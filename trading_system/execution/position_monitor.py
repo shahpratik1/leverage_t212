@@ -1,0 +1,693 @@
+"""Active Position & Lifecycle Monitor for 3x Leveraged Trades.
+
+Monitors open positions in real time, manages multi-stage exits (TP1, TP2, TP3),
+ratchets dynamic Trailing Stop Losses (TSL), triggers auto-executions on Trading 212,
+and dispatches real-time alerts.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from trading_system.agents.risk_manager import DecisionCard, RiskManager
+from trading_system.config import settings
+from trading_system.data.trading212_client import Trading212Client, Trading212Error
+from trading_system.notifications.notifier import Notifier
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrackedPosition:
+    """Represents an active trade being managed through its lifecycle."""
+    ticker: str                         # Trading 212 execution ticker (e.g. 'QQQ3l_EQ')
+    underlying: str                     # Underlying ticker (e.g. 'QQQ')
+    direction: str                      # 'LONG' or 'SHORT'
+    entry_price: float
+    original_quantity: float
+    remaining_quantity: float
+    stop_loss: float
+    trailing_stop_loss: float
+    highest_price: float                # Peak price recorded since entry
+    lowest_price: float                 # Trough price recorded since entry
+    tp1: float
+    tp2: float
+    tp3: float
+    atr: float
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+    tp3_hit: bool = False
+    is_closed: bool = False
+    strategy_type: str = "momentum"
+    rsi3: Optional[float] = None
+    rsi7: Optional[float] = None
+    rsi14: Optional[float] = None
+    sma5: Optional[float] = None
+    win_rate_exp: str = "80%"
+    entry_time: str = ""
+    last_update_time: str = ""
+    earnings_in_days: Optional[float] = None
+    is_overnight_eligible: bool = False
+    broker_stop_order_id: Optional[str] = None
+    tp1_armed_hysteresis: bool = False
+
+    def __post_init__(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        if not self.entry_time:
+            self.entry_time = now
+        if not self.last_update_time:
+            self.last_update_time = now
+        if self.highest_price <= 0:
+            self.highest_price = self.entry_price
+        if self.lowest_price <= 0:
+            self.lowest_price = self.entry_price
+
+
+class PositionMonitor:
+    """Manages active trades, checks exit targets, updates TSL, and fires notifications."""
+
+    def __init__(
+        self,
+        t212_client: Trading212Client,
+        notifier: Notifier,
+        risk_manager: RiskManager,
+        state_file: str = "active_trades.json",
+        dry_run: bool = False,
+    ):
+        self.t212 = t212_client
+        self.notifier = notifier
+        self.risk_manager = risk_manager
+        self.state_file = state_file
+        self.dry_run = dry_run
+        self.positions: Dict[str, TrackedPosition] = self._load_state()
+        self._last_session_close_date: str = ""
+
+    # ─────────────────────────────────────────────────────────────
+    # Trade Registration
+    # ─────────────────────────────────────────────────────────────
+    def register_new_trade(
+        self,
+        card: DecisionCard,
+        atr: float = 0.0,
+        earnings_in_days: Optional[float] = None,
+    ) -> TrackedPosition:
+        """Register a newly opened trade for active lifecycle tracking."""
+        pos = TrackedPosition(
+            ticker=card.trading212_ticker,
+            underlying=card.ticker,
+            direction=card.direction,
+            entry_price=card.entry_price,
+            original_quantity=card.position_size_shares,
+            remaining_quantity=card.position_size_shares,
+            stop_loss=card.stop_loss,
+            trailing_stop_loss=card.trailing_stop_loss or card.stop_loss,
+            highest_price=card.entry_price,
+            lowest_price=card.entry_price,
+            tp1=card.take_profit_1,
+            tp2=card.take_profit_2,
+            tp3=card.take_profit_3,
+            atr=atr or (card.entry_price * 0.02),
+            earnings_in_days=earnings_in_days if earnings_in_days is not None else getattr(card, "earnings_in_days", None),
+        )
+        self.positions[card.trading212_ticker] = pos
+        self._save_state()
+
+        logger.info(
+            "Registered new 3x %s trade: %s @ $%.2f (Shares: %.2f, SL: $%.2f, TP1: $%.2f, Earnings: %s)",
+            pos.direction, pos.ticker, pos.entry_price, pos.original_quantity, pos.stop_loss, pos.tp1,
+            f"{pos.earnings_in_days}d" if pos.earnings_in_days is not None else "None",
+        )
+        return pos
+
+    # ─────────────────────────────────────────────────────────────
+    # Native Broker Stop Orders (Trading 212 Server-Side SL / TSL)
+    # ─────────────────────────────────────────────────────────────
+    def place_broker_stop(self, pos: TrackedPosition, stop_price: Optional[float] = None) -> Optional[str]:
+        """Place or replace a native GTC Stop Order on Trading 212 broker server."""
+        price = stop_price if stop_price is not None else pos.trailing_stop_loss
+        if pos.remaining_quantity <= 0 or price <= 0:
+            return None
+
+        # Cancel previous broker stop order if one was already placed
+        if pos.broker_stop_order_id:
+            self.cancel_broker_stop(pos)
+
+        if self.dry_run:
+            fake_id = f"DRY_STOP_{pos.ticker}_{int(time.time())}"
+            pos.broker_stop_order_id = fake_id
+            self._save_state()
+            logger.info("[DRY-RUN] Would place native broker Stop Order for %s: %.3f shares @ $%.2f",
+                        pos.ticker, pos.remaining_quantity, price)
+            return fake_id
+
+        try:
+            # In Trading 212 Invest/Stocks API:
+            # For LONG positions, Stop Loss sells held shares (negative quantity)
+            # For SHORT positions, Stop Loss buys back shares (positive quantity)
+            order_qty = -abs(pos.remaining_quantity) if pos.direction.upper() == "LONG" else abs(pos.remaining_quantity)
+            logger.info(
+                "Placing native Stop Order on Trading 212 for %s: %.3f shares @ stopPrice $%.2f",
+                pos.ticker, order_qty, price
+            )
+            # Try GTC first (standard for persistent protective stops), fallback to DAY
+            try:
+                res = self.t212.place_stop_order(
+                    ticker=pos.ticker,
+                    quantity=order_qty,
+                    stop_price=round(price, 2),
+                    time_validity="GTC",
+                )
+            except Exception as first_exc:
+                logger.debug("Stop order with validity GTC failed (%s), attempting DAY...", first_exc)
+                # Respect rate limit spacing before fallback order submission
+                delay = getattr(self.t212, "rate_limit_delay", 1.25)
+                time.sleep(delay)
+                res = self.t212.place_stop_order(
+                    ticker=pos.ticker,
+                    quantity=order_qty,
+                    stop_price=round(price, 2),
+                    time_validity="DAY",
+                )
+            pos.broker_stop_order_id = res.id
+            setattr(pos, "_last_stop_fail_time", 0.0)
+            self._save_state()
+            logger.info("Successfully placed broker Stop Order on Trading 212: %s (id=%s)", pos.ticker, res.id)
+            return res.id
+        except Exception as exc:
+            setattr(pos, "_last_stop_fail_time", time.time())
+            logger.error("Failed to place native broker Stop Order for %s on Trading 212: %s", pos.ticker, exc)
+            return None
+
+    def cancel_broker_stop(self, pos: TrackedPosition) -> bool:
+        """Cancel pending broker stop order on Trading 212."""
+        order_id = pos.broker_stop_order_id
+        if not order_id:
+            return True
+
+        pos.broker_stop_order_id = None
+        self._save_state()
+
+        if self.dry_run or order_id.startswith("DRY_"):
+            logger.info("[DRY-RUN] Cancelled broker stop order %s for %s", order_id, pos.ticker)
+            return True
+
+        try:
+            logger.info("Canceling broker Stop Order %s for %s on Trading 212", order_id, pos.ticker)
+            success = self.t212.cancel_order(order_id)
+            return success
+        except Exception as exc:
+            logger.warning("Failed to cancel broker Stop Order %s on Trading 212: %s", order_id, exc)
+            return False
+
+    def sync_broker_stops(self) -> List[str]:
+        """Ensure all active positions have an active native GTC Stop Order placed on Trading 212."""
+        synced = []
+        now = time.time()
+        for ticker, pos in list(self.positions.items()):
+            if not pos.is_closed and pos.remaining_quantity > 0 and not pos.broker_stop_order_id:
+                last_fail = getattr(pos, "_last_stop_fail_time", 0.0)
+                if now - last_fail < 180.0:
+                    logger.debug("Cooldown active for %s stop sync (failed %.1fs ago)", ticker, now - last_fail)
+                    continue
+
+                logger.info("Syncing missing broker Stop Order for active position %s...", ticker)
+                order_id = self.place_broker_stop(pos)
+                if order_id:
+                    synced.append(ticker)
+        if synced:
+            self._save_state()
+            logger.info("Synced native broker stops for %d positions: %s", len(synced), synced)
+        return synced
+
+    # ─────────────────────────────────────────────────────────────
+    # Asymmetric Session Protocol (16:20 UTC Gap Evacuation & Quota Management)
+    # ─────────────────────────────────────────────────────────────
+    def evaluate_asymmetric_session(
+        self,
+        current_time: Optional[datetime] = None,
+        force_evaluation: bool = False,
+        current_prices: Optional[Dict[str, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate 16:20 UTC Asymmetric Session rules:
+        - 3x Short/Inverse positions: Unconditionally liquidated (INVERSE_INTRADAY_FLATTEN).
+        - 3x Long positions:
+            * If not tp1_hit (stop not at breakeven): Liquidated (ASYMMETRIC_SESSION_EXIT).
+            * If tp1_hit but earnings <= 24h: Liquidated (EARNINGS_BLACKOUT_EXIT).
+            * If tp1_hit and no earnings: Retained overnight (is_overnight_eligible = True).
+        """
+        now_utc = current_time or datetime.now(timezone.utc)
+        today_str = now_utc.strftime("%Y-%m-%d")
+
+        if not force_evaluation:
+            try:
+                cutoff_parts = settings.SESSION_CLOSE_CUTOFF_UTC.split(":")
+                cutoff_h, cutoff_m = int(cutoff_parts[0]), int(cutoff_parts[1])
+            except Exception:
+                cutoff_h, cutoff_m = 16, 20
+
+            current_minutes = now_utc.hour * 60 + now_utc.minute
+            cutoff_minutes = cutoff_h * 60 + cutoff_m
+
+            # Active within 10-minute window: 16:20 UTC to 16:30 UTC
+            in_window = cutoff_minutes <= current_minutes < (cutoff_minutes + 10)
+            if not in_window:
+                return []
+
+            if self._last_session_close_date == today_str:
+                return []
+
+        logger.info(
+            "Evaluating Asymmetric Session Protocol at %s UTC (Cutoff: %s UTC)...",
+            now_utc.strftime("%H:%M:%S"), settings.SESSION_CLOSE_CUTOFF_UTC
+        )
+
+        prices = current_prices or {}
+        positions_to_close: List[Tuple[TrackedPosition, str, float]] = []
+        tickers_to_remove: List[str] = []
+
+        for ticker, pos in list(self.positions.items()):
+            if pos.is_closed or pos.remaining_quantity <= 0:
+                tickers_to_remove.append(ticker)
+                continue
+
+            current_price = prices.get(ticker) or prices.get(pos.underlying) or pos.entry_price
+
+            if pos.direction.upper() == "SHORT":
+                if settings.ENFORCE_INVERSE_INTRADAY_ONLY:
+                    positions_to_close.append((pos, "INVERSE_INTRADAY_FLATTEN", current_price))
+                    tickers_to_remove.append(ticker)
+            elif pos.direction.upper() == "LONG":
+                if settings.ENFORCE_LONG_BREAKEVEN_OVERNIGHT:
+                    if not pos.tp1_hit:
+                        positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
+                        tickers_to_remove.append(ticker)
+                    elif pos.earnings_in_days is not None and 0 <= pos.earnings_in_days <= (settings.EARNINGS_BLACKOUT_HOURS / 24.0):
+                        positions_to_close.append((pos, "EARNINGS_BLACKOUT_EXIT", current_price))
+                        tickers_to_remove.append(ticker)
+                    else:
+                        pos.is_overnight_eligible = True
+                        logger.info("Retaining Long %s for overnight swing (TP1 hit, Breakeven Stop active)", ticker)
+
+        events: List[Dict[str, Any]] = []
+        if positions_to_close:
+            logger.info("Queued %d positions for rate-limited 16:20 session liquidation", len(positions_to_close))
+            events = self._execute_liquidation_queue(positions_to_close)
+
+        for t in tickers_to_remove:
+            if t in self.positions:
+                del self.positions[t]
+
+        self._last_session_close_date = today_str
+        self._save_state()
+        return events
+
+    def _execute_liquidation_queue(
+        self,
+        positions_to_close: List[Tuple[TrackedPosition, str, float]]
+    ) -> List[Dict[str, Any]]:
+        """Execute queued 16:20 liquidations serially with broker rate-limit pacing."""
+        events = []
+        total = len(positions_to_close)
+
+        for i, (pos, reason, price) in enumerate(positions_to_close):
+            shares_to_sell = pos.remaining_quantity
+            logger.info(
+                "[%d/%d] Executing 16:20 session liquidation for %s (%s): %.3f shares (Reason: %s)",
+                i + 1, total, pos.ticker, pos.direction, shares_to_sell, reason
+            )
+
+            # Cancel native broker stop order to prevent orphan execution
+            self.cancel_broker_stop(pos)
+
+            success = self._execute_sell(pos.ticker, shares_to_sell)
+
+            pos.is_closed = True
+            pos.remaining_quantity = 0.0
+            pos.last_update_time = datetime.now(timezone.utc).isoformat()
+
+            pnl = shares_to_sell * (price - pos.entry_price)
+            pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0.0
+
+            self.notifier.notify_session_exit(
+                ticker=pos.ticker,
+                underlying=pos.underlying,
+                direction=pos.direction,
+                price=price,
+                quantity=shares_to_sell,
+                exit_reason=reason,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+            )
+
+            events.append({
+                "event": reason,
+                "ticker": pos.ticker,
+                "underlying": pos.underlying,
+                "direction": pos.direction,
+                "price": price,
+                "quantity": shares_to_sell,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "success": success,
+            })
+
+            # Respect rate limit quota if more orders remain in queue
+            if i < total - 1:
+                time.sleep(settings.RATE_LIMIT_INTER_CALL_DELAY)
+
+        return events
+
+    # ─────────────────────────────────────────────────────────────
+    # Inspection & Lifecycle Update Tick
+    # ─────────────────────────────────────────────────────────────
+    def monitor_tick(
+        self,
+        current_prices: Dict[str, float],
+        current_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run one check cycle across all active positions using latest prices.
+
+        Args:
+            current_prices: Dictionary mapping ticker to latest market price.
+            current_time: Optional UTC datetime override (useful for testing session cutoff).
+
+        Returns:
+            List of event summaries generated during this tick.
+        """
+        events = []
+
+        # 1. Asymmetric Session Protocol Check (16:20 UTC cutoff)
+        session_events = self.evaluate_asymmetric_session(
+            current_time=current_time,
+            current_prices=current_prices,
+        )
+        events.extend(session_events)
+
+        tickers_to_remove = []
+
+        for ticker, pos in list(self.positions.items()):
+            if pos.is_closed:
+                tickers_to_remove.append(ticker)
+                continue
+
+            current_price = current_prices.get(ticker)
+            if not current_price or current_price <= 0:
+                # If direct price not available, try underlying
+                current_price = current_prices.get(pos.underlying)
+
+            if not current_price or current_price <= 0:
+                continue
+
+            pos.last_update_time = datetime.now(timezone.utc).isoformat()
+
+            # Track peak price
+            if current_price > pos.highest_price:
+                pos.highest_price = current_price
+            if current_price < pos.lowest_price:
+                pos.lowest_price = current_price
+
+            # Check exits in priority order
+            # 1. Stop Loss & Trailing Stop Loss
+            active_stop = max(pos.stop_loss, pos.trailing_stop_loss)
+            if current_price <= active_stop:
+                event = self._handle_stop_exit(pos, current_price, is_tsl=(active_stop == pos.trailing_stop_loss and pos.tp1_hit))
+                events.append(event)
+                tickers_to_remove.append(ticker)
+                continue
+
+            # 2. Take Profit 3 (Final target - Full close)
+            if current_price >= pos.tp3 and not pos.tp3_hit:
+                event = self._handle_tp3_hit(pos, current_price)
+                events.append(event)
+                tickers_to_remove.append(ticker)
+                continue
+
+            # 3. Take Profit 2 (Second trim - 25%)
+            if current_price >= pos.tp2 and not pos.tp2_hit:
+                event = self._handle_tp2_hit(pos, current_price)
+                events.append(event)
+
+            # 4. Take Profit 1 (First trim - 50% + Breakeven SL + Arm Hysteresis)
+            if current_price >= pos.tp1 and not pos.tp1_hit:
+                event = self._handle_tp1_hit(pos, current_price)
+                events.append(event)
+
+            # 5. Schmitt-Trigger Hysteresis: Elevate stop to TP1 once price clears escape threshold
+            if getattr(pos, "tp1_armed_hysteresis", False) and not pos.tp2_hit:
+                escape_offset = 0.5 * pos.atr if pos.atr > 0 else abs(pos.tp1 - pos.entry_price) * 0.5
+                escape_threshold = pos.tp1 + escape_offset if pos.direction.upper() == "LONG" else pos.tp1 - escape_offset
+                escape_cleared = (current_price >= escape_threshold) if pos.direction.upper() == "LONG" else (current_price <= escape_threshold)
+                if escape_cleared:
+                    pos.tp1_armed_hysteresis = False
+                    pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1) if pos.direction.upper() == "LONG" else min(pos.trailing_stop_loss, pos.tp1)
+                    pos.stop_loss = max(pos.stop_loss, pos.tp1) if pos.direction.upper() == "LONG" else min(pos.stop_loss, pos.tp1)
+                    locked_pct = abs((pos.tp1 - pos.entry_price) / pos.entry_price) * 100
+                    logger.info(
+                        "🎯 %s Schmitt-Trigger Hysteresis ESCAPE: price $%.2f cleared threshold $%.2f. Stop safely elevated to TP1 ($%.2f, +%.1f%% locked)",
+                        ticker, current_price, escape_threshold, pos.tp1, locked_pct,
+                    )
+                    # Update native broker stop order on Trading 212
+                    self.place_broker_stop(pos, stop_price=pos.tp1)
+                    self.notifier.notify_tsl(
+                        ticker=pos.ticker,
+                        underlying=pos.underlying,
+                        direction=pos.direction,
+                        current_price=current_price,
+                        new_tsl=pos.tp1,
+                        locked_in_pnl_pct=locked_pct,
+                    )
+                    events.append({"event": "HYSTERESIS_TP1_RATCHET", "ticker": ticker, "new_tsl": pos.tp1})
+
+            # 6. Trailing Stop Ratchet (Ratchets higher with new highs once hysteresis clears)
+            if pos.tp1_hit and not getattr(pos, "tp1_armed_hysteresis", False):
+                new_tsl = self.risk_manager.calculate_trailing_stop(
+                    current_price=current_price,
+                    peak_price=pos.highest_price,
+                    atr=pos.atr,
+                    current_tsl=pos.trailing_stop_loss,
+                    direction=pos.direction,
+                )
+                if new_tsl > pos.trailing_stop_loss:
+                    old_tsl = pos.trailing_stop_loss
+                    pos.trailing_stop_loss = new_tsl
+                    locked_pct = ((new_tsl - pos.entry_price) / pos.entry_price) * 100
+                    logger.info("%s TSL ratcheted UP: $%.2f -> $%.2f (+%.1f%% locked)", ticker, old_tsl, new_tsl, locked_pct)
+
+                    # Update native broker stop order on Trading 212
+                    self.place_broker_stop(pos, stop_price=new_tsl)
+
+                    self.notifier.notify_tsl(
+                        ticker=pos.ticker,
+                        underlying=pos.underlying,
+                        direction=pos.direction,
+                        current_price=current_price,
+                        new_tsl=new_tsl,
+                        locked_in_pnl_pct=locked_pct,
+                    )
+                    events.append({"event": "TSL_RATCHET", "ticker": ticker, "new_tsl": new_tsl})
+
+        # Clean up closed positions
+        for t in tickers_to_remove:
+            if t in self.positions:
+                del self.positions[t]
+
+        if events:
+            self._save_state()
+
+        return events
+
+    # ─────────────────────────────────────────────────────────────
+    # Internal Target Handlers
+    # ─────────────────────────────────────────────────────────────
+    def _handle_tp1_hit(self, pos: TrackedPosition, price: float) -> Dict[str, Any]:
+        """Process TP1 hit: Sell 50%, bank profit, move stop to break-even, arm hysteresis."""
+        pos.tp1_hit = True
+        pos.tp1_armed_hysteresis = True
+        trim_shares = round(pos.original_quantity * 0.50, 3)
+        actual_trim = min(trim_shares, pos.remaining_quantity)
+        pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
+
+        # Move stop to Break-Even (Entry price) - keeps 1.0R buffer to prevent instant whipsaw
+        pos.stop_loss = pos.entry_price
+        pos.trailing_stop_loss = pos.entry_price
+
+        pnl = actual_trim * (price - pos.entry_price)
+        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+
+        # Cancel pending broker stop order to unblock shares for sell execution
+        self.cancel_broker_stop(pos)
+
+        # Execute sell order on Trading 212
+        self._execute_sell(pos.ticker, actual_trim)
+
+        # Update native broker stop order on Trading 212 to Break-Even for remaining shares
+        self.place_broker_stop(pos, stop_price=pos.entry_price)
+
+        # Notify
+        self.notifier.notify_tp1(
+            ticker=pos.ticker,
+            underlying=pos.underlying,
+            direction=pos.direction,
+            price=price,
+            quantity_sold=actual_trim,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            new_sl=pos.entry_price,
+        )
+        return {"event": "TP1", "ticker": pos.ticker, "price": price, "pnl": pnl}
+
+    def _handle_tp2_hit(self, pos: TrackedPosition, price: float) -> Dict[str, Any]:
+        """Process TP2 hit: Sell 25% of original, ratchet trailing stop to TP1."""
+        pos.tp2_hit = True
+        pos.tp1_armed_hysteresis = False
+        trim_shares = round(pos.original_quantity * 0.25, 3)
+        actual_trim = min(trim_shares, pos.remaining_quantity)
+        pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
+
+        # Ratchet trailing stop to TP1
+        pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1)
+        pos.stop_loss = max(pos.stop_loss, pos.tp1)
+
+        pnl = actual_trim * (price - pos.entry_price)
+        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+
+        # Cancel pending broker stop order to unblock shares for sell execution
+        self.cancel_broker_stop(pos)
+
+        # Execute sell order on Trading 212
+        self._execute_sell(pos.ticker, actual_trim)
+
+        # Update native broker stop order on Trading 212 for remaining shares
+        self.place_broker_stop(pos, stop_price=pos.trailing_stop_loss)
+
+        # Notify
+        self.notifier.notify_tp2(
+            ticker=pos.ticker,
+            underlying=pos.underlying,
+            direction=pos.direction,
+            price=price,
+            quantity_sold=actual_trim,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            tsl=pos.trailing_stop_loss,
+        )
+        return {"event": "TP2", "ticker": pos.ticker, "price": price, "pnl": pnl}
+
+    def _handle_tp3_hit(self, pos: TrackedPosition, price: float) -> Dict[str, Any]:
+        """Process TP3 hit: Close remaining runner position with full gains."""
+        pos.tp3_hit = True
+        pos.tp1_armed_hysteresis = False
+        pos.is_closed = True
+        shares_to_sell = pos.remaining_quantity
+        pos.remaining_quantity = 0.0
+
+        # Cancel pending broker stop order on Trading 212
+        self.cancel_broker_stop(pos)
+
+        pnl = shares_to_sell * (price - pos.entry_price)
+        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+
+        # Execute sell order on Trading 212
+        self._execute_sell(pos.ticker, shares_to_sell)
+
+        # Notify
+        self.notifier.notify_tp3(
+            ticker=pos.ticker,
+            underlying=pos.underlying,
+            direction=pos.direction,
+            price=price,
+            quantity_sold=shares_to_sell,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+        )
+        return {"event": "TP3", "ticker": pos.ticker, "price": price, "pnl": pnl}
+
+    def _handle_stop_exit(self, pos: TrackedPosition, price: float, is_tsl: bool) -> Dict[str, Any]:
+        """Process Stop Loss or Trailing Stop Loss trigger: Liquidate remaining shares."""
+        pos.is_closed = True
+        shares_to_sell = pos.remaining_quantity
+        pos.remaining_quantity = 0.0
+
+        # Cancel pending broker stop order on Trading 212
+        self.cancel_broker_stop(pos)
+
+        pnl = shares_to_sell * (price - pos.entry_price)
+        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+
+        # Execute sell order on Trading 212
+        self._execute_sell(pos.ticker, shares_to_sell)
+
+        if is_tsl:
+            self.notifier.notify_tsl(
+                ticker=pos.ticker,
+                underlying=pos.underlying,
+                direction=pos.direction,
+                current_price=price,
+                new_tsl=price,
+                locked_in_pnl_pct=pnl_pct,
+                is_triggered=True,
+            )
+        else:
+            self.notifier.notify_sl(
+                ticker=pos.ticker,
+                underlying=pos.underlying,
+                direction=pos.direction,
+                price=price,
+                quantity=shares_to_sell,
+                loss_amount=abs(pnl),
+                loss_pct=abs(pnl_pct),
+            )
+        return {"event": "STOP_EXIT", "is_tsl": is_tsl, "ticker": pos.ticker, "price": price, "pnl": pnl}
+
+    def _execute_sell(self, ticker: str, quantity: float) -> bool:
+        """Execute a sell order via Trading 212 API (negative quantity)."""
+        if quantity <= 0:
+            return True
+        if self.dry_run:
+            logger.info("[DRY-RUN] Would place SELL market order for %.3f shares of %s", quantity, ticker)
+            return True
+        try:
+            # In Trading 212, selling existing shares is negative quantity
+            result = self.t212.place_market_order(ticker, -abs(quantity))
+            logger.info("Executed market SELL on Trading 212: %s (Qty: -%.3f)", ticker, quantity)
+            return True
+        except Trading212Error as exc:
+            logger.error("Failed to execute SELL order for %s on Trading 212: %s", ticker, exc)
+            return False
+
+    # ─────────────────────────────────────────────────────────────
+    # State Persistence
+    # ─────────────────────────────────────────────────────────────
+    def _save_state(self) -> None:
+        """Persist current active positions to state file."""
+        try:
+            raw = {t: asdict(pos) for t, pos in self.positions.items()}
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2)
+        except Exception as exc:
+            logger.warning("Failed to save position monitor state to %s: %s", self.state_file, exc)
+
+    def _load_state(self) -> Dict[str, TrackedPosition]:
+        """Load active positions from state file."""
+        if not os.path.exists(self.state_file):
+            return {}
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            known_fields = {f.name for f in fields(TrackedPosition)}
+            positions = {}
+            for t, data in raw.items():
+                if not data.get("is_closed", False):
+                    filtered_data = {k: v for k, v in data.items() if k in known_fields}
+                    positions[t] = TrackedPosition(**filtered_data)
+            logger.info("Loaded %d active tracked positions from %s", len(positions), self.state_file)
+            return positions
+        except Exception as exc:
+            logger.warning("Could not read state file %s: %s", self.state_file, exc)
+            return {}

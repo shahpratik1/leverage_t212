@@ -1,0 +1,739 @@
+"""Orchestrator — 3x Leveraged Long & Short Quantitative Engine.
+
+Main Execution Pipeline:
+1. Data Ingestion: Ingests OHLCV for liquid 3x underlying assets (Indices, Tech Giants, Commodities).
+2. System 1 Fast Screening: Laya NLI screener detects Bullish (3x Long) and Bearish (3x Short) momentum,
+   rejecting choppy consolidation (ADX < 20) to prevent volatility decay.
+3. System 2 Deliberation: Multi-agent debate & Risk Manager compute position sizing, ATR Stop Loss,
+   multi-stage Take Profits (TP1, TP2, TP3), and initial Trailing Stop Loss.
+4. Automated Execution & Notifications: Places market entry orders on Trading 212 and dispatches
+   real-time multi-channel alerts (Console, Desktop, Telegram, Discord, JSONL) for:
+   BUY, SELL, TP1, TP2, TP3, SL, and TSL.
+5. Continuous Position Monitor: Tracks live positions, triggers partial profit trims, ratchets TSL,
+   and closes stopped-out trades.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import logging
+import sys
+import time
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from trading_system.config import settings
+from trading_system.data.leveraged_universe import LeveragedUniverse
+from trading_system.data.trading212_client import (
+    AccountCash,
+    MarketDataProvider,
+    Position,
+    Trading212Client,
+    Trading212Error,
+)
+from trading_system.execution.position_monitor import PositionMonitor
+from trading_system.notifications.notifier import Notifier
+from trading_system.screener.laya_screener import LayaScreener, ScreenerResult
+from trading_system.agents.technical_agent import TechnicalAnalyst
+from trading_system.agents.fundamental_agent import FundamentalAnalyst
+from trading_system.agents.debate_engine import DebateEngine
+from trading_system.agents.risk_manager import DecisionCard, RiskManager
+
+logger = logging.getLogger(__name__)
+
+# Fallback watchlist of ordinary equities if 3x mode is disabled
+DEFAULT_UNIVERSE = [
+    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK-B",
+    "UNH", "LLY", "JPM", "XOM", "JNJ", "V", "PG", "AVGO", "MA", "HD",
+    "MRK", "CVX", "ABBV", "COST", "PEP", "KO", "ADBE", "WMT", "MCD",
+    "CRM", "CSCO", "TMO", "ACN", "ABT", "LIN", "BAC", "NFLX", "PFE",
+    "AMD", "DHR", "DIS", "ORCL", "CMCSA", "PM", "INTC", "VZ", "WFC",
+]
+
+
+class Orchestrator:
+    """Master controller for 3x Long/Short Quantitative Trading Engine."""
+
+    def __init__(self, dry_run: bool = False) -> None:
+        settings.validate()
+        self.dry_run = dry_run
+
+        # ── 1. Trading 212 API Client ─────────────────────────────
+        self.t212 = Trading212Client(
+            api_key=settings.TRADING212_API_KEY,
+            api_secret=settings.TRADING212_API_SECRET,
+            base_url=settings.api_base_url,
+        )
+
+        # ── 2. Universe Manager ───────────────────────────────────
+        self.leveraged_universe = LeveragedUniverse()
+        if settings.USE_LEVERAGED_3X:
+            self.universe: List[str] = (
+                settings.WATCHLIST
+                if settings.WATCHLIST
+                else self.leveraged_universe.get_all_underlyings()
+            )
+        else:
+            self.universe = (
+                settings.WATCHLIST
+                if settings.WATCHLIST
+                else DEFAULT_UNIVERSE[: settings.UNIVERSE_SIZE]
+            )
+
+        # ── 3. Notification Engine ────────────────────────────────
+        self.notifier = Notifier(
+            telegram_bot_token=settings.TELEGRAM_BOT_TOKEN,
+            telegram_chat_id=settings.TELEGRAM_CHAT_ID,
+            discord_webhook_url=settings.DISCORD_WEBHOOK_URL,
+            log_file=settings.NOTIFICATIONS_LOG_PATH,
+            enable_desktop=settings.ENABLE_DESKTOP_NOTIFICATIONS,
+        )
+
+        # ── 4. System 1: Fast Screener ────────────────────────────
+        self.screener = LayaScreener(
+            min_setup_score=settings.SCREENER_MIN_SETUP_SCORE,
+            max_catalyst_risk=settings.SCREENER_MAX_CATALYST_RISK,
+            top_n=settings.SCREENER_TOP_N,
+        )
+
+        # ── 5. System 2: Deliberative Multi-Agent Stack ──────────
+        self.technical_analyst = TechnicalAnalyst(
+            openai_api_key=settings.OPENAI_API_KEY,
+            model=settings.LLM_DEEP_MODEL,
+        )
+        self.fundamental_analyst = FundamentalAnalyst(
+            openai_api_key=settings.OPENAI_API_KEY,
+            model=settings.LLM_DEEP_MODEL,
+        )
+        self.debate_engine = DebateEngine(
+            openai_api_key=settings.OPENAI_API_KEY,
+            model=settings.LLM_DEEP_MODEL,
+            quick_model=settings.LLM_QUICK_MODEL,
+            debate_rounds=3,
+            speculative_routing=settings.ENABLE_SPECULATIVE_ROUTING,
+            speculative_threshold=settings.SPECULATIVE_CONFIDENCE_THRESHOLD,
+        )
+        self.parallel_ingestion_workers = settings.PARALLEL_INGESTION_WORKERS
+        self.parallel_deliberation_workers = settings.PARALLEL_DELIBERATION_WORKERS
+        self.risk_manager = RiskManager(
+            max_risk_per_trade=settings.MAX_RISK_PER_TRADE,
+            max_position_pct=settings.MAX_POSITION_PCT,
+            atr_sl_multiplier=settings.ATR_SL_MULTIPLIER,
+            min_sl_pct=settings.MIN_SL_PCT,
+            tp1_r=settings.TP1_R_MULTIPLE,
+            tp2_r=settings.TP2_R_MULTIPLE,
+            tp3_r=settings.TP3_R_MULTIPLE,
+            tsl_atr_multiplier=settings.TSL_ATR_MULTIPLIER,
+        )
+
+        # ── 6. Active Position & Lifecycle Monitor ───────────────
+        self.position_monitor = PositionMonitor(
+            t212_client=self.t212,
+            notifier=self.notifier,
+            risk_manager=self.risk_manager,
+            state_file=settings.ACTIVE_TRADES_PATH,
+            dry_run=self.dry_run,
+        )
+        # Synchronize broker-native GTC Stop Loss / TSL orders for active positions
+        if not self.dry_run:
+            try:
+                self.position_monitor.sync_broker_stops()
+            except Exception as exc:
+                logger.warning("Initial broker stop sync deferred: %s", exc)
+
+        # ── 7. Audit Logging ──────────────────────────────────────
+        self.trades_log = Path(settings.TRADES_LOG_PATH)
+
+        logger.info(
+            "Orchestrator initialized — 3x Universe: %d assets, Mode: %s (DryRun: %s)",
+            len(self.universe),
+            "LIVE" if settings.USE_LIVE else "DEMO",
+            self.dry_run,
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # Phase 1 — Data Ingestion (Parallel Subagents)
+    # ─────────────────────────────────────────────────────────────
+    def ingest_universe_data(self) -> Dict[str, Dict[str, Any]]:
+        """Fetch OHLCV and compute indicators for liquid underlyings in parallel using worker threads."""
+        universe_metrics: Dict[str, Dict[str, Any]] = {}
+        total = len(self.universe)
+        start_time = time.time()
+
+        def _fetch_asset(symbol: str) -> tuple[str, Optional[Dict[str, Any]]]:
+            try:
+                daily = MarketDataProvider.get_daily_candles(symbol, period="1y")
+                hourly = MarketDataProvider.get_hourly_candles(symbol, period="1mo")
+                metrics = MarketDataProvider.compute_indicators(daily, hourly)
+                return symbol, metrics
+            except Exception as exc:
+                logger.error("Failed to ingest %s: %s", symbol, exc)
+                return symbol, None
+
+        logger.info(
+            "Ingesting market data for %d assets in parallel across %d subagent workers…",
+            total, self.parallel_ingestion_workers
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel_ingestion_workers) as executor:
+            future_to_symbol = {executor.submit(_fetch_asset, sym): sym for sym in self.universe}
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_symbol):
+                completed += 1
+                symbol, metrics = future.result()
+                if metrics:
+                    universe_metrics[symbol] = metrics
+                    logger.debug("[%d/%d] Ingested %s (close=%.2f, RSI=%.1f, ADX=%.1f)",
+                                 completed, total, symbol, metrics.get("close", 0.0),
+                                 metrics.get("rsi", 0.0), metrics.get("adx", 0.0))
+                else:
+                    logger.warning("[%d/%d] %s — insufficient candle data", completed, total, symbol)
+
+        elapsed = time.time() - start_time
+        logger.info(
+            "Ingestion complete: %d / %d assets ready for screening in %.2fs (%.1f assets/sec)",
+            len(universe_metrics), total, elapsed, total / max(0.001, elapsed)
+        )
+        return universe_metrics
+
+    # ─────────────────────────────────────────────────────────────
+    # Phase 2 — System 1 Fast Screening (Long & Short)
+    # ─────────────────────────────────────────────────────────────
+    def screen_candidates(
+        self, universe_metrics: Dict[str, Dict[str, Any]]
+    ) -> List[ScreenerResult]:
+        """Filter universe using Laya NLI router for Bullish and Bearish setups."""
+        logger.info("Screening %d assets for 3x Long/Short momentum (ADX >= %.1f)…",
+                    len(universe_metrics), settings.MIN_ADX_TREND)
+        candidates = self.screener.scan_universe(universe_metrics)
+        logger.info(
+            "System 1 passed %d high-momentum candidates: %s",
+            len(candidates),
+            [f"{c.ticker} ({c.bias})" for c in candidates],
+        )
+        return candidates
+
+    # ─────────────────────────────────────────────────────────────
+    # Phase 3 — System 2 Multi-Agent Deliberation (Concurrent Subagents)
+    # ─────────────────────────────────────────────────────────────
+    def deep_analyse(
+        self, candidate: ScreenerResult, account_equity: Optional[float] = None
+    ) -> Optional[DecisionCard]:
+        """Perform multi-agent debate and map candidate to exact 3x Long/Short ETP."""
+        underlying = candidate.ticker
+        metrics = candidate.metrics
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        direction = "LONG" if candidate.bias == "bullish" else "SHORT"
+        strategy_type = getattr(candidate, "strategy_type", "momentum")
+
+        logger.info("═══ System 2 Deliberation for %s (%s | %s) ═══", underlying, direction, strategy_type)
+
+        # ── Pre-Trade Earnings Blackout Check (48h Gate - R2.2) ──
+        earnings_in_days = metrics.get("earnings_in_days")
+        if earnings_in_days is not None and 0 <= float(earnings_in_days) <= 2.0:
+            logger.warning(
+                "Pre-trade earnings filter: %s rejected due to impending earnings in %.1f days (<= 48h blackout)",
+                underlying, float(earnings_in_days)
+            )
+            return None
+
+        # ── 1. Map to Leveraged Execution Ticker (3x or 5x) ──────
+        if settings.USE_LEVERAGED_3X:
+            use_5x = getattr(settings, "ENABLE_5X_LEVERAGE", True) and getattr(settings, "PREFER_5X_LEVERAGE", False) and self.leveraged_universe.has_5x_leverage(underlying, direction)
+            target_leverage = 5 if use_5x else 3
+            t212_ticker = self.leveraged_universe.get_execution_ticker(underlying, direction, leverage=target_leverage)
+            if not t212_ticker:
+                logger.warning("No paired %dx %s ETP found for %s — using standard mapping", target_leverage, direction, underlying)
+                instrument = self.t212.get_instrument_by_symbol(underlying)
+                t212_ticker = instrument.ticker if instrument else f"{underlying}_US_EQ"
+        else:
+            instrument = self.t212.get_instrument_by_symbol(underlying)
+            t212_ticker = instrument.ticker if instrument else f"{underlying}_US_EQ"
+
+        # ── 2 & 3. Concurrent Technical & Fundamental Subagent Analysis ──
+        tech_report = ""
+        fund_report = ""
+
+        def _run_technical() -> str:
+            try:
+                tech = self.technical_analyst.analyze(underlying, metrics, date=today)
+                return self.technical_analyst.format_report(tech)
+            except Exception as exc:
+                logger.error("Technical analysis failed for %s: %s", underlying, exc)
+                return f"Technical analysis unavailable ({exc})"
+
+        def _run_fundamental() -> str:
+            try:
+                fund = self.fundamental_analyst.analyze(underlying, metrics, date=today)
+                return self.fundamental_analyst.format_report(fund)
+            except Exception as exc:
+                logger.error("Fundamental analysis failed for %s: %s", underlying, exc)
+                return f"Fundamental analysis unavailable ({exc})"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_tech = executor.submit(_run_technical)
+            fut_fund = executor.submit(_run_fundamental)
+            tech_report = fut_tech.result()
+            fund_report = fut_fund.result()
+
+        # ── 4. Speculative Model Routing / Bull vs Bear Debate ───
+        try:
+            outcome = self.debate_engine.run_debate(
+                underlying, metrics, tech_report, fund_report, date=today,
+                strategy_type=strategy_type,
+            )
+            logger.info("Debate outcome for %s: consensus=%s, conviction=%.2f",
+                        underlying, outcome.consensus_decision, outcome.conviction_score)
+        except Exception as exc:
+            logger.error("Debate failed for %s: %s", underlying, exc)
+            return None
+
+        # ── 5. Risk Management & Sizing ──────────────────────────
+        try:
+            if account_equity is None or account_equity <= 0:
+                account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+                account_equity = account.total or settings.DEFAULT_ACCOUNT_EQUITY
+
+            card = self.risk_manager.generate_decision_card(
+                ticker=underlying,
+                trading212_ticker=t212_ticker,
+                direction=direction,
+                metrics=metrics,
+                debate_outcome=outcome,
+                account_equity=account_equity,
+                strategy_type=strategy_type,
+            )
+
+            logger.info("Decision card generated:\n%s", self.risk_manager.format_decision_card(card))
+            return card
+
+        except Exception as exc:
+            logger.error("Risk management failed for %s: %s", underlying, exc)
+            return None
+
+    # ─────────────────────────────────────────────────────────────
+    # Phase 4 — Execution & Order Placement
+    # ─────────────────────────────────────────────────────────────
+    def execute_trade(
+        self,
+        card: DecisionCard,
+        atr: float = 0.0,
+        available_cash: Optional[float] = None,
+        positions: Optional[List[Position]] = None,
+    ) -> bool:
+        """Execute trade on Trading 212 and dispatch BUY/SELL notification."""
+        if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
+            logger.info("Skipping execution for %s — decision=%s", card.ticker, card.decision)
+            self._log_trade(card, executed=False, reason=card.decision)
+            return False
+
+        # ── Pre-trade validation ─────────────────────────────────
+        if available_cash is not None and positions is not None:
+            account_free = available_cash
+            current_positions = positions
+        else:
+            try:
+                account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+                account_free = account.free
+                current_positions = self.t212.get_portfolio()
+            except Trading212Error as exc:
+                if self.dry_run:
+                    logger.warning("Pre-trade broker check unavailable (%s) — using dry-run simulation context", exc)
+                    account_free = 10000.0
+                    current_positions = []
+                else:
+                    logger.error("Pre-trade check failed: %s", exc)
+                    self._log_trade(card, executed=False, reason=str(exc))
+                    return False
+
+        valid, reason = self.risk_manager.validate_trade(card, account_free, current_positions)
+        if not valid:
+            logger.warning("Trade validation FAILED for %s: %s", card.ticker, reason)
+            self._log_trade(card, executed=False, reason=reason)
+            return False
+
+        # ── Execute Entry Order on Trading 212 ───────────────────
+        order_id = "DRY_RUN_ORDER"
+        if not self.dry_run:
+            try:
+                logger.info(
+                    "Placing Trading 212 order: %s (%s) — %.3f shares @ ≈$%.2f",
+                    card.trading212_ticker, card.direction, card.position_size_shares, card.entry_price
+                )
+                entry_order = self.t212.place_market_order(
+                    ticker=card.trading212_ticker,
+                    quantity=card.position_size_shares,
+                )
+                order_id = entry_order.id
+                logger.info("Order executed successfully: id=%s", order_id)
+            except Trading212Error as exc:
+                logger.error("Execution failed for %s: %s", card.trading212_ticker, exc)
+                self._log_trade(card, executed=False, reason=str(exc))
+                return False
+        else:
+            logger.info("[DRY-RUN] Simulated execution for %s: %.3f shares @ $%.2f",
+                        card.trading212_ticker, card.position_size_shares, card.entry_price)
+
+        # ── Register with Active Position Monitor ────────────────
+        pos = self.position_monitor.register_new_trade(
+            card,
+            atr=atr,
+            earnings_in_days=card.earnings_in_days,
+        )
+
+        # ── Place Native Broker GTC Stop Order on Trading 212 ────
+        self.position_monitor.place_broker_stop(pos)
+
+        # ── Dispatch Real-Time Notifications ─────────────────────
+        if card.direction == "LONG":
+            self.notifier.notify_buy(
+                ticker=card.trading212_ticker,
+                underlying=card.ticker,
+                price=card.entry_price,
+                quantity=card.position_size_shares,
+                sl=card.stop_loss,
+                tp1=card.take_profit_1,
+                tp2=card.take_profit_2,
+                tp3=card.take_profit_3,
+                rationale=card.rationale,
+            )
+        else:
+            self.notifier.notify_sell(
+                ticker=card.trading212_ticker,
+                underlying=card.ticker,
+                price=card.entry_price,
+                quantity=card.position_size_shares,
+                sl=card.stop_loss,
+                tp1=card.take_profit_1,
+                tp2=card.take_profit_2,
+                tp3=card.take_profit_3,
+                is_short_entry=True,
+                rationale=card.rationale,
+            )
+
+        self._log_trade(card, executed=True, reason="Entry order placed", entry_order_id=order_id)
+        return True
+
+    # ─────────────────────────────────────────────────────────────
+    # Audit Log
+    # ─────────────────────────────────────────────────────────────
+    def _log_trade(
+        self,
+        card: DecisionCard,
+        executed: bool,
+        reason: str,
+        entry_order_id: Optional[str] = None,
+    ) -> None:
+        """Persist trade record to JSONL audit log."""
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "executed": executed,
+            "reason": reason,
+            "entry_order_id": entry_order_id,
+            **asdict(card),
+        }
+        try:
+            with open(self.trades_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as exc:
+            logger.error("Failed to write audit log: %s", exc)
+
+    def execute_trades_batch(
+        self, candidate_cards: List[tuple[ScreenerResult, DecisionCard]]
+    ) -> List[DecisionCard]:
+        """Execute multiple candidate signals in synchronized sequence with capital pacing.
+
+        Ensures:
+        1. API calls are paced (>= 1.5s) to adhere strictly to broker mutation limits.
+        2. High-conviction signals are prioritized first.
+        3. Free cash and position allocations are tracked incrementally so concurrent signals
+           do not over-commit account capital or trigger redundant broker GET requests.
+        4. Cross-process flag warns background monitor daemons to yield bandwidth.
+        """
+        if not candidate_cards:
+            return []
+
+        # 1. Announce active execution to cross-process daemons
+        Trading212Client.set_trade_active(True)
+
+        try:
+            # 2. Separate actionable entry signals from holds/skips
+            actionable: List[tuple[ScreenerResult, DecisionCard]] = []
+            for cand, card in candidate_cards:
+                if card.decision in ("BUY_ENTRY", "SELL_ENTRY"):
+                    actionable.append((cand, card))
+                else:
+                    self._log_trade(card, executed=False, reason=card.decision)
+
+            if not actionable:
+                return []
+
+            # 3. Sort by conviction score descending (highest conviction gets first capital allocation)
+            actionable.sort(key=lambda item: item[1].conviction_score, reverse=True)
+
+            # 4. Fetch baseline cash and positions once for the entire batch
+            try:
+                account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+                running_free_cash = account.free
+                running_positions = list(self.t212.get_portfolio())
+            except Trading212Error as exc:
+                if self.dry_run:
+                    running_free_cash = 10000.0
+                    running_positions = []
+                else:
+                    logger.error("Batch pre-trade broker check failed: %s", exc)
+                    for _, card in actionable:
+                        self._log_trade(card, executed=False, reason=f"Broker pre-check failed: {exc}")
+                    return []
+
+            executed_cards: List[DecisionCard] = []
+            is_test_mode = getattr(self.t212, "rate_limit_delay", 1.25) < 0.5
+            pacing_delay = self.t212.rate_limit_delay if is_test_mode else 1.5
+
+            for i, (cand, card) in enumerate(actionable):
+                atr = cand.metrics.get("atr", card.entry_price * 0.02)
+
+                # Validate against running capital allocation
+                valid, reason = self.risk_manager.validate_trade(card, running_free_cash, running_positions)
+                if not valid:
+                    logger.warning(
+                        "Batch trade validation FAILED for %s (conviction=%.2f): %s",
+                        card.ticker, card.conviction_score, reason
+                    )
+                    self._log_trade(card, executed=False, reason=reason)
+                    continue
+
+                # Execute order with synchronized running cash and positions
+                success = self.execute_trade(
+                    card,
+                    atr=atr,
+                    available_cash=running_free_cash,
+                    positions=running_positions,
+                )
+                if success:
+                    executed_cards.append(card)
+                    running_free_cash = max(0.0, running_free_cash - card.position_notional)
+                    running_positions.append(Position(
+                        ticker=card.trading212_ticker,
+                        quantity=card.position_size_shares,
+                        average_price=card.entry_price,
+                        current_price=card.entry_price,
+                        ppl=0.0,
+                        max_buy=0.0,
+                        max_sell=0.0,
+                    ))
+
+                    # Pace consecutive orders by broker quota minimum if more orders remain
+                    if i < len(actionable) - 1:
+                        time.sleep(pacing_delay)
+
+            return executed_cards
+
+        finally:
+            Trading212Client.set_trade_active(False)
+
+    # ─────────────────────────────────────────────────────────────
+    # Complete Single Cycle
+    # ─────────────────────────────────────────────────────────────
+    def run_cycle(self) -> List[DecisionCard]:
+        """Execute one complete Scan → Filter → Debate → Execute cycle."""
+        logger.info("━━━ Starting 3x Quantitative Cycle at %s ━━━",
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+        # Step 1: Ingestion
+        metrics_dict = self.ingest_universe_data()
+        if not metrics_dict:
+            logger.warning("No market data ingested — cycle aborted")
+            return []
+
+        # Step 2: Screening
+        candidates = self.screen_candidates(metrics_dict)
+        if not candidates:
+            logger.info("No candidates passed 3x momentum filter this cycle.")
+            return []
+
+        # Step 3: Parallel Deliberation across Candidates
+        candidates_to_process = candidates[:settings.SCREENER_TOP_N]
+        candidate_cards: List[tuple[ScreenerResult, DecisionCard]] = []
+        n_delib_workers = max(1, min(len(candidates_to_process), self.parallel_deliberation_workers))
+
+        logger.info("Deliberating on %d candidate(s) in parallel across %d subagent workers…",
+                    len(candidates_to_process), n_delib_workers)
+
+        # Baseline equity query once before parallel deliberation to avoid concurrent /account/cash hits
+        try:
+            account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+            baseline_equity = account.total or settings.DEFAULT_ACCOUNT_EQUITY
+        except Exception as exc:
+            logger.warning("Baseline equity query failed (%s); using default $%.2f", exc, settings.DEFAULT_ACCOUNT_EQUITY)
+            baseline_equity = settings.DEFAULT_ACCOUNT_EQUITY
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_delib_workers) as executor:
+            future_to_cand = {
+                executor.submit(self.deep_analyse, cand, baseline_equity): cand
+                for cand in candidates_to_process
+            }
+            for future in concurrent.futures.as_completed(future_to_cand):
+                cand = future_to_cand[future]
+                try:
+                    card = future.result()
+                    if card:
+                        candidate_cards.append((cand, card))
+                except Exception as exc:
+                    logger.error("Parallel deliberation failed for %s: %s", cand.ticker, exc)
+
+        # Step 4: Execution & Logging via Synchronized Batch Coordinator
+        executed_cards = self.execute_trades_batch(candidate_cards)
+        logger.info("Cycle finished. %d trades executed.", len(executed_cards))
+        return executed_cards
+
+    # ─────────────────────────────────────────────────────────────
+    # Continuous Loop with Active Position Monitoring
+    # ─────────────────────────────────────────────────────────────
+    def run_loop(self, scan_interval_minutes: int = 60, monitor_interval_seconds: int = 30) -> None:
+        """Run continuous engine loop.
+
+        Performs position monitoring every ``monitor_interval_seconds`` (checking TP1/TP2/TP3/SL/TSL),
+        and runs a full universe scan every ``scan_interval_minutes``.
+        """
+        logger.info(
+            "Starting continuous engine (Scan Interval: %dm, Monitor Interval: %ds). Press Ctrl+C to stop.",
+            scan_interval_minutes, monitor_interval_seconds
+        )
+        last_scan_time = 0.0
+
+        while True:
+            try:
+                now = time.time()
+
+                # 1. Check if it's time for a full scan cycle
+                if now - last_scan_time >= scan_interval_minutes * 60:
+                    logger.info("Triggering scheduled 3x universe scan…")
+                    self.run_cycle()
+                    last_scan_time = time.time()
+
+                # 2. Run active position monitoring tick (TP1, TP2, TP3, SL, TSL)
+                if self.position_monitor.positions:
+                    logger.debug("Checking %d active positions…", len(self.position_monitor.positions))
+                    current_prices = {}
+                    try:
+                        t212_positions = self.t212.get_portfolio()
+                        for p in t212_positions:
+                            if p.current_price > 0:
+                                current_prices[p.ticker] = p.current_price
+                    except Exception as e:
+                        logger.debug("T212 portfolio price fetch: %s", e)
+
+                    for ticker, pos in self.position_monitor.positions.items():
+                        if ticker not in current_prices:
+                            try:
+                                daily = MarketDataProvider.get_daily_candles(pos.underlying, period="5d")
+                                if hasattr(daily, "empty") and not daily.empty:
+                                    current_prices[pos.underlying] = float(daily["close"].iloc[-1])
+                                    current_prices[ticker] = float(daily["close"].iloc[-1])
+                                elif isinstance(daily, list) and daily:
+                                    current_prices[pos.underlying] = float(daily[-1]["close"])
+                                    current_prices[ticker] = float(daily[-1]["close"])
+                            except Exception:
+                                pass
+
+                    self.position_monitor.monitor_tick(current_prices)
+
+                time.sleep(monitor_interval_seconds)
+
+            except KeyboardInterrupt:
+                logger.info("Keyboard interrupt received — stopping loop.")
+                break
+            except Exception as exc:
+                logger.error("Loop iteration error: %s", exc, exc_info=True)
+                time.sleep(10)
+
+    def shutdown(self) -> None:
+        """Clean up resources."""
+        logger.info("Shutting down trading engine…")
+        self.t212.close()
+        logger.info("Shutdown complete.")
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLI Entry Point
+# ─────────────────────────────────────────────────────────────────
+def main() -> None:
+    """CLI runner with diagnostic and testing commands."""
+    logging.basicConfig(
+        level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+        format="%(asctime)s | %(name)-28s | %(levelname)-7s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    parser = argparse.ArgumentParser(description="3x Leveraged Long/Short Quantitative Trading Engine")
+    parser.add_argument("--once", action="store_true", help="Run a single scan & execution cycle and exit")
+    parser.add_argument("--interval", type=int, default=60, help="Minutes between full universe scans (default: 60)")
+    parser.add_argument("--monitor-interval", type=int, default=30, help="Seconds between position monitor ticks (default: 30)")
+    parser.add_argument("--dry-run", action="store_true", help="Run in paper-trade mode without real order execution")
+    parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
+    args = parser.parse_args()
+
+    engine = Orchestrator(dry_run=args.dry_run)
+
+    # Test all 7 notification formats if requested
+    if args.test_notifications:
+        print("\n🧪 Testing all 7 notification formats (Console, Desktop, Webhooks)...\n")
+        engine.notifier.notify_buy(
+            ticker="QQQ3l_EQ", underlying="QQQ", price=150.25, quantity=10.0,
+            sl=145.00, tp1=155.50, tp2=160.75, tp3=166.00,
+            rationale="High-conviction 3x Bullish breakout (ADX=29.4, 20 EMA > 50 EMA)"
+        )
+        time.sleep(0.5)
+        engine.notifier.notify_tp1(
+            ticker="QQQ3l_EQ", underlying="QQQ", direction="LONG", price=155.50,
+            quantity_sold=3.33, pnl=17.48, pnl_pct=3.49, new_sl=150.25
+        )
+        time.sleep(0.5)
+        engine.notifier.notify_tp2(
+            ticker="QQQ3l_EQ", underlying="QQQ", direction="LONG", price=160.75,
+            quantity_sold=3.33, pnl=34.97, pnl_pct=6.99, tsl=155.50
+        )
+        time.sleep(0.5)
+        engine.notifier.notify_tsl(
+            ticker="QQQ3l_EQ", underlying="QQQ", direction="LONG", current_price=163.00,
+            new_tsl=158.20, locked_in_pnl_pct=5.29
+        )
+        time.sleep(0.5)
+        engine.notifier.notify_tp3(
+            ticker="QQQ3l_EQ", underlying="QQQ", direction="LONG", price=166.00,
+            quantity_sold=3.34, pnl=52.61, pnl_pct=10.48
+        )
+        time.sleep(0.5)
+        engine.notifier.notify_sell(
+            ticker="QQQSl_EQ", underlying="QQQ", price=45.10, quantity=25.0,
+            sl=47.50, tp1=42.70, tp2=40.30, tp3=37.90, is_short_entry=True,
+            rationale="3x Bearish breakdown momentum detected (ADX=31.2, 20 EMA < 50 EMA)"
+        )
+        time.sleep(0.5)
+        engine.notifier.notify_sl(
+            ticker="QQQSl_EQ", underlying="QQQ", direction="SHORT", price=47.50,
+            quantity=25.0, loss_amount=60.00, loss_pct=5.32
+        )
+        print("\n✅ All 7 notification event tests completed successfully!\n")
+        return
+
+    try:
+        if args.once:
+            engine.run_cycle()
+        else:
+            engine.run_loop(
+                scan_interval_minutes=args.interval,
+                monitor_interval_seconds=args.monitor_interval,
+            )
+    finally:
+        engine.shutdown()
+
+
+if __name__ == "__main__":
+    main()

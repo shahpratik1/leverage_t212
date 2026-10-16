@@ -1,0 +1,369 @@
+"""3x & 5x Leveraged Asset Universe for Trading 212.
+
+Provides curated pairs and dynamic discovery for 3x & 5x Long and Inverse Short
+Exchange Traded Products (ETPs) available on Trading 212 (London Stock Exchange / European listings).
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LeveragedPair:
+    """A paired set of 3x (and optionally 5x) Long and Short instruments tied to an underlying asset."""
+    underlying_symbol: str      # e.g., 'QQQ', 'NVDA', 'SPY' (used for technicals/yfinance)
+    name: str                   # e.g., 'Nasdaq 100', 'NVIDIA', 'S&P 500'
+    category: str               # 'Index', 'Tech Equity', 'Commodity', 'Fixed Income'
+    long_3x_ticker: str         # Trading 212 ticker for 3x Long (e.g. 'QQQ3l_EQ')
+    long_3x_name: str           # Full instrument name
+    short_3x_ticker: str        # Trading 212 ticker for 3x Short (e.g. 'QQQSl_EQ')
+    short_3x_name: str          # Full instrument name
+    currency: str = "USD"
+    # 5x Leverage Extensions (Leverage Shares LSE/EU on Trading 212)
+    long_5x_ticker: Optional[str] = None   # Trading 212 ticker for 5x Long (e.g. 'QQQ5l_EQ')
+    long_5x_name: Optional[str] = None     # Full 5x Long instrument name
+    short_5x_ticker: Optional[str] = None  # Trading 212 ticker for -5x Short (e.g. 'QQ3Sl_EQ')
+    short_5x_name: Optional[str] = None    # Full -5x Short instrument name
+    has_5x: bool = False
+
+    def __post_init__(self) -> None:
+        if self.long_5x_ticker or self.short_5x_ticker:
+            self.has_5x = True
+
+
+# ── Curated high-liquidity 3x & 5x pairs on Trading 212 ───────────────────────
+# These represent the most actively traded 3x & 5x ETPs on the London / European exchanges
+# available via Trading 212 Equity with proven liquidity and tight spreads.
+# Single equities max out at 3x under UCITS/PRIIPs concentration rules.
+# Broad indices, commodities, and fixed income offer institutional 5x leverage.
+CURATED_3X_PAIRS: List[LeveragedPair] = [
+    LeveragedPair(
+        underlying_symbol="QQQ",
+        name="Nasdaq 100",
+        category="Index",
+        long_3x_ticker="QQQ3l_EQ",
+        long_3x_name="WisdomTree NASDAQ 100 3x Daily Leveraged",
+        short_3x_ticker="QQQSl_EQ",
+        short_3x_name="WisdomTree NASDAQ 100 3x Daily Short",
+        currency="USD",
+        long_5x_ticker="QQQ5l_EQ",
+        long_5x_name="Leverage Shares 5x Long US Tech 100 ETP",
+        short_5x_ticker="QQ3Sl_EQ",
+        short_5x_name="Leverage Shares -5x Short US Tech 100 ETP",
+    ),
+    LeveragedPair(
+        underlying_symbol="SPY",
+        name="S&P 500",
+        category="Index",
+        long_3x_ticker="3USLl_EQ",
+        long_3x_name="WisdomTree S&P 500 3x Daily Leveraged",
+        short_3x_ticker="3USSl_EQ",
+        short_3x_name="WisdomTree S&P 500 3x Daily Short",
+        currency="USD",
+        long_5x_ticker="SP5Yl_EQ",
+        long_5x_name="Leverage Shares 5x Long US 500 ETP",
+        short_5x_ticker="SPYSl_EQ",
+        short_5x_name="Leverage Shares -5x Short US 500 ETP",
+    ),
+    LeveragedPair(
+        underlying_symbol="NVDA",
+        name="NVIDIA",
+        category="Tech Equity",
+        long_3x_ticker="3LNVl_EQ",
+        long_3x_name="GraniteShares 3x Long NVIDIA",
+        short_3x_ticker="3SNVl_EQ",
+        short_3x_name="GraniteShares 3x Short NVIDIA",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="TSLA",
+        name="Tesla",
+        category="Tech Equity",
+        long_3x_ticker="3LTSl_EQ",
+        long_3x_name="GraniteShares 3x Long Tesla",
+        short_3x_ticker="3STSl_EQ",
+        short_3x_name="GraniteShares 3x Short Tesla",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="AAPL",
+        name="Apple",
+        category="Tech Equity",
+        long_3x_ticker="AAP3l_EQ",
+        long_3x_name="Leverage Shares 3x Apple",
+        short_3x_ticker="AAPSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Apple AAPL",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="MSFT",
+        name="Microsoft",
+        category="Tech Equity",
+        long_3x_ticker="MSF3l_EQ",
+        long_3x_name="Leverage Shares 3x Microsoft",
+        short_3x_ticker="MS3Sl_EQ",
+        short_3x_name="Leverage Shares -3x Short Microsoft MSFT",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="AMZN",
+        name="Amazon",
+        category="Tech Equity",
+        long_3x_ticker="3LZPl_EQ",
+        long_3x_name="GraniteShares 3x Long Amazon",
+        short_3x_ticker="3SZNl_EQ",
+        short_3x_name="GraniteShares 3x Short Amazon",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="GOOGL",
+        name="Alphabet (Google)",
+        category="Tech Equity",
+        long_3x_ticker="3LALl_EQ",
+        long_3x_name="GraniteShares 3x Long Alphabet",
+        short_3x_ticker="GGESl_EQ",
+        short_3x_name="Leverage Shares -3x Short Alphabet GOOG",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="SOXX",
+        name="Semiconductors",
+        category="Index",
+        long_3x_ticker="3SEMl_EQ",
+        long_3x_name="WisdomTree PHLX Semiconductor 3x Daily Leveraged",
+        short_3x_ticker="SM3El_EQ",
+        short_3x_name="Leverage Shares -3x Short Semiconductors",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="GLD",
+        name="Gold",
+        category="Commodity",
+        long_3x_ticker="3GLEl_EQ",
+        long_3x_name="Leverage Shares 3x Long Gold",
+        short_3x_ticker="GDMSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Gold Miners",
+        currency="USD",
+        long_5x_ticker="GLD5l_EQ",
+        long_5x_name="Leverage Shares 5x Long Gold ETP",
+        short_5x_ticker=None,
+        short_5x_name=None,
+    ),
+    LeveragedPair(
+        underlying_symbol="SLV",
+        name="Silver",
+        category="Commodity",
+        long_3x_ticker="3SLVl_EQ",
+        long_3x_name="Leverage Shares 3x Long Silver",
+        short_3x_ticker="SLVSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Silver",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="USO",
+        name="WTI Crude Oil",
+        category="Commodity",
+        long_3x_ticker="WTI3l_EQ",
+        long_3x_name="Leverage Shares 3x Long WTI Oil",
+        short_3x_ticker="SWTOl_EQ",
+        short_3x_name="Leverage Shares -3x Short WTI Oil",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="TSM",
+        name="Taiwan Semiconductor (TSMC)",
+        category="Global Tech",
+        long_3x_ticker="3TSMl_EQ",
+        long_3x_name="Leverage Shares 3x Long TSMC",
+        short_3x_ticker="STSMl_EQ",
+        short_3x_name="Leverage Shares -3x Short TSMC",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="TLT",
+        name="20+ Year Treasury Bond",
+        category="Fixed Income",
+        long_3x_ticker="3TYLl_EQ",
+        long_3x_name="Leverage Shares 3x Long US Treasuries",
+        short_3x_ticker="3TYSl_EQ",
+        short_3x_name="Leverage Shares -3x Short US Treasuries",
+        currency="USD",
+        long_5x_ticker="TLT5l_EQ",
+        long_5x_name="Leverage Shares 5x Long 20+ Year Treasury Bond ETP",
+        short_5x_ticker="TL5Sl_EQ",
+        short_5x_name="Leverage Shares -5x Short 20+ Year Treasury Bond ETP",
+    ),
+    LeveragedPair(
+        underlying_symbol="MAGS",
+        name="Magnificent 7 (Big Tech Basket)",
+        category="Tech Basket",
+        long_3x_ticker="MAG7l_EQ",
+        long_3x_name="Leverage Shares 3x Long Magnificent 7",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+        long_5x_ticker="MAG7l_EQ",
+        long_5x_name="Leverage Shares 5x Long Magnificent 7 ETP",
+        short_5x_ticker=None,
+        short_5x_name=None,
+    ),
+    LeveragedPair(
+        underlying_symbol="^HSI",
+        name="Hong Kong Hang Seng",
+        category="Global Index",
+        long_3x_ticker="3HSl_EQ",
+        long_3x_name="GraniteShares 3x Long Hang Seng",
+        short_3x_ticker="3SHSl_EQ",
+        short_3x_name="GraniteShares 3x Short Hang Seng",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="^GDAXI",
+        name="Germany DAX 40",
+        category="Global Index",
+        long_3x_ticker="3DELl_EQ",
+        long_3x_name="WisdomTree DAX 3x Daily Leveraged",
+        short_3x_ticker="3DESl_EQ",
+        short_3x_name="WisdomTree DAX 3x Daily Short",
+        currency="EUR",
+        long_5x_ticker="DAX5l_EQ",
+        long_5x_name="Leverage Shares 5x Long Germany 40 ETP",
+        short_5x_ticker="DAXSl_EQ",
+        short_5x_name="Leverage Shares -5x Short Germany 40 ETP",
+    ),
+    LeveragedPair(
+        underlying_symbol="^FTSE",
+        name="UK FTSE 100",
+        category="Global Index",
+        long_3x_ticker="3UKLl_EQ",
+        long_3x_name="WisdomTree FTSE 100 3x Daily Leveraged",
+        short_3x_ticker="3UKSl_EQ",
+        short_3x_name="WisdomTree FTSE 100 3x Daily Short",
+        currency="GBP",
+        long_5x_ticker="5UKXl_EQ",
+        long_5x_name="Leverage Shares 5x Long FTSE 100 ETP",
+        short_5x_ticker=None,
+        short_5x_name=None,
+    ),
+    LeveragedPair(
+        underlying_symbol="^STOXX50E",
+        name="EURO STOXX 50",
+        category="Global Index",
+        long_3x_ticker="3EULl_EQ",
+        long_3x_name="WisdomTree EURO STOXX 50 3x Daily Leveraged",
+        short_3x_ticker="3EUSl_EQ",
+        short_3x_name="WisdomTree EURO STOXX 50 3x Daily Short",
+        currency="EUR",
+        long_5x_ticker="5SX5l_EQ",
+        long_5x_name="Leverage Shares 5x Long EURO STOXX 50 ETP",
+        short_5x_ticker=None,
+        short_5x_name=None,
+    ),
+    LeveragedPair(
+        underlying_symbol="SAP",
+        name="SAP SE (Germany)",
+        category="Global Tech",
+        long_3x_ticker="3SAPl_EQ",
+        long_3x_name="Leverage Shares 3x Long SAP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+]
+
+
+class LeveragedUniverse:
+    """Manages 3x and 5x leveraged trading universe for Long & Short opportunities on Trading 212."""
+
+    def __init__(self, pairs: Optional[List[LeveragedPair]] = None):
+        self.pairs: List[LeveragedPair] = pairs or CURATED_3X_PAIRS
+        self._underlying_map: Dict[str, LeveragedPair] = {
+            p.underlying_symbol.upper(): p for p in self.pairs
+        }
+
+    def get_all_underlyings(self) -> List[str]:
+        """Return list of all underlying symbols to fetch OHLCV data for."""
+        return [p.underlying_symbol for p in self.pairs]
+
+    def get_pair_for_underlying(self, underlying: str) -> Optional[LeveragedPair]:
+        """Lookup leveraged pair by underlying ticker."""
+        return self._underlying_map.get(underlying.upper())
+
+    def has_5x_leverage(self, underlying: str, direction: Optional[str] = None) -> bool:
+        """Check whether 5x leverage is available for the given underlying asset on Trading 212."""
+        pair = self.get_pair_for_underlying(underlying)
+        if not pair or not pair.has_5x:
+            return False
+        if direction is None:
+            return pair.has_5x
+        direction_upper = direction.upper()
+        if direction_upper in ("LONG", "BUY", "BULLISH"):
+            return bool(pair.long_5x_ticker)
+        elif direction_upper in ("SHORT", "SELL", "BEARISH"):
+            return bool(pair.short_5x_ticker and pair.short_5x_ticker != "None")
+        return False
+
+    def get_available_leverage_multipliers(self, underlying: str) -> List[int]:
+        """Return supported leverage multipliers for an asset (e.g. [3, 5] or [3])."""
+        pair = self.get_pair_for_underlying(underlying)
+        if not pair:
+            return [1]
+        return [3, 5] if pair.has_5x else [3]
+
+    def get_execution_ticker(
+        self,
+        underlying: str,
+        direction: str,
+        leverage: int = 3,
+    ) -> Optional[str]:
+        """Given an underlying symbol, direction ('LONG' or 'SHORT'), and desired leverage (3 or 5),
+        return the appropriate Trading 212 execution ticker.
+
+        If 5x is requested but unavailable for this asset or direction, gracefully falls back to 3x.
+        """
+        pair = self.get_pair_for_underlying(underlying)
+        if not pair:
+            return None
+
+        direction_upper = direction.upper()
+        is_long = direction_upper in ("LONG", "BUY", "BULLISH")
+        is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
+
+        # 5x Resolution with automatic 3x fallback
+        if leverage >= 5 and pair.has_5x:
+            if is_long and pair.long_5x_ticker:
+                return pair.long_5x_ticker
+            elif is_short and pair.short_5x_ticker and pair.short_5x_ticker != "None":
+                return pair.short_5x_ticker
+            logger.info("5x %s ETP unavailable for %s; falling back to 3x ETP", direction_upper, underlying)
+
+        # 3x Resolution (standard)
+        if is_long:
+            return pair.long_3x_ticker
+        elif is_short:
+            return pair.short_3x_ticker if pair.short_3x_ticker != "None" else None
+
+        return None
+
+    def get_5x_pairs(self) -> List[LeveragedPair]:
+        """Return all pairs in the universe that support 5x leverage."""
+        return [p for p in self.pairs if p.has_5x]
+
+    def get_all_execution_tickers(self) -> List[str]:
+        """Return list of all 3x and 5x Trading 212 execution tickers."""
+        tickers = []
+        for p in self.pairs:
+            if p.long_3x_ticker:
+                tickers.append(p.long_3x_ticker)
+            if p.short_3x_ticker and p.short_3x_ticker != "None":
+                tickers.append(p.short_3x_ticker)
+            if p.long_5x_ticker:
+                tickers.append(p.long_5x_ticker)
+            if p.short_5x_ticker and p.short_5x_ticker != "None":
+                tickers.append(p.short_5x_ticker)
+        return list(dict.fromkeys(tickers))

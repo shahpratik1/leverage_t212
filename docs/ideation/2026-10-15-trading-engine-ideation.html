@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ideation: Institutional 3x Leveraged Quantitative Trading Engine</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: #111827;
+      --card-border: #1f293d;
+      --card-hover: #26334d;
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --cyan: #06b6d4;
+      --cyan-glow: rgba(6, 182, 212, 0.15);
+      --emerald: #10b981;
+      --emerald-glow: rgba(16, 185, 129, 0.15);
+      --amber: #f59e0b;
+      --amber-glow: rgba(245, 158, 11, 0.15);
+      --rose: #f43f5e;
+      --indigo: #6366f1;
+      --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text-main);
+      font-family: var(--font-stack);
+      line-height: 1.6;
+      padding: 2.5rem 1.5rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    header.doc-header {
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 2rem;
+      margin-bottom: 2.5rem;
+    }
+    .badge-bar {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-bottom: 1rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .badge-cyan { background: var(--cyan-glow); color: var(--cyan); border: 1px solid rgba(6,182,212,0.3); }
+    .badge-emerald { background: var(--emerald-glow); color: var(--emerald); border: 1px solid rgba(16,185,129,0.3); }
+    .badge-amber { background: var(--amber-glow); color: var(--amber); border: 1px solid rgba(245,158,11,0.3); }
+    .badge-indigo { background: rgba(99,102,241,0.15); color: var(--indigo); border: 1px solid rgba(99,102,241,0.3); }
+    .badge-mono { font-family: var(--font-mono); }
+
+    h1 {
+      font-size: 2.25rem;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: -0.025em;
+      margin-bottom: 0.75rem;
+    }
+    .subtitle {
+      font-size: 1.1rem;
+      color: var(--text-muted);
+      max-width: 850px;
+      margin-bottom: 1.25rem;
+    }
+    .header-metadata {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      font-size: 0.85rem;
+    }
+    .meta-item strong { display: block; color: var(--text-dim); text-transform: uppercase; font-size: 0.7rem; margin-bottom: 0.15rem; }
+    .meta-item span { color: var(--text-main); font-weight: 500; font-family: var(--font-mono); }
+
+    section { margin-bottom: 3.5rem; }
+    h2.section-title {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1.25rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--card-border);
+    }
+    h2.section-title .count-pill {
+      background: var(--card-border);
+      color: var(--cyan);
+      font-size: 0.8rem;
+      padding: 0.15rem 0.55rem;
+      border-radius: 9999px;
+      font-family: var(--font-mono);
+    }
+
+    .grounding-box {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .grounding-box h3 {
+      font-size: 1rem;
+      color: var(--cyan);
+      margin-bottom: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .grounding-box ul {
+      list-style-type: disc;
+      padding-left: 1.5rem;
+      color: var(--text-muted);
+      font-size: 0.925rem;
+    }
+    .grounding-box ul li { margin-bottom: 0.5rem; }
+    .grounding-box strong { color: var(--text-main); }
+
+    .jump-nav {
+      background: rgba(17, 24, 39, 0.7);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 2rem;
+    }
+    .jump-nav strong { display: block; font-size: 0.8rem; text-transform: uppercase; color: var(--text-dim); margin-bottom: 0.5rem; }
+    .jump-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1rem;
+    }
+    .jump-links a {
+      color: var(--cyan);
+      text-decoration: none;
+      font-size: 0.85rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      transition: color 0.15s ease;
+    }
+    .jump-links a:hover { color: #ffffff; text-decoration: underline; }
+
+    .idea-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 2rem;
+      margin-bottom: 2rem;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      position: relative;
+    }
+    .idea-card:hover {
+      border-color: var(--card-hover);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+    .idea-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+    .idea-title-group h3 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 0.25rem;
+    }
+    .idea-axis-tag {
+      font-size: 0.8rem;
+      color: var(--cyan);
+      font-family: var(--font-mono);
+    }
+    .idea-meta-badges {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .idea-desc {
+      font-size: 1rem;
+      color: var(--text-main);
+      margin-bottom: 1.5rem;
+      line-height: 1.65;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.25rem;
+      background: #0d121f;
+      border: 1px solid rgba(31, 41, 61, 0.6);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin-bottom: 1.5rem;
+    }
+    .field-block strong {
+      display: block;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.35rem;
+    }
+    .field-block.basis strong { color: var(--indigo); }
+    .field-block.rationale strong { color: var(--emerald); }
+    .field-block.downsides strong { color: var(--rose); }
+    .field-block p {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+    .field-block code {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      background: rgba(0,0,0,0.3);
+      padding: 0.15rem 0.35rem;
+      border-radius: 4px;
+      color: #e5e7eb;
+    }
+
+    .diagram-container {
+      background: #080c14;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-top: 1rem;
+      text-align: center;
+    }
+    .diagram-container svg {
+      max-width: 100%;
+      height: auto;
+    }
+    .diagram-caption {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      margin-top: 0.75rem;
+      font-style: italic;
+    }
+
+    table.rejection-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+      background: var(--card-bg);
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--card-border);
+    }
+    table.rejection-table th {
+      background: #0d121f;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--card-border);
+    }
+    table.rejection-table td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid rgba(31, 41, 61, 0.4);
+      color: var(--text-muted);
+      vertical-align: top;
+    }
+    table.rejection-table tr:hover td { background: rgba(255,255,255,0.02); }
+    table.rejection-table td.idx { font-family: var(--font-mono); color: var(--text-dim); width: 3rem; }
+    table.rejection-table td.title { color: var(--text-main); font-weight: 500; width: 35%; }
+
+    footer.composition-signal {
+      margin-top: 4rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--card-border);
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <header class="doc-header">
+    <div class="badge-bar">
+      <span class="badge badge-cyan">ce-ideate</span>
+      <span class="badge badge-emerald">Surprise-Me Discovery</span>
+      <span class="badge badge-indigo">7 Ranked Survivors</span>
+      <span class="badge badge-mono">Quantitative Trading Desk</span>
+    </div>
+    <h1>Institutional 3x Leveraged Trading Engine: Architecture & Alpha Ideation</h1>
+    <p class="subtitle">
+      A systematic discovery and adversarial evaluation of high-impact improvements for the <code>modest-bose</code> quantitative engine, spanning valuation bridge mechanics, Avionic Flight Envelope protection, and transatlantic liquidity capture.
+    </p>
+    <div class="header-metadata">
+      <div class="meta-item">
+        <strong>Composition Date</strong>
+        <span>2026-10-15</span>
+      </div>
+      <div class="meta-item">
+        <strong>Execution Mode</strong>
+        <span>repo-grounded</span>
+      </div>
+      <div class="meta-item">
+        <strong>Raw Candidates Audited</strong>
+        <span>52 Candidates (45 Cut)</span>
+      </div>
+      <div class="meta-item">
+        <strong>Target Universe</strong>
+        <span>3x Leveraged ETPs / Trading 212</span>
+      </div>
+    </div>
+  </header>
+
+  <section id="grounding-context">
+    <h2 class="section-title">
+      Grounding Context <span class="count-pill">Validated Repo & Domain Signal</span>
+    </h2>
+    <div class="grounding-box">
+      <h3>Codebase Reality (modest-bose)</h3>
+      <ul>
+        <li><strong>Architecture & Execution:</strong> Orchestrator deploys parallel 12-worker ingestion feeding <code>LayaScreener</code> (ModernBERT NLI & ADX gate) and <code>DebateEngine</code> (speculative fast reflex vs deep LLM deliberation). Orders transmit to Trading 212 REST API for spot BUY of 3x Long and Short (inverse) ETPs.</li>
+        <li><strong>Critical Coordinate Fracture:</strong> Position sizing, ATR stop distances, and profit targets are calculated using underlying index prices ($500 QQQ, 8,200 FTSE), but orders transmit on European ETP tickers (£15 QQQ3, £8 3UKL). This causes 95% capital under-allocation and instant false stop-outs on tick 1 of <code>PositionMonitor</code>.</li>
+        <li><strong>Microstructure & Friction Gaps:</strong> Stop-losses rely on 1x unscaled ATR on 3x instruments. Cross-currency ETPs incur Trading 212's 0.15% spot FX fee (0.30% round-trip). Client-side 30-second polling leaves open positions exposed to server crashes during market hours.</li>
+      </ul>
+    </div>
+    <div class="grounding-box">
+      <h3>External Quantitative Theorems & Market Microstructure</h3>
+      <ul>
+        <li><strong>Mathematical Volatility Drag (Avellaneda & Zhang, 2010):</strong> Proved continuous return tracks \(L_t/L_0 pprox (S_t/S_0)^eta \exp\left(rac{eta - eta^2}{2} V_tight)\). For \(eta = 3\), the quadratic drag coefficient is \(-3.0 \cdot V_t\). Passive holding through sideways chop guarantees exponential capital decay.</li>
+        <li><strong>Market-on-Close Rebalancing Flow (Cheng & Madhavan, 2009):</strong> Mandatory mechanical rebalancing by 3x ETP issuers at 16:00 UTC creates massive, predictable market-on-close liquidity shocks and intraday momentum continuation.</li>
+        <li><strong>Computation vs. Narration Principle (FinRobot / TradingAgents):</strong> Quantitative triggers, ATR, and sizing must be computed deterministically in microseconds; LLMs should be reserved strictly for qualitative risk disqualification.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="topic-axes">
+    <h2 class="section-title">
+      Topic Axes
+    </h2>
+    <p style="color: var(--text-muted); font-size: 0.9rem; font-family: var(--font-mono);">
+      Decomposition skipped — surprise-me mode (Exploration allowed each frame to independently discover and challenge core structural assumptions).
+    </p>
+  </section>
+
+  <section id="ranked-ideas">
+    <h2 class="section-title">
+      Ranked Ideas <span class="count-pill">7 High-Conviction Survivors</span>
+    </h2>
+
+    <nav class="jump-nav">
+      <strong>Jump to Idea:</strong>
+      <div class="jump-links">
+        <a href="#idea-1">1. Canonical Dual-Asset Quote Bridge</a>
+        <a href="#idea-2">2. Avionic Flight Envelope Protection</a>
+        <a href="#idea-3">3. Pre-Mortem Invalidation Sentinel</a>
+        <a href="#idea-4">4. Asymmetric Session Protocol</a>
+        <a href="#idea-5">5. Zero-Drag Currency-Native Routing</a>
+        <a href="#idea-6">6. End-of-Day Rebalancing Liquidity Harvester</a>
+        <a href="#idea-7">7. Fail-Fast Startup Attestation Barrier</a>
+      </div>
+    </nav>
+
+    <!-- IDEA 1 -->
+    <article class="idea-card" id="idea-1">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>1. Canonical Dual-Asset Quote Bridge & Ingestion Normalizer</h3>
+          <span class="idea-axis-tag">Axis: Execution & Pricing Integrity</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 98%</span>
+          <span class="badge badge-indigo">Complexity: Medium</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Establishes a unified translation layer at the ingestion boundary that simultaneously ingests live quotes, spreads, tick increments, and FX exchange rates for both the underlying index/stock and its paired European 3x ETP. Underlying candles are utilized strictly for directional indicator math, while position sizing, ATR-based risk distances, and order execution are computed natively in ETP price coordinates and currency.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>direct:</code> <code>trading_system/agents/risk_manager.py:166-173</code> computes <code>entry_price = metrics.get('close')</code>, <code>stop_loss</code>, and <code>position_size_shares</code> on underlying prices ($500 QQQ), which <code>trading_system/execution/position_monitor.py:135-154</code> checks against ETP market prices (£15 QQQ3), triggering immediate false liquidations.
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            Resolves the single most critical structural bug in the repository. Without this bridge, every live order buys <£10 of an asset or instantly stops out on the first price tick. Normalizing at the ingestion boundary makes all downstream agents, risk rules, and monitors permanently mathematically coherent.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            Increases market ingestion requests from 1 to 2 API calls per asset pair, requiring lightweight caching to stay well inside broker rate limits.
+          </p>
+        </div>
+      </div>
+
+      <div class="diagram-container">
+        <svg viewBox="0 0 800 160" width="100%" height="160" xmlns="http://www.w3.org/2000/svg">
+          <rect x="20" y="30" width="220" height="100" rx="8" fill="#111827" stroke="#06b6d4" stroke-width="2"/>
+          <text x="130" y="65" fill="#ffffff" font-size="14" font-weight="bold" text-anchor="middle">Underlying Asset</text>
+          <text x="130" y="90" fill="#9ca3af" font-size="12" text-anchor="middle">QQQ @ $500.00 (USD)</text>
+          <text x="130" y="110" fill="#06b6d4" font-size="11" text-anchor="middle">Directional Alpha & Indicators</text>
+
+          <path d="M 240 80 L 310 80" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow)" fill="none"/>
+
+          <rect x="310" y="20" width="200" height="120" rx="8" fill="#1f293d" stroke="#6366f1" stroke-width="2"/>
+          <text x="410" y="50" fill="#ffffff" font-size="13" font-weight="bold" text-anchor="middle">Quote & FX Bridge</text>
+          <text x="410" y="75" fill="#a5b4fc" font-size="11" text-anchor="middle">• Live ETP Order Book</text>
+          <text x="410" y="95" fill="#a5b4fc" font-size="11" text-anchor="middle">• Spot FX Rate (USD/GBP)</text>
+          <text x="410" y="115" fill="#a5b4fc" font-size="11" text-anchor="middle">• Delta & Tick Translation</text>
+
+          <path d="M 510 80 L 570 80" stroke="#10b981" stroke-width="2" fill="none"/>
+
+          <rect x="570" y="30" width="210" height="100" rx="8" fill="#111827" stroke="#10b981" stroke-width="2"/>
+          <text x="675" y="65" fill="#ffffff" font-size="14" font-weight="bold" text-anchor="middle">Native 3x ETP Order</text>
+          <text x="675" y="90" fill="#9ca3af" font-size="12" text-anchor="middle">QQQ3 @ £15.20 (GBP)</text>
+          <text x="675" y="110" fill="#10b981" font-size="11" text-anchor="middle">Exact Sizing & Valid Stops</text>
+        </svg>
+        <p class="diagram-caption">Figure 1: Architectural Decoupling of Underlying Indicator Space from Native ETP Execution Coordinates</p>
+      </div>
+    </article>
+
+    <!-- IDEA 2 -->
+    <article class="idea-card" id="idea-2">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>2. Avionic Flight Envelope: Realized Path-Variance Budgeting for 3x Volatility Drag</h3>
+          <span class="idea-axis-tag">Axis: Mathematical Risk Engineering</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 95%</span>
+          <span class="badge badge-indigo">Complexity: Medium</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Replaces static linear stop-losses with an Avionic Flight Envelope that models quadratic variance drag (\(\int \sigma^2 dt\)) in 3x daily rebalanced ETPs. The engine tracks an accumulating "Variance Budget": if an asset enters prolonged sideways chop where mathematical drag exceeds expected delta, the flight envelope triggers an autonomous Alpha-Floor exit, overriding bullish LLM conviction and liquidating the position before compounding decay destroys capital.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>external:</code> Avellaneda & Zhang (2010), <em>Path-Dependence of Leveraged ETF Returns</em>, proving quadratic drag tracks \(-3.0 \cdot V_t\) for \(eta=3\); <code>direct:</code> <code>trading_system/agents/risk_manager.py:78</code> relies on 1x unscaled ATR stops oblivious to path variance.
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            3x leveraged products are non-Markovian: price level alone does not reflect position health. A trade that oscillates near breakeven for 4 days loses 4–8% in ETP value purely to mathematical drag. Budgeting variance terminates dead-money positions dynamically.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            May occasionally exit right before a delayed breakout if choppy price action prematurely consumes the path-variance budget.
+          </p>
+        </div>
+      </div>
+
+      <div class="diagram-container">
+        <svg viewBox="0 0 800 150" width="100%" height="150" xmlns="http://www.w3.org/2000/svg">
+          <line x1="50" y1="120" x2="750" y2="120" stroke="#374151" stroke-width="1"/>
+          <line x1="50" y1="20" x2="50" y2="120" stroke="#374151" stroke-width="1"/>
+          <text x="35" y="25" fill="#9ca3af" font-size="10">NAV</text>
+          <text x="730" y="135" fill="#9ca3af" font-size="10">Holding Hours</text>
+
+          <!-- Flat underlying line -->
+          <line x1="50" y1="50" x2="750" y2="50" stroke="#9ca3af" stroke-dasharray="4" stroke-width="1.5"/>
+          <text x="560" y="42" fill="#9ca3af" font-size="11">Underlying Price (Flat / Breakeven)</text>
+
+          <!-- Decaying 3x curve -->
+          <path d="M 50 50 Q 300 65 520 95 Q 650 115 750 120" stroke="#f43f5e" stroke-width="2.5" fill="none"/>
+          <text x="440" y="80" fill="#f43f5e" font-size="11">3x ETP NAV Decay (-3.0 * Vt)</text>
+
+          <!-- Flight envelope cut -->
+          <line x1="520" y1="20" x2="520" y2="120" stroke="#06b6d4" stroke-width="2" stroke-dasharray="3"/>
+          <rect x="445" y="15" width="150" height="24" rx="4" fill="#06b6d4"/>
+          <text x="520" y="31" fill="#090d16" font-size="10" font-weight="bold" text-anchor="middle">ALPHA FLOOR EJECT</text>
+        </svg>
+        <p class="diagram-caption">Figure 2: Avionic Flight Envelope Ejection When Integrated Variance Drag Exhausts Trade Asymmetry</p>
+      </div>
+    </article>
+
+    <!-- IDEA 3 -->
+    <article class="idea-card" id="idea-3">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>3. Pre-Mortem Invalidation Sentinel: Fast Adversarial Risk Gating</h3>
+          <span class="idea-axis-tag">Axis: Multi-Agent Deliberation Architecture</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 92%</span>
+          <span class="badge badge-cyan">Complexity: Low</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Re-architects System 2 multi-agent deliberation by stripping LLMs of slow, hallucinatory directional price forecasting and re-anchoring them strictly as an adversarial "Pre-Mortem Invalidation Sentinel". High-speed statistical models (Laya NLI, Connors 3-RSI, ADX) determine entry alpha; the candidate then passes to a lightweight sub-2-second adversarial LLM auditor whose sole job is to prove an immediate disqualifier (e.g. corporate earnings within 48h, antitrust/macro releases, abnormal bid-ask spread widening). If no fatal disqualifier is proven, the order clears immediately.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>direct:</code> <code>trading_system/agents/debate_engine.py:24-33</code> blocks execution for 15–45s while generating speculative narrative arguments; <code>external:</code> FinRobot / TradingAgents principle of "Computation vs. Narration" (deterministic code drives quantitative triggers; LLMs provide qualitative boundary checks).
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            LLMs possess near-zero directional edge on microsecond technical price bounces, but excel at unstructured qualitative risk identification. Re-scoping the LLM to an adversarial veto slashes execution latency from 30s to <2s while filtering out catastrophic exogenous landmines.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            Relies on accurate qualitative inputs (news/catalyst dates) fed into the prompt; overly pessimistic prompts could veto valid high-volatility breakouts.
+          </p>
+        </div>
+      </div>
+    </article>
+
+    <!-- IDEA 4 -->
+    <article class="idea-card" id="idea-4">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>4. Asymmetric Session Protocol: Intraday Inverse Hedging & 16:20 Gap Evacuation</h3>
+          <span class="idea-axis-tag">Axis: Market Microstructure & Session Timing</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 94%</span>
+          <span class="badge badge-cyan">Complexity: Low</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Enforces an asymmetric holding rule across directional instruments: while 3x Long positions (<code>QQQ3</code>) can be held as multi-day tactical swings (capped at 4 days), 3x Inverse/Short positions (<code>QQQS</code>) are restricted strictly to intraday tactical overlays with mandatory 16:20 UTC liquidation. Simultaneously, any open long position that has not secured breakeven stop protection (+1R) prior to the 16:30 UTC London close is automatically flattened, eliminating unhedged overnight gap risk while London is shut and US markets trade post-market earnings.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>direct:</code> <code>trading_system/execution/position_monitor.py:26-54</code> models longs and shorts with identical multi-day holding states; <code>external:</code> Avellaneda & Zhang (2010), demonstrating that inverse -3x ETPs suffer double the volatility drag penalty combined with equity risk premia, making overnight holding statistically toxic.
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            European ETPs are frozen for 4.5 hours while US cash equities continue trading into after-hours earnings. If a tech company reports disastrous earnings at 21:05 UTC, an LSE-listed ETP will gap down 15–25% at 08:00 UTC London open, blowing right past any software stop-loss. Intraday flattening completely removes this gap risk.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            Closes positions that might have gapped favorably overnight; limits short-side profits strictly to same-day session moves.
+          </p>
+        </div>
+      </div>
+    </article>
+
+    <!-- IDEA 5 -->
+    <article class="idea-card" id="idea-5">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>5. Zero-Drag Currency-Native Routing & Fractional Position Streaming</h3>
+          <span class="idea-axis-tag">Axis: Broker Execution & Cost Optimization</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 96%</span>
+          <span class="badge badge-cyan">Complexity: Low</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Upgrades the instrument selector and risk manager to dynamically route trades to the specific ETP share class matching the broker account's base currency (e.g. selecting GBP-denominated <code>3USL</code>/<code>QQ3</code> on LSE instead of USD <code>QQQ3</code>), and refactors position sizing from rounded integer shares to continuous fractional monetary notional. This completely eliminates Trading 212's 0.15% spot FX conversion fee (saving 0.30% round-trip) and eliminates the <code>max(1.0, round(shares))</code> bug that forces massive over-allocation on smaller balances.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>direct:</code> <code>trading_system/agents/risk_manager.py:148-151</code> forces integer rounding (<code>shares = max(1.0, round(raw_shares, 2))</code>), breaking sizing on accounts under £5,000; <code>external:</code> Trading 212 Fee Schedule (0.15% currency conversion fee on cross-currency trades).
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            On Connors 3-RSI tactical mean-reversion trades with an expected edge of 1.0–1.5%, paying 0.30% in round-trip FX fees consumes 20–30% of total strategy alpha. Eliminating this friction directly injects hundreds of basis points back into net portfolio returns.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            Requires cataloging all multi-currency share classes (USD, GBP, EUR) for each leveraged ETP in <code>LeveragedUniverse</code>.
+          </p>
+        </div>
+      </div>
+    </article>
+
+    <!-- IDEA 6 -->
+    <article class="idea-card" id="idea-6">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>6. End-of-Day Rebalance Liquidity Harvester (The 16:15 UTC MOC Flow Engine)</h3>
+          <span class="idea-axis-tag">Axis: Alpha Strategy & Order Flow</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 90%</span>
+          <span class="badge badge-indigo">Complexity: Medium</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Transforms daily leveraged ETP rebalancing from a spread hazard into an active execution and momentum engine. 3x ETP issuers are legally mandated to rebalance their swap/futures books at the market close to maintain constant 3x leverage, creating predictable, non-discretionary order flow into the 16:30 UTC London close. The engine models this expected institutional volume (\(Q_{	ext{rebal}} = (eta - 1) rac{\Delta S}{S} 	ext{AUM}\)) to enter momentum continuation trades at 16:15 UTC on strong trend days, crossing into maximum daily liquidity and exiting at the market-on-close auction without overnight risk.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>external:</code> Cheng & Madhavan (2009), <em>The Dynamics of Leveraged and Inverse Exchange-Traded Funds</em>, documenting predictable market-on-close liquidity surges and momentum continuation caused by mechanical index rebalancing; <code>direct:</code> <code>trading_system/orchestrator.py:5-7</code> currently treats rebalancing purely as a decay hazard to avoid.
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            Trading alongside mandatory, non-discretionary institutional order flow provides the cleanest statistical tailwind in financial markets, while allowing the engine to capture alpha with zero overnight holding risk and near-zero volatility drag.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            Trade window is narrow (16:15–16:30 UTC); requires reliable intraday volume and return telemetry.
+          </p>
+        </div>
+      </div>
+    </article>
+
+    <!-- IDEA 7 -->
+    <article class="idea-card" id="idea-7">
+      <div class="idea-header">
+        <div class="idea-title-group">
+          <h3>7. Fail-Fast Startup Attestation & Reactive Pub/Sub Event Telemetry</h3>
+          <span class="idea-axis-tag">Axis: Infrastructure Resilience & Observability</span>
+        </div>
+        <div class="idea-meta-badges">
+          <span class="badge badge-emerald">Conf: 94%</span>
+          <span class="badge badge-indigo">Complexity: Medium</span>
+        </div>
+      </div>
+      <p class="idea-desc">
+        Replaces fragile file-based state synchronization (<code>active_trades.json</code>, <code>scratch/rsi3_scan.json</code>, <code>notifications.jsonl</code>) with a thread-safe in-memory Pub/Sub event bus that streams live execution events to <code>signals_dashboard.html</code> via Server-Sent Events (SSE). Concurrently establishes a strict <code>ProductionEnvironmentValidator</code> that halts engine execution loudly if live broker credentials, L1 market quotes, or authenticated model endpoints fail, permanently eliminating silent degradation into synthetic candles and mock debates.
+      </p>
+
+      <div class="field-grid">
+        <div class="field-block basis">
+          <strong>Articulated Basis</strong>
+          <p>
+            <code>direct:</code> <code>trading_system/orchestrator.py:313-316</code> silently falls back to dry-run simulation when broker checks fail; <code>trading_system/execution/position_monitor.py:83, 107</code> performs synchronous file I/O locks on local JSON files during active trade ticks.
+          </p>
+        </div>
+        <div class="field-block rationale">
+          <strong>Strategic Rationale</strong>
+          <p>
+            Silent mock fallbacks are the ultimate production trap—they create the illusion that the engine is trading live when it is actually evaluating toy data. Pairing a fail-fast barrier with an event bus provides zero-latency observability and unshakeable operational reliability.
+          </p>
+        </div>
+        <div class="field-block downsides">
+          <strong>Tradeoffs & Costs</strong>
+          <p>
+            Halts engine execution on missing dependencies or broken API keys rather than attempting best-effort simulation.
+          </p>
+        </div>
+      </div>
+    </article>
+  </section>
+
+  <section id="rejection-summary">
+    <h2 class="section-title">
+      Rejection Summary <span class="count-pill">45 Candidates Critiqued & Cut</span>
+    </h2>
+    <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+      Every considered candidate was audited by an independent Basis Verifier and adjudicated by the orchestrator against repo realities and execution constraints.
+    </p>
+
+    <table class="rejection-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Idea Title</th>
+          <th>Reason Rejected</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="idx">3</td><td class="title">Broker-Native GTC Bracket Orders</td><td>Trading 212 Public API lacks native bracket/OCO orders on fill, making server-side decomposition unviable.</td></tr>
+        <tr><td class="idx">8</td><td class="title">ETP Issuer MOC Spread Throttle</td><td>Consolidated into Idea 6 (End-of-Day Rebalancing Liquidity Harvester); standalone blackout is redundant.</td></tr>
+        <tr><td class="idx">9</td><td class="title">Inverted Valuation Bridge (Variant)</td><td>Consolidated into Idea 1 (Canonical Dual-Asset Quote Bridge).</td></tr>
+        <tr><td class="idx">10</td><td class="title">Removal of Software Polling</td><td>Consolidated into Idea 7 and pruned due to broker API limits on atomic server-side brackets.</td></tr>
+        <tr><td class="idx">11</td><td class="title">Inverted Consensus: Disqualification Gate</td><td>Consolidated into Idea 3 (Pre-Mortem Invalidation Sentinel).</td></tr>
+        <tr><td class="idx">12</td><td class="title">Automated Currency-Native Routing (Variant)</td><td>Consolidated into Idea 5 (Zero-Drag Currency-Native Routing).</td></tr>
+        <tr><td class="idx">13</td><td class="title">Inversion of Fixed Distance Stops</td><td>Consolidated into Idea 2 (Avionic Flight Envelope).</td></tr>
+        <tr><td class="idx">14</td><td class="title">Removal of Heavy External LLM Dependencies</td><td>Consolidated into Idea 7 (Fail-Fast Startup Attestation Barrier).</td></tr>
+        <tr><td class="idx">15</td><td class="title">Automated Session-Boundary Decoupling</td><td>Consolidated into Idea 4 (Asymmetric Session Protocol).</td></tr>
+        <tr><td class="idx">16</td><td class="title">Asymmetric Holding Protocol (Raw)</td><td>Refined and promoted to Idea 4.</td></tr>
+        <tr><td class="idx">17</td><td class="title">Volatility-Decay Exits via Variance Budgeting</td><td>Consolidated into Idea 2 (Avionic Flight Envelope).</td></tr>
+        <tr><td class="idx">18</td><td class="title">Pre-Mortem Invalidation Sentinel (Raw)</td><td>Refined and promoted to Idea 3.</td></tr>
+        <tr><td class="idx">19</td><td class="title">Cross-Session Liquidity Phasing</td><td>Consolidated into Idea 4 and Idea 6 as execution time filters.</td></tr>
+        <tr><td class="idx">20</td><td class="title">Target Volatility Risk Budgeting</td><td>Secondary enhancement; deferred until single-asset valuation bridge and variance stops are active.</td></tr>
+        <tr><td class="idx">21</td><td class="title">EOD Compounding Arbitrage</td><td>Consolidated into Idea 6 (End-of-Day Rebalance Liquidity Harvester).</td></tr>
+        <tr><td class="idx">22</td><td class="title">Portfolio-Level Factor Beta Neutralization</td><td>Premature optimization before single-trade execution and ETP pricing are stabilized.</td></tr>
+        <tr><td class="idx">23</td><td class="title">Synthetic Delta Mirroring Engine</td><td>Refuted: Trading 212 is a retail broker with no direct exchange market-making access or maker rebates.</td></tr>
+        <tr><td class="idx">24</td><td class="title">Canonical Dual-Asset Quote Bridge (Raw)</td><td>Refined and promoted to Idea 1.</td></tr>
+        <tr><td class="idx">25</td><td class="title">Volatility-Drag Integrated Decay Clock</td><td>Consolidated into Idea 2 (Avionic Flight Envelope).</td></tr>
+        <tr><td class="idx">26</td><td class="title">Speculative Debate Distillation</td><td>Rejected as unsafe: technical chart similarity ignores macro/earnings landmines.</td></tr>
+        <tr><td class="idx">27</td><td class="title">Mechanical EOD Rebalancing Exploitation</td><td>Consolidated into Idea 6 (End-of-Day Rebalance Liquidity Harvester).</td></tr>
+        <tr><td class="idx">28</td><td class="title">Broker-Native OCO Staging with WAL</td><td>Trading 212 API does not support native server-side OCO orders on spot equity.</td></tr>
+        <tr><td class="idx">29</td><td class="title">Equalized Volatility-Targeted Capital Sizing</td><td>Consolidated into portfolio-level scaling; deferred behind Idea 1 and Idea 5.</td></tr>
+        <tr><td class="idx">30</td><td class="title">Reactive In-Memory Event Telemetry Bus</td><td>Promoted and merged into Idea 7.</td></tr>
+        <tr><td class="idx">31</td><td class="title">Avionic Flight Envelope for 3x Convexity Stall</td><td>Refined and promoted to Idea 2.</td></tr>
+        <tr><td class="idx">32</td><td class="title">Immunological Two-Signal Co-Stimulation</td><td>Consolidated into Idea 1 and Idea 3 as spread/depth gating.</td></tr>
+        <tr><td class="idx">33</td><td class="title">Electrical Grid AGC Load-Shedding</td><td>Better handled at portfolio sizing stage once position monitors are stabilized.</td></tr>
+        <tr><td class="idx">34</td><td class="title">MVCC Snapshot Leases</td><td>Unnecessary complexity; sub-2s latency in Idea 3 eliminates the market drift window.</td></tr>
+        <tr><td class="idx">35</td><td class="title">Counterfactual Regret Adversary (CFR-Bear)</td><td>Fails meeting-test: misapplies finite game-theory poker math as a prompt engineering metaphor.</td></tr>
+        <tr><td class="idx">36</td><td class="title">HARQ Adaptive Liquidity Modulation</td><td>Refuted: Trading 212's 1-req/sec REST rate limit makes packet-level adaptive slicing unviable.</td></tr>
+        <tr><td class="idx">37</td><td class="title">Thermodynamic Dissipative Entropy Budgeting</td><td>Consolidated into Idea 2; thermodynamic metaphors add confusion over standard variance math.</td></tr>
+        <tr><td class="idx">38</td><td class="title">Automotive ESC Torque-Vectoring Synthetic Hedging</td><td>Refuted: Buying an inverse ETP ties up new capital, crosses wide ask spreads, and doubles FX fees.</td></tr>
+        <tr><td class="idx">39</td><td class="title">One-Tick-Per-Day MOC Sniper</td><td>Consolidated into Idea 4 and Idea 6.</td></tr>
+        <tr><td class="idx">40</td><td class="title">Native ETP Autonomy (Decoupling Underlying)</td><td>Refuted: Leveraged ETP price charts suffer severe volatility decay, distorting technical indicators.</td></tr>
+        <tr><td class="idx">41</td><td class="title">Zero-Heartbeat Server-Side Bracket Decomposition</td><td>Trading 212 API lacks native multi-tranche bracket capabilities.</td></tr>
+        <tr><td class="idx">42</td><td class="title">Closed-Loop Dual-ETP Battery</td><td>Too restrictive as a product improvement; confines engine to only 1 asset.</td></tr>
+        <tr><td class="idx">43</td><td class="title">Deterministic Minimax Matrix</td><td>Consolidated into Idea 3 and Idea 7.</td></tr>
+        <tr><td class="idx">44</td><td class="title">15-Minute Rebalancing Arbitrageur</td><td>Consolidated into Idea 6.</td></tr>
+        <tr><td class="idx">45</td><td class="title">Micro-Capital Fractional Value Streaming</td><td>Promoted and merged into Idea 5.</td></tr>
+        <tr><td class="idx">46</td><td class="title">Dual-Decay Volatility Harvester</td><td>Refuted: Trading 212 Invest accounts are spot long-only and forbid naked shorting of both legs.</td></tr>
+        <tr><td class="idx">47</td><td class="title">Autonomous Convexity Envelope & Native Quote Bridge</td><td>Decomposed and merged into Idea 1 and Idea 2.</td></tr>
+        <tr><td class="idx">48</td><td class="title">Sub-Second Adversarial Order Stager</td><td>Duplicate of Idea 3 with unviable server-side bracket assumptions.</td></tr>
+        <tr><td class="idx">49</td><td class="title">Intraday Rebalance Harvester & Overnight Gap Evacuator</td><td>Decomposed and promoted into Idea 4 and Idea 6.</td></tr>
+        <tr><td class="idx">50</td><td class="title">Dynamic Volatility-Parity Hedging System</td><td>Contains the flawed inverse-buying hedge; rejected.</td></tr>
+        <tr><td class="idx">51</td><td class="title">Offline-First Reflex Kernel with Distilled Memory</td><td>Consolidated into Idea 7.</td></tr>
+        <tr><td class="idx">52</td><td class="title">Zero-Drag Global ETP Multi-Currency Dispatcher</td><td>Promoted and merged into Idea 5.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer class="composition-signal">
+    Composed 2026-10-15 by ce-ideate from repo-grounded quantitative analysis of <code>modest-bose</code>
+  </footer>
+
+</body>
+</html>

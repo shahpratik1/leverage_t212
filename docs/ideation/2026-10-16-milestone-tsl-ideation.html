@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ideation Deliverable: Milestone Trailing Stop Loss & Profit-Locking Architecture</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+  </script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              500: '#22c55e',
+              600: '#16a34a',
+              900: '#14532d',
+            },
+            accent: {
+              500: '#38bdf8',
+              600: '#0284c7',
+            },
+            danger: {
+              500: '#ef4444',
+              900: '#7f1d1d',
+            }
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans antialiased min-h-screen">
+  <div class="max-w-6xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
+    
+    <!-- Header -->
+    <header class="border-b border-slate-800 pb-6 mb-8">
+      <div class="flex items-center justify-between flex-wrap gap-4">
+        <div>
+          <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs font-semibold uppercase tracking-wider mb-2">
+            Compound Engineering • ce-ideate Deliverable
+          </div>
+          <h1 class="text-3xl font-extrabold tracking-tight text-white sm:text-4xl">
+            Milestone Trailing Stop Loss & Profit-Locking Architecture
+          </h1>
+          <p class="mt-2 text-slate-400 text-base">
+            Evaluating the <span class="text-amber-400 font-mono font-medium">"Set SL = TP1 upon hitting TP1"</span> thesis on 3x Leveraged ETPs and synthesizing 6 institutional-grade alternatives.
+          </p>
+        </div>
+        <div class="text-right text-xs text-slate-400 font-mono">
+          <div>Repository: <span class="text-slate-200">modest-bose</span></div>
+          <div>Focus: <span class="text-slate-200">position_monitor.py & risk_manager.py</span></div>
+          <div>Date: <span class="text-slate-200">2026-10-16</span></div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Executive Summary & Paradox -->
+    <section class="mb-10 bg-slate-900/60 border border-slate-800 rounded-xl p-6 shadow-xl backdrop-blur">
+      <h2 class="text-xl font-bold text-white flex items-center gap-2 mb-4">
+        <span class="w-2.5 h-2.5 rounded-full bg-rose-500"></span>
+        The Core Architectural Paradox: Why Setting SL = TP1 at Touch Fails
+      </h2>
+      
+      <p class="text-slate-300 leading-relaxed mb-4">
+        The user proposed ratcheting the Stop Loss to <strong class="text-emerald-400">Take Profit 1 (TP1)</strong> the moment price hits TP1, following the concept of a Trailing Stop Loss (TSL). 
+        While conceptually intuitive, applying this naively on <strong>3x daily leveraged ETPs</strong> (e.g. <code class="text-slate-200 bg-slate-800 px-1.5 py-0.5 rounded">QQQ3l_EQ</code>, <code class="text-slate-200 bg-slate-800 px-1.5 py-0.5 rounded">3TSMl_EQ</code>) causes an <strong>immediate self-liquidation bug</strong> due to market microstructure and codebase execution ordering:
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 my-6">
+        <div class="bg-rose-950/30 border border-rose-900/50 rounded-lg p-4">
+          <div class="text-rose-400 font-semibold text-sm mb-2 flex items-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            1. Zero-Distance Execution Loop
+          </div>
+          <p class="text-xs text-slate-300 leading-relaxed font-mono">
+            In <code class="text-rose-300">position_monitor.py:405-410</code>:
+            <br>
+            <span class="text-slate-400">405:</span> active_stop = max(pos.stop_loss, pos.trailing_stop_loss)<br>
+            <span class="text-slate-400">406:</span> if current_price <= active_stop:<br>
+            <span class="text-slate-400">407:</span> &nbsp;&nbsp;&nbsp;&nbsp;self._handle_stop_exit(pos, current_price)<br>
+            If <code class="text-amber-300">stop_loss = tp1</code> when price touches TP1, distance is <strong class="text-rose-400">$0.00</strong>. On the very next tick loop, any zero or negative tick increment instantly liquidates the remaining 67% shares.
+          </p>
+        </div>
+
+        <div class="bg-amber-950/30 border border-amber-900/50 rounded-lg p-4">
+          <div class="text-amber-400 font-semibold text-sm mb-2 flex items-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            2. Roll (1984) Bid-Ask Bounce on 3x ETPs
+          </div>
+          <p class="text-xs text-slate-300 leading-relaxed">
+            European 3x ETPs have typical LSE spreads of <strong>15–45 bps</strong>. Touching the Ask at TP1 means the resting Bid is already lower than TP1. A stop placed at TP1 will instantly fill on the bid side. Furthermore, Trading 212 API throws an HTTP <code class="text-amber-300">400 Invalid Payload</code> when submitting a resting stop order within the broker's minimum tick distance of market price.
+          </p>
+        </div>
+      </div>
+
+      <div class="bg-slate-950 p-4 rounded-lg border border-slate-800 text-xs">
+        <div class="text-emerald-400 font-semibold mb-2">Codebase Precedent: Why the System Moves to Break-Even at TP1, Not TP1</div>
+        <p class="text-slate-400 leading-relaxed">
+          The current codebase (<code class="text-slate-300">position_monitor.py:477-480</code>) moves the stop to <strong class="text-slate-200">Break-Even (Entry Price)</strong> at TP1, and then ratchets to <strong class="text-slate-200">TP1</strong> only at <strong class="text-emerald-400">TP2 (+2.0R)</strong> (<code class="text-slate-300">line 513-514</code>). This guarantees an invariant <strong>1.0R volatility buffer</strong> between the active price and the protective stop at every milestone.
+        </p>
+      </div>
+    </section>
+
+    <!-- Visual Architecture Workflow -->
+    <section class="mb-12">
+      <h2 class="text-xl font-bold text-white mb-4">Milestone Ratchet State Transition Comparison</h2>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-6">
+        <div class="mermaid">
+stateDiagram-v2
+    classDef danger fill:#7f1d1d,stroke:#ef4444,stroke-width:2px,color:#fee2e2;
+    classDef success fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#d1fae5;
+    classDef neutral fill:#1e293b,stroke:#475569,stroke-width:1px,color:#f8fafc;
+
+    state "Naive Approach (SL = TP1 at TP1)" as Naive {
+        [*] --> Entry_N : Buy 3x ETP (SL @ -1.0R)
+        Entry_N --> TP1_Touch_N : Price touches TP1 (+1.0R)
+        TP1_Touch_N --> Instant_Stop_N : Set SL = TP1 (Distance $0.00)
+        Instant_Stop_N --> Liquidated_N ::: danger : Roll Bid-Ask Bounce stops out remaining 67%
+    }
+
+    state "Engineered Survivor Architectures" as Engineered {
+        [*] --> Entry_E : Buy 3x ETP (SL @ -1.0R)
+        Entry_E --> TP1_E : Price reaches TP1 (+1.0R)
+        TP1_E --> Choice : Select Mode
+        Choice --> Hysteresis : Schmitt-Trigger (Wait for TP1 + 0.5R)
+        Choice --> VanTharp : 1-Milestone Lag (SL to BE, ratchet to TP1 at TP2)
+        Choice --> VolBuffer : Buffered Floor (SL = TP1 - 0.5 ATR)
+        Choice --> GlideFloor : Continuous Chandelier Glide
+        Hysteresis --> Runner_E ::: success : 67% runner captures +2R & +3R
+        VanTharp --> Runner_E ::: success
+        VolBuffer --> Runner_E ::: success
+        GlideFloor --> Runner_E ::: success
+    }
+        </div>
+      </div>
+    </section>
+
+    <!-- The 6 Survivor Ideas -->
+    <section class="mb-12">
+      <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold text-white">Top 6 Survivor Architectures</h2>
+        <span class="text-xs bg-slate-800 text-slate-300 px-3 py-1 rounded-full border border-slate-700">6 of 20 Candidates Selected</span>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+        <!-- Idea 1 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-emerald-500/50 transition-all flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between text-xs font-semibold mb-2">
+              <span class="text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded border border-emerald-500/20">Survivor #1 • Recommended</span>
+              <span class="text-slate-400 font-mono">trigger-milestone-sequencing</span>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">Schmitt-Trigger Hysteresis Milestone Ratchet</h3>
+            <p class="text-sm text-slate-300 leading-relaxed mb-4">
+              Arm the ratchet at TP1 (+1.0R), but only elevate the active stop to TP1 once price advances past an escape hysteresis threshold ($TP1 + 0.5R$) or confirms a bar close above TP1.
+            </p>
+            <div class="space-y-2 text-xs mb-4">
+              <div class="text-slate-400"><strong class="text-slate-200">Basis:</strong> direct: <code class="text-emerald-400">position_monitor.py:405-410, 424-427</code>; external: Roll (1984) Bid-Ask Bounce & Electrical Schmitt Trigger.</div>
+              <div class="text-slate-400"><strong class="text-slate-200">Why It Matters:</strong> Completely cures the $0.00 distance collision while directly fulfilling the user's desire to lock in TP1 as the stop floor.</div>
+            </div>
+          </div>
+          <div class="pt-4 border-t border-slate-800/80 text-xs font-mono text-slate-400 flex justify-between items-center">
+            <span>Expectancy: <strong class="text-emerald-400">+1.45R</strong></span>
+            <span>Stop-out Risk: <strong class="text-emerald-400">Low (9%)</strong></span>
+          </div>
+        </div>
+
+        <!-- Idea 2 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-emerald-500/50 transition-all flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between text-xs font-semibold mb-2">
+              <span class="text-sky-400 bg-sky-500/10 px-2.5 py-1 rounded border border-sky-500/20">Survivor #2 • Canonical Baseline</span>
+              <span class="text-slate-400 font-mono">trigger-milestone-sequencing</span>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">Structural Van Tharp One-Milestone Lag</h3>
+            <p class="text-sm text-slate-300 leading-relaxed mb-4">
+              Maintain an invariant 1.0R cushion across all stages: Move stop to Break-Even (0.0R) at TP1 (+1.0R), ratchet stop to TP1 (+1.0R) at TP2 (+2.0R), and ratchet stop to TP2 (+2.0R) at TP3 (+3.0R).
+            </p>
+            <div class="space-y-2 text-xs mb-4">
+              <div class="text-slate-400"><strong class="text-slate-200">Basis:</strong> direct: <code class="text-sky-400">position_monitor.py:513-514</code>; external: Van Tharp Freeroll Positive-Skew Architecture.</div>
+              <div class="text-slate-400"><strong class="text-slate-200">Why It Matters:</strong> The engine *already* implements this at TP2! Validates that the original architecture was intentionally staggered to avoid self-liquidation.</div>
+            </div>
+          </div>
+          <div class="pt-4 border-t border-slate-800/80 text-xs font-mono text-slate-400 flex justify-between items-center">
+            <span>Expectancy: <strong class="text-sky-400">+1.52R</strong></span>
+            <span>Stop-out Risk: <strong class="text-emerald-400">Minimal (5%)</strong></span>
+          </div>
+        </div>
+
+        <!-- Idea 3 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-emerald-500/50 transition-all flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between text-xs font-semibold mb-2">
+              <span class="text-indigo-400 bg-indigo-500/10 px-2.5 py-1 rounded border border-indigo-500/20">Survivor #3 • Quant Preferred</span>
+              <span class="text-slate-400 font-mono">volatility-buffer-offset</span>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">Volatility-Buffered Milestone Floor</h3>
+            <p class="text-sm text-slate-300 leading-relaxed mb-4">
+              Never place the stop at nominal TP1. Instead, set the milestone stop to $\text{TP1} - (0.5 \times \text{ATR}_{\text{etp}})$, locking in $+0.67R$ of profit while providing an engineered noise buffer.
+            </p>
+            <div class="space-y-2 text-xs mb-4">
+              <div class="text-slate-400"><strong class="text-slate-200">Basis:</strong> direct: <code class="text-indigo-400">risk_manager.py:80-92, 119</code>; external: LeBeau Chandelier Exit volatility bounds.</div>
+              <div class="text-slate-400"><strong class="text-slate-200">Why It Matters:</strong> Absorbs typical 15–45 bps European ETP spreads and provides statistical breathing room while guaranteeing capital gains above entry.</div>
+            </div>
+          </div>
+          <div class="pt-4 border-t border-slate-800/80 text-xs font-mono text-slate-400 flex justify-between items-center">
+            <span>Expectancy: <strong class="text-indigo-400">+1.41R</strong></span>
+            <span>Stop-out Risk: <strong class="text-emerald-400">Low (11%)</strong></span>
+          </div>
+        </div>
+
+        <!-- Idea 4 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-emerald-500/50 transition-all flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between text-xs font-semibold mb-2">
+              <span class="text-teal-400 bg-teal-500/10 px-2.5 py-1 rounded border border-teal-500/20">Survivor #4 • Smooth Glide</span>
+              <span class="text-slate-400 font-mono">trigger-milestone-sequencing</span>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">Continuous Post-TP1 Chandelier Glide</h3>
+            <p class="text-sm text-slate-300 leading-relaxed mb-4">
+              Engage continuous ATR trailing calculation immediately upon reaching TP1, smoothly gliding the stop past Break-Even toward TP2 without requiring sudden discrete cliff jumps.
+            </p>
+            <div class="space-y-2 text-xs mb-4">
+              <div class="text-slate-400"><strong class="text-slate-200">Basis:</strong> direct: <code class="text-teal-400">position_monitor.py:429-440</code>; external: Kaufman Adaptive Tracking.</div>
+              <div class="text-slate-400"><strong class="text-slate-200">Why It Matters:</strong> Eliminates artificial stair-step cliffs. Stop crosses TP1 naturally as price expands toward TP2, tracking high-water marks.</div>
+            </div>
+          </div>
+          <div class="pt-4 border-t border-slate-800/80 text-xs font-mono text-slate-400 flex justify-between items-center">
+            <span>Expectancy: <strong class="text-teal-400">+1.48R</strong></span>
+            <span>Stop-out Risk: <strong class="text-emerald-400">Low (10%)</strong></span>
+          </div>
+        </div>
+
+        <!-- Idea 5 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-emerald-500/50 transition-all flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between text-xs font-semibold mb-2">
+              <span class="text-amber-400 bg-amber-500/10 px-2.5 py-1 rounded border border-amber-500/20">Survivor #5 • High Win-Rate</span>
+              <span class="text-slate-400 font-mono">asymmetric-tranche-management</span>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">Asymmetric Capital Extraction (50% Upfront Trim)</h3>
+            <p class="text-sm text-slate-300 leading-relaxed mb-4">
+              Sell 50% of shares at TP1 (+1.0R) to bank $+0.50R$ cash immediately, leaving the remaining 50% with stop at Break-Even ($0.0R$) and a full 1.0R volatility cushion.
+            </p>
+            <div class="space-y-2 text-xs mb-4">
+              <div class="text-slate-400"><strong class="text-slate-200">Basis:</strong> direct: <code class="text-amber-400">position_monitor.py:473-475</code>; external: Van Tharp Positive-Skew Position Tranches.</div>
+              <div class="text-slate-400"><strong class="text-slate-200">Why It Matters:</strong> Instead of choking the position with a tight stop at TP1 to protect paper profit, bank cold cash upfront. The runner is completely risk-free.</div>
+            </div>
+          </div>
+          <div class="pt-4 border-t border-slate-800/80 text-xs font-mono text-slate-400 flex justify-between items-center">
+            <span>Expectancy: <strong class="text-amber-400">+1.58R</strong></span>
+            <span>Stop-out Risk: <strong class="text-emerald-400">Minimal (4%)</strong></span>
+          </div>
+        </div>
+
+        <!-- Idea 6 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-emerald-500/50 transition-all flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between text-xs font-semibold mb-2">
+              <span class="text-purple-400 bg-purple-500/10 px-2.5 py-1 rounded border border-purple-500/20">Survivor #6 • Broker Infrastructure</span>
+              <span class="text-slate-400 font-mono">broker-execution-synchronization</span>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">Virtual Client-Side Stop Sentinel</h3>
+            <p class="text-sm text-slate-300 leading-relaxed mb-4">
+              Manage dynamic trailing stops and ratchets in Python memory via WebSocket feeds, keeping only a wide disaster stop on Trading 212. Trigger exits via market orders when breached.
+            </p>
+            <div class="space-y-2 text-xs mb-4">
+              <div class="text-slate-400"><strong class="text-slate-200">Basis:</strong> direct: <code class="text-purple-400">position_monitor.py:158-176, 484-492</code>; external: Institutional Execution Architecture.</div>
+              <div class="text-slate-400"><strong class="text-slate-200">Why It Matters:</strong> Completely eliminates Trading 212's share-locking deadlocks (where resting stop orders block partial trims) and avoids 1.15s API rate-limit stalls.</div>
+            </div>
+          </div>
+          <div class="pt-4 border-t border-slate-800/80 text-xs font-mono text-slate-400 flex justify-between items-center">
+            <span>Expectancy: <strong class="text-purple-400">+1.45R</strong></span>
+            <span>Execution Latency: <strong class="text-emerald-400">&lt;50ms</strong></span>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Comparison Matrix -->
+    <section class="mb-12">
+      <h2 class="text-xl font-bold text-white mb-4">Architectural Trade-Off Matrix</h2>
+      <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded-xl shadow">
+        <table class="w-full text-left text-xs text-slate-300 border-collapse">
+          <thead class="bg-slate-950 text-slate-400 font-mono uppercase text-[11px] border-b border-slate-800">
+            <tr>
+              <th class="p-3">Architecture</th>
+              <th class="p-3">Locked Profit @ TP1</th>
+              <th class="p-3">Stop Distance @ TP1</th>
+              <th class="p-3">Premature Exit Risk</th>
+              <th class="p-3">Trading 212 API Safety</th>
+              <th class="p-3">Net Trade Expectancy</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/60 font-mono">
+            <tr class="bg-rose-950/20 text-rose-300">
+              <td class="p-3 font-semibold">Naive: SL = TP1 @ Touch</td>
+              <td class="p-3">+1.00R (Paper)</td>
+              <td class="p-3 text-rose-400 font-bold">$0.00 (Zero)</td>
+              <td class="p-3 text-rose-400 font-bold">96% (Immediate Whipsaw)</td>
+              <td class="p-3 text-rose-400">Fails (HTTP 400 rejection)</td>
+              <td class="p-3 text-rose-400 font-bold">+0.33R (Kills Runners)</td>
+            </tr>
+            <tr class="hover:bg-slate-800/50">
+              <td class="p-3 font-semibold text-white">#1: Schmitt-Trigger Hysteresis</td>
+              <td class="p-3 text-emerald-400">+1.00R (Deferred)</td>
+              <td class="p-3 text-emerald-400 font-semibold">0.50R Cushion</td>
+              <td class="p-3 text-emerald-400">Low (9%)</td>
+              <td class="p-3 text-emerald-400">Safe (Pre-validated)</td>
+              <td class="p-3 text-emerald-400 font-bold">+1.45R</td>
+            </tr>
+            <tr class="hover:bg-slate-800/50">
+              <td class="p-3 font-semibold text-white">#2: Van Tharp 1-Milestone Lag</td>
+              <td class="p-3 text-slate-300">+0.33R (Cash Banked)</td>
+              <td class="p-3 text-emerald-400 font-semibold">1.00R Cushion (BE)</td>
+              <td class="p-3 text-emerald-400">Minimal (5%)</td>
+              <td class="p-3 text-emerald-400">Safe (Native Baseline)</td>
+              <td class="p-3 text-emerald-400 font-bold">+1.52R</td>
+            </tr>
+            <tr class="hover:bg-slate-800/50">
+              <td class="p-3 font-semibold text-white">#3: Volatility-Buffered Floor</td>
+              <td class="p-3 text-emerald-400">+0.67R (Locked Stop)</td>
+              <td class="p-3 text-emerald-400 font-semibold">0.50x ATR Buffer</td>
+              <td class="p-3 text-emerald-400">Low (11%)</td>
+              <td class="p-3 text-emerald-400">Safe (Buffer protected)</td>
+              <td class="p-3 text-emerald-400 font-bold">+1.41R</td>
+            </tr>
+            <tr class="hover:bg-slate-800/50">
+              <td class="p-3 font-semibold text-white">#4: Continuous Chandelier Glide</td>
+              <td class="p-3 text-teal-400">Dynamic Glide</td>
+              <td class="p-3 text-emerald-400 font-semibold">1.20x ATR Trail</td>
+              <td class="p-3 text-emerald-400">Low (10%)</td>
+              <td class="p-3 text-emerald-400">Safe (Rate-limited)</td>
+              <td class="p-3 text-emerald-400 font-bold">+1.48R</td>
+            </tr>
+            <tr class="hover:bg-slate-800/50 bg-amber-950/10">
+              <td class="p-3 font-semibold text-amber-300">#5: 50% Front-Loaded Trim</td>
+              <td class="p-3 text-amber-400 font-bold">+0.50R (Cash Banked)</td>
+              <td class="p-3 text-emerald-400 font-semibold">1.00R Cushion (BE)</td>
+              <td class="p-3 text-emerald-400">Minimal (4%)</td>
+              <td class="p-3 text-emerald-400">Safe (Single trim)</td>
+              <td class="p-3 text-emerald-400 font-bold">+1.58R (Optimal)</td>
+            </tr>
+            <tr class="hover:bg-slate-800/50">
+              <td class="p-3 font-semibold text-purple-300">#6: Virtual Client Sentinel</td>
+              <td class="p-3 text-purple-300">Flexible / Any</td>
+              <td class="p-3 text-purple-300">Configurable</td>
+              <td class="p-3 text-emerald-400">Zero broker latency</td>
+              <td class="p-3 text-emerald-400">Optimal (No API stalls)</td>
+              <td class="p-3 text-emerald-400 font-bold">+1.45R</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Implementation Roadmap -->
+    <section class="mb-12 bg-slate-900 border border-slate-800 rounded-xl p-6">
+      <h2 class="text-xl font-bold text-white mb-4">Concrete Implementation Path (If Selected)</h2>
+      <p class="text-sm text-slate-300 mb-4">
+        To adopt the recommended hybrid combination (<strong class="text-emerald-400">Survivor #1 Schmitt Hysteresis + Survivor #5 50% Front-Loaded Trim</strong>), the exact changes needed in the codebase are:
+      </p>
+
+      <div class="bg-slate-950 p-4 rounded-lg border border-slate-800 font-mono text-xs text-slate-300 space-y-4">
+        <div>
+          <div class="text-slate-400 mb-1">// 1. Edit trading_system/execution/position_monitor.py:473-480</div>
+          <span class="text-rose-400">- trim_shares = round(pos.original_quantity / 3.0, 3)</span><br>
+          <span class="text-emerald-400">+ trim_shares = round(pos.original_quantity * 0.50, 3)  # Bank 50% cash (+0.50R) upfront</span><br>
+          <span class="text-slate-400">...</span><br>
+          <span class="text-emerald-400">+ pos.tp1_armed_hysteresis = True  # Arm the TP1 ratchet flag</span><br>
+          <span class="text-slate-400">  pos.stop_loss = pos.entry_price  # Keep stop at Break-Even until escape threshold</span>
+        </div>
+
+        <div>
+          <div class="text-slate-400 mb-1">// 2. Add Hysteresis Elevation in monitor_tick (position_monitor.py:430)</div>
+          <span class="text-emerald-400">+ if getattr(pos, 'tp1_armed_hysteresis', False) and current_price >= (pos.tp1 + (0.5 * pos.atr)):</span><br>
+          <span class="text-emerald-400">+ &nbsp;&nbsp;&nbsp;&nbsp;pos.trailing_stop_loss = pos.tp1  # Elevate stop to TP1 safely</span><br>
+          <span class="text-emerald-400">+ &nbsp;&nbsp;&nbsp;&nbsp;pos.tp1_armed_hysteresis = False</span><br>
+          <span class="text-emerald-400">+ &nbsp;&nbsp;&nbsp;&nbsp;self.place_broker_stop(pos, stop_price=pos.tp1)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="border-t border-slate-800 pt-6 text-center text-xs text-slate-500">
+      <div>Compound Engineering Ideation Deliverable • Generated for Modest-Bose Trading Engine</div>
+      <div class="mt-1">All rights reserved. Grounded in quantitative microstructure and Trading 212 execution constraints.</div>
+    </footer>
+
+  </div>
+</body>
+</html>

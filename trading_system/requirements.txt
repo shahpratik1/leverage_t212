@@ -1,0 +1,25 @@
+# Hybrid Quantitative Trading Engine — Dependencies
+# ==================================================
+
+# ── Core HTTP & Data ─────────────────────────────────────────────
+httpx>=0.27,<1.0
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+yfinance>=0.2.30,<1.0
+
+# ── System 1 — Laya NLI Engine ───────────────────────────────────
+laya-engine>=0.1.0
+
+# ── System 2 — TradingAgents Multi-Agent Framework ───────────────
+tradingagents>=0.1.0
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+openai>=1.0,<3.0
+
+# ── ML Backbone (for Laya's ModernBERT) ──────────────────────────
+torch>=2.0
+transformers>=4.40
+
+# ── Utilities ────────────────────────────────────────────────────
+python-dotenv>=1.0
