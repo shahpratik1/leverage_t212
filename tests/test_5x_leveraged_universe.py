@@ -16,16 +16,17 @@ class Test5xLeveragedUniverse(unittest.TestCase):
         self.risk_manager = RiskManager()
 
     def test_5x_pairs_presence_and_flag(self):
-        """Major indices, commodities, and fixed income must support 5x leverage."""
+        """Major indices, commodities, and fixed income track 5x market availability, but enforce 3x execution."""
         expected_5x = ["QQQ", "SPY", "GLD", "TLT", "MAGS", "^FTSE", "^GDAXI", "^STOXX50E"]
         for symbol in expected_5x:
             pair = self.universe.get_pair_for_underlying(symbol)
             self.assertIsNotNone(pair, f"Missing pair for {symbol}")
             self.assertTrue(pair.has_5x, f"Expected has_5x=True for {symbol}")
-            self.assertIn(5, self.universe.get_available_leverage_multipliers(symbol))
+            # Policy: if 5x exists, available leverage multiplier is capped at [3]
+            self.assertEqual(self.universe.get_available_leverage_multipliers(symbol), [3])
 
     def test_single_stocks_capped_at_3x(self):
-        """Single equities must remain 3x due to European UCITS concentration regulations."""
+        """Single equities remain 3x due to European UCITS concentration regulations."""
         single_stocks = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "GOOGL", "TSM"]
         for symbol in single_stocks:
             pair = self.universe.get_pair_for_underlying(symbol)
@@ -34,20 +35,20 @@ class Test5xLeveragedUniverse(unittest.TestCase):
             self.assertEqual(self.universe.get_available_leverage_multipliers(symbol), [3])
 
     def test_5x_ticker_resolution_long_and_short(self):
-        """Resolution of 5x tickers for both Long and Inverse Short."""
-        # QQQ (Nasdaq 100)
-        self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=5), "QQQ5l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=5), "QQ3Sl_EQ")
+        """Resolution of 5x tickers replaces 5x with 3x for both Long and Inverse Short."""
+        # QQQ (Nasdaq 100): 5x replaced with 3x (QQQ3 / QQQS)
+        self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=5), "QQQ3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=5), "QQQSl_EQ")
 
-        # SPY (S&P 500)
-        self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=5), "SP5Yl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=5), "SPYSl_EQ")
+        # SPY (S&P 500): 5x replaced with 3x (3USL / 3USS)
+        self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=5), "3USLl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=5), "3USSl_EQ")
 
-        # TLT (20+ Year Treasury Bond)
-        self.assertEqual(self.universe.get_execution_ticker("TLT", "LONG", leverage=5), "TLT5l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("TLT", "SHORT", leverage=5), "TL5Sl_EQ")
+        # TLT (20+ Year Treasury Bond): 5x replaced with 3x (3TYL / 3TYS)
+        self.assertEqual(self.universe.get_execution_ticker("TLT", "LONG", leverage=5), "3TYLl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("TLT", "SHORT", leverage=5), "3TYSl_EQ")
 
-        # MAGS (Magnificent 7)
+        # MAGS (Magnificent 7): 5x replaced with 3x (MAG7l_EQ)
         self.assertEqual(self.universe.get_execution_ticker("MAGS", "LONG", leverage=5), "MAG7l_EQ")
 
     def test_5x_fallback_to_3x_when_unavailable(self):
@@ -60,19 +61,20 @@ class Test5xLeveragedUniverse(unittest.TestCase):
         self.assertEqual(self.universe.get_execution_ticker("TSM", "LONG", leverage=5), "3TSMl_EQ")
 
     def test_standard_3x_resolution_preserved(self):
-        """Default leverage=3 resolution must remain identical to prior behavior."""
+        """Default leverage=3 resolution remains standard."""
         self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=3), "QQQ3l_EQ")
         self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=3), "QQQSl_EQ")
         self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=3), "3USLl_EQ")
         self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=3), "3USSl_EQ")
 
     def test_decision_card_leverage_tagging(self):
-        """DecisionCard properly tags leverage=5 when 5x execution ticker is passed."""
+        """DecisionCard replaces leverage=5 and 5x tickers with 3x per policy."""
         debate_mock = MagicMock()
         debate_mock.consensus_decision = "BUY_ENTRY"
         debate_mock.conviction_score = 0.90
-        debate_mock.synthesis = "High conviction 5x tech breakout."
+        debate_mock.synthesis = "High conviction tech breakout."
 
+        # Pass 5x ticker ("QQQ5l_EQ") and leverage=5
         card_5x = self.risk_manager.calculate_decision_card(
             ticker="QQQ",
             trading212_ticker="QQQ5l_EQ",
@@ -82,8 +84,9 @@ class Test5xLeveragedUniverse(unittest.TestCase):
             account_equity=10000.0,
             leverage=5,
         )
-        self.assertEqual(card_5x.leverage, 5)
-        self.assertEqual(card_5x.trading212_ticker, "QQQ5l_EQ")
+        # Both leverage and ticker must be replaced with 3x
+        self.assertEqual(card_5x.leverage, 3)
+        self.assertEqual(card_5x.trading212_ticker, "QQQ3l_EQ")
 
         card_3x = self.risk_manager.calculate_decision_card(
             ticker="QQQ",
@@ -96,6 +99,63 @@ class Test5xLeveragedUniverse(unittest.TestCase):
         )
         self.assertEqual(card_3x.leverage, 3)
         self.assertEqual(card_3x.trading212_ticker, "QQQ3l_EQ")
+
+    def test_validate_trade_rejects_excess_leverage_and_5x_tickers(self):
+        """RiskManager.validate_trade strictly rejects cards with leverage > 3 or 5x tickers."""
+        debate_mock = MagicMock()
+        debate_mock.consensus_decision = "BUY_ENTRY"
+        debate_mock.conviction_score = 0.90
+        debate_mock.synthesis = "Test"
+
+        # Card with 5x leverage
+        card_invalid_leverage = DecisionCard(
+            ticker="QQQ",
+            trading212_ticker="QQQ3l_EQ",
+            direction="LONG",
+            decision="BUY_ENTRY",
+            entry_price=400.0,
+            stop_loss=390.0,
+            trailing_stop_loss=390.0,
+            stop_distance_pct=0.025,
+            take_profit_1=410.0,
+            take_profit_2=420.0,
+            take_profit_3=430.0,
+            position_size_shares=5.0,
+            position_notional=2000.0,
+            risk_amount=50.0,
+            risk_pct_of_equity=0.005,
+            conviction_score=0.90,
+            rationale="Test",
+            leverage=5,
+        )
+        valid, msg = self.risk_manager.validate_trade(card_invalid_leverage, account_cash=10000.0, existing_positions=[])
+        self.assertFalse(valid)
+        self.assertIn("exceeds maximum allowed cap", msg)
+
+        # Card with prohibited 5x ticker
+        card_invalid_ticker = DecisionCard(
+            ticker="QQQ",
+            trading212_ticker="QQQ5l_EQ",
+            direction="LONG",
+            decision="BUY_ENTRY",
+            entry_price=100.0,
+            stop_loss=95.0,
+            trailing_stop_loss=95.0,
+            stop_distance_pct=0.05,
+            take_profit_1=105.0,
+            take_profit_2=110.0,
+            take_profit_3=115.0,
+            position_size_shares=10.0,
+            position_notional=1000.0,
+            risk_amount=50.0,
+            risk_pct_of_equity=0.005,
+            conviction_score=0.90,
+            rationale="Test",
+            leverage=3,
+        )
+        valid_t, msg_t = self.risk_manager.validate_trade(card_invalid_ticker, account_cash=10000.0, existing_positions=[])
+        self.assertFalse(valid_t)
+        self.assertIn("Prohibited 5x execution ticker detected", msg_t)
 
 
 if __name__ == "__main__":

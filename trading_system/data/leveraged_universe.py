@@ -285,6 +285,16 @@ class LeveragedUniverse:
         self._underlying_map: Dict[str, LeveragedPair] = {
             p.underlying_symbol.upper(): p for p in self.pairs
         }
+        self._5x_to_3x_map: Dict[str, str] = {}
+        for p in self.pairs:
+            if p.long_5x_ticker and p.long_3x_ticker:
+                self._5x_to_3x_map[p.long_5x_ticker] = p.long_3x_ticker
+            if p.short_5x_ticker and p.short_5x_ticker != "None" and p.short_3x_ticker and p.short_3x_ticker != "None":
+                self._5x_to_3x_map[p.short_5x_ticker] = p.short_3x_ticker
+
+    def replace_5x_ticker(self, ticker: str) -> str:
+        """If a given ticker is a known 5x ETP, return its 3x replacement; otherwise return the ticker as-is."""
+        return self._5x_to_3x_map.get(ticker, ticker)
 
     def get_all_underlyings(self) -> List[str]:
         """Return list of all underlying symbols to fetch OHLCV data for."""
@@ -309,11 +319,14 @@ class LeveragedUniverse:
         return False
 
     def get_available_leverage_multipliers(self, underlying: str) -> List[int]:
-        """Return supported leverage multipliers for an asset (e.g. [3, 5] or [3])."""
+        """Return supported leverage multipliers for an asset.
+
+        Policy: If 5x exists on the asset, it is replaced with 3x, so available leverage is [3].
+        """
         pair = self.get_pair_for_underlying(underlying)
         if not pair:
             return [1]
-        return [3, 5] if pair.has_5x else [3]
+        return [3]
 
     def get_execution_ticker(
         self,
@@ -324,7 +337,7 @@ class LeveragedUniverse:
         """Given an underlying symbol, direction ('LONG' or 'SHORT'), and desired leverage (3 or 5),
         return the appropriate Trading 212 execution ticker.
 
-        If 5x is requested but unavailable for this asset or direction, gracefully falls back to 3x.
+        Policy: If 5x is requested or exists for this asset, it is replaced with 3x ETP.
         """
         pair = self.get_pair_for_underlying(underlying)
         if not pair:
@@ -334,13 +347,18 @@ class LeveragedUniverse:
         is_long = direction_upper in ("LONG", "BUY", "BULLISH")
         is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
 
-        # 5x Resolution with automatic 3x fallback
-        if leverage >= 5 and pair.has_5x:
-            if is_long and pair.long_5x_ticker:
-                return pair.long_5x_ticker
-            elif is_short and pair.short_5x_ticker and pair.short_5x_ticker != "None":
-                return pair.short_5x_ticker
-            logger.info("5x %s ETP unavailable for %s; falling back to 3x ETP", direction_upper, underlying)
+        # Policy: If 5x is requested or exists, replace it with 3x
+        if leverage >= 5:
+            if pair.has_5x:
+                logger.info(
+                    "5x leverage exists for %s (%s); replacing with 3x ETP per leverage policy",
+                    underlying, direction_upper,
+                )
+            else:
+                logger.info(
+                    "5x %s ETP unavailable for %s; falling back to 3x ETP",
+                    direction_upper, underlying,
+                )
 
         # 3x Resolution (standard)
         if is_long:
@@ -355,15 +373,11 @@ class LeveragedUniverse:
         return [p for p in self.pairs if p.has_5x]
 
     def get_all_execution_tickers(self) -> List[str]:
-        """Return list of all 3x and 5x Trading 212 execution tickers."""
+        """Return list of all active Trading 212 execution tickers (3x only per policy)."""
         tickers = []
         for p in self.pairs:
             if p.long_3x_ticker:
                 tickers.append(p.long_3x_ticker)
             if p.short_3x_ticker and p.short_3x_ticker != "None":
                 tickers.append(p.short_3x_ticker)
-            if p.long_5x_ticker:
-                tickers.append(p.long_5x_ticker)
-            if p.short_5x_ticker and p.short_5x_ticker != "None":
-                tickers.append(p.short_5x_ticker)
         return list(dict.fromkeys(tickers))

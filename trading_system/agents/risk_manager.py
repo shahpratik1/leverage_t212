@@ -197,10 +197,21 @@ class RiskManager:
         entry_price = metrics.get("close", 0.0)
         atr = metrics.get("atr", 0.0)
 
-        # Detect 5x leverage from ticker or explicit parameter
-        resolved_leverage = leverage if leverage is not None else (
+        # Policy: if 5x exists or is passed, replace it with 3x (cap at MAX_LEVERAGE = 3)
+        from trading_system.data.leveraged_universe import LeveragedUniverse
+        universe = LeveragedUniverse()
+        sanitized_t212_ticker = universe.replace_5x_ticker(trading212_ticker)
+        if sanitized_t212_ticker == trading212_ticker:
+            pair = universe.get_pair_for_underlying(ticker)
+            if pair:
+                replacement = universe.get_execution_ticker(ticker, direction, leverage=3)
+                if replacement:
+                    sanitized_t212_ticker = replacement
+
+        raw_leverage = leverage if leverage is not None else (
             5 if any(x in trading212_ticker for x in ("5l_EQ", "5Y", "5S", "5E", "5x", "5QQQ", "5SPY")) else 3
         )
+        resolved_leverage = 3 if raw_leverage >= 5 else raw_leverage
 
         stop_loss = self.calculate_stop_loss(entry_price, atr, direction=direction)
         stop_distance_pct = (
@@ -226,7 +237,7 @@ class RiskManager:
 
         return DecisionCard(
             ticker=ticker,
-            trading212_ticker=trading212_ticker,
+            trading212_ticker=sanitized_t212_ticker,
             direction=direction.upper(),
             decision=decision_action,
             entry_price=entry_price,
@@ -256,6 +267,15 @@ class RiskManager:
         """Validate whether a trade should be executed."""
         if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
             return False, f"Decision is {card.decision}, not an entry decision"
+
+        from trading_system.config import settings
+        max_allowed_leverage = getattr(settings, "MAX_LEVERAGE", 3)
+        if card.leverage > max_allowed_leverage:
+            return False, f"Leverage {card.leverage}x exceeds maximum allowed cap of {max_allowed_leverage}x"
+
+        # Check for prohibited 5x execution tickers
+        if any(x in card.trading212_ticker for x in ("5l_EQ", "5Yl_EQ", "5Sl_EQ", "5El_EQ", "5x", "QQQ5", "SP5Y", "GLD5", "TLT5", "DAX5", "5UKX", "5SX5")):
+            return False, f"Prohibited 5x execution ticker detected: {card.trading212_ticker}"
 
         if card.position_notional > account_cash:
             return False, f"Insufficient free capital (${account_cash:.2f} < ${card.position_notional:.2f})"

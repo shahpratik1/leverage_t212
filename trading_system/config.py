@@ -144,8 +144,9 @@ class Settings:
 
     # Universe & Mode
     USE_LEVERAGED_3X: bool = True
-    ENABLE_5X_LEVERAGE: bool = True
+    ENABLE_5X_LEVERAGE: bool = False  # Policy: if 5x exists then replace it with 3x
     PREFER_5X_LEVERAGE: bool = False
+    MAX_LEVERAGE: int = 3  # Maximum allowed leverage multiplier (strict 3x cap)
     LOG_LEVEL: str = "INFO"
     TRADES_LOG_PATH: str = "trades.jsonl"
     UNIVERSE_SIZE: int = 100

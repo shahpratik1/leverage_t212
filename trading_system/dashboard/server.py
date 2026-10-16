@@ -401,7 +401,7 @@ def generate_html_dashboard(output_path: str) -> str:
               <th class="py-3 px-4">Name / Sector</th>
               <th class="py-3 px-4 text-emerald-400 font-semibold">3x Long ETP</th>
               <th class="py-3 px-4 text-rose-400 font-semibold">3x Short (Inverse) ETP</th>
-              <th class="py-3 px-4 text-purple-400 font-semibold">5x Leverage (LSE / T212)</th>
+              <th class="py-3 px-4 text-amber-400 font-semibold">Leverage Policy (5x &rarr; 3x Replaced)</th>
               <th class="py-3 px-4">Currency</th>
             </tr>
           </thead>
@@ -697,11 +697,11 @@ def generate_html_dashboard(output_path: str) -> str:
         const row = document.createElement('tr');
         row.className = "hover:bg-slate-900/80 transition";
         const fiveXBadge = p.has_5x
-          ? `<div class="flex flex-col gap-1">
-               <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-500/10 text-purple-300 border border-purple-500/30">Long: <b>${{p.long_5x_ticker}}</b></span>
-               ${{p.short_5x_ticker && p.short_5x_ticker !== 'None' && p.short_5x_ticker !== '—' ? `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-500/10 text-rose-300 border border-rose-500/30">Short: <b>${{p.short_5x_ticker}}</b></span>` : ''}}
+          ? `<div class="flex flex-col gap-0.5">
+               <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30">5x Exists &rarr; Replaced with 3x</span>
+               <span class="text-[10px] font-mono text-slate-400">Exec: <b>${{p.long_ticker}}</b></span>
              </div>`
-          : `<span class="text-slate-500 text-[10px]">3x Only (Single-Stock Cap)</span>`;
+          : `<span class="text-slate-500 text-[10px]">3x Standard</span>`;
 
         row.innerHTML = `
           <td class="py-3 px-4 font-bold text-white">${{p.underlying}}</td>
