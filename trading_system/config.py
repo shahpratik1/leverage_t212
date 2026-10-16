@@ -98,7 +98,7 @@ class Settings:
     # Risk parameters
     MAX_RISK_PER_TRADE: float = 0.005  # 0.5% of equity
     MAX_POSITION_PCT: float = 0.05  # 5% of equity max
-    ATR_SL_MULTIPLIER: float = 1.5
+    ATR_SL_MULTIPLIER: float = 2.2
     MIN_SL_PCT: float = 0.005  # 0.5% minimum stop distance
     TP1_R_MULTIPLE: float = 1.0
     TP2_R_MULTIPLE: float = 2.0
