@@ -112,9 +112,9 @@ class Settings:
 
     # 3-RSI Mean Reversion Strategy (High Win-Rate Institutional Dip Buying)
     ENABLE_3RSI_MEAN_REVERSION: bool = True
-    RSI3_OVERSOLD: float = 20.0      # Extreme oversold trigger (Connors / 3-RSI)
-    RSI3_OVERBOUGHT: float = 80.0    # Extreme overbought trigger for inverse short
-    RSI7_OVERSOLD: float = 40.0      # Medium-term momentum confirmation
+    RSI3_OVERSOLD: float = 15.0      # Extreme oversold trigger (Connors / 3-RSI)
+    RSI3_OVERBOUGHT: float = 85.0    # Extreme overbought trigger for inverse short
+    RSI7_OVERSOLD: float = 35.0      # Medium-term momentum confirmation
     RSI7_OVERBOUGHT: float = 60.0
     RSI14_OVERSOLD: float = 48.0     # Macro trend pullback confirmation
     RSI14_OVERBOUGHT: float = 52.0
