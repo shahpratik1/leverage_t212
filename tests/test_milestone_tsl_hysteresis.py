@@ -246,6 +246,216 @@ class TestMilestoneTSLHysteresis(unittest.TestCase):
         self.mock_t212.cancel_order.assert_called_with("stop_tp2_1")
         self.mock_t212.place_market_order.assert_called_with("QQQ3l_EQ", -2.5)
 
+    def test_calculate_escape_threshold_long_and_short(self):
+        """RiskManager.calculate_escape_threshold computes correct buffers for LONG and SHORT."""
+        # Long: 105.0 + 0.5 * 4.0 = 107.0
+        esc_long = self.risk_manager.calculate_escape_threshold(tp1=105.0, atr=4.0, direction="LONG", multiplier=0.5)
+        self.assertEqual(esc_long, 107.0)
+
+        # Short: 95.0 - 0.5 * 4.0 = 93.0
+        esc_short = self.risk_manager.calculate_escape_threshold(tp1=95.0, atr=4.0, direction="SHORT", multiplier=0.5)
+        self.assertEqual(esc_short, 93.0)
+
+    def test_short_symmetry_hysteresis_escape(self):
+        """Short positions elevate stop downward to TP1 once price drops past escape threshold."""
+        pos = TrackedPosition(
+            ticker="QQQ3S_EQ",
+            underlying="QQQ",
+            direction="SHORT",
+            entry_price=100.0,
+            original_quantity=10.0,
+            remaining_quantity=5.0,
+            stop_loss=100.0,
+            trailing_stop_loss=100.0,
+            highest_price=100.0,
+            lowest_price=95.0,
+            tp1=95.0,
+            tp2=90.0,
+            tp3=85.0,
+            atr=4.0,
+            tp1_hit=True,
+            tp1_armed_hysteresis=True,
+            tp1_escape_threshold=93.0,
+            broker_stop_order_id="stop_short_1",
+        )
+        self.monitor.positions["QQQ3S_EQ"] = pos
+
+        # Price at 94.0 (below TP1 95.0, but hasn't cleared escape 93.0)
+        events = self.monitor.monitor_tick(current_prices={"QQQ3S_EQ": 94.0})
+        self.assertEqual(len([e for e in events if e.get("event") == "HYSTERESIS_TP1_RATCHET"]), 0)
+        self.assertTrue(pos.tp1_armed_hysteresis)
+
+        # Price drops to 92.50 (clears escape 93.0)
+        events = self.monitor.monitor_tick(current_prices={"QQQ3S_EQ": 92.50})
+        self.assertEqual(len([e for e in events if e.get("event") == "HYSTERESIS_TP1_RATCHET"]), 1)
+        self.assertFalse(pos.tp1_armed_hysteresis)
+        self.assertTrue(pos.tp1_stop_elevated)
+        self.assertEqual(pos.stop_loss, 95.0)
+
+    def test_pullback_to_breakeven_locks_in_net_profit(self):
+        """Pullback to Break-Even post-TP1 exits remaining shares at $0 loss, leaving net +0.50R profit."""
+        pos = TrackedPosition(
+            ticker="QQQ3l_EQ",
+            underlying="QQQ",
+            direction="LONG",
+            entry_price=400.0,
+            original_quantity=10.0,
+            remaining_quantity=10.0,
+            stop_loss=390.0,
+            trailing_stop_loss=390.0,
+            highest_price=400.0,
+            lowest_price=400.0,
+            tp1=410.0,
+            tp2=420.0,
+            tp3=430.0,
+            atr=4.0,
+        )
+        self.monitor.positions["QQQ3l_EQ"] = pos
+
+        # 1. Price hits TP1 (410.0): Sells 50% (5.0 shares), banks $50 profit
+        events1 = self.monitor.monitor_tick(current_prices={"QQQ3l_EQ": 410.0})
+        tp1_event = [e for e in events1 if e.get("event") == "TP1"][0]
+        self.assertEqual(tp1_event["pnl"], 50.0)
+        self.assertEqual(pos.remaining_quantity, 5.0)
+        self.assertEqual(pos.stop_loss, 400.0)
+
+        # 2. Price falls back to entry price Break-Even (400.0) before escape threshold is reached
+        events2 = self.monitor.monitor_tick(current_prices={"QQQ3l_EQ": 400.0})
+        stop_event = [e for e in events2 if e.get("event") == "STOP_EXIT"][0]
+        self.assertEqual(stop_event["pnl"], 0.0)  # Exited remaining 5 shares at $400 ($0 loss)
+        self.assertTrue(pos.is_closed)
+        self.assertEqual(pos.remaining_quantity, 0.0)
+
+    def test_gap_surge_directly_to_tp2_handles_sequence_safely(self):
+        """Single-tick gap surge to TP2 with tp1_hit=False triggers TP1 & TP2 sequence cleanly."""
+        pos = TrackedPosition(
+            ticker="QQQ3l_EQ",
+            underlying="QQQ",
+            direction="LONG",
+            entry_price=400.0,
+            original_quantity=10.0,
+            remaining_quantity=10.0,
+            stop_loss=390.0,
+            trailing_stop_loss=390.0,
+            highest_price=400.0,
+            lowest_price=400.0,
+            tp1=410.0,
+            tp2=420.0,
+            tp3=430.0,
+            atr=4.0,
+            tp1_hit=False,
+            tp2_hit=False,
+        )
+        self.monitor.positions["QQQ3l_EQ"] = pos
+
+        # Price surges in a single tick past TP1 straight to TP2 (420.0)
+        events = self.monitor.monitor_tick(current_prices={"QQQ3l_EQ": 420.0})
+
+        event_names = [e.get("event") for e in events]
+        self.assertIn("TP1", event_names)
+        self.assertIn("TP2", event_names)
+
+        # Trims 50% on TP1 and 25% on TP2 -> remaining is 2.5 shares
+        self.assertEqual(pos.remaining_quantity, 2.5)
+        self.assertTrue(pos.tp1_hit)
+        self.assertTrue(pos.tp2_hit)
+        # Hysteresis must be cleared and stop ratcheted to at least TP1
+        self.assertFalse(pos.tp1_armed_hysteresis)
+        self.assertGreaterEqual(pos.trailing_stop_loss, 410.0)
+        self.assertGreaterEqual(pos.stop_loss, 410.0)
+
+    def test_place_broker_stop_uses_negative_quantity_for_all_positions(self):
+        """Protective broker stops sell held shares using negative quantity for both long and short."""
+        # Long position
+        pos_long = TrackedPosition(
+            ticker="QQQ3l_EQ",
+            underlying="QQQ",
+            direction="LONG",
+            entry_price=400.0,
+            original_quantity=10.0,
+            remaining_quantity=7.5,
+            stop_loss=390.0,
+            trailing_stop_loss=390.0,
+            highest_price=400.0,
+            lowest_price=400.0,
+            tp1=410.0,
+            tp2=420.0,
+            tp3=430.0,
+            atr=4.0,
+        )
+        self.monitor.place_broker_stop(pos_long, stop_price=390.0)
+        self.mock_t212.place_stop_order.assert_called_with(
+            ticker="QQQ3l_EQ",
+            quantity=-7.5,
+            stop_price=390.0,
+            time_validity="GTC",
+        )
+
+        # Short position (cash inverse ETP)
+        pos_short = TrackedPosition(
+            ticker="QQQ3S_EQ",
+            underlying="QQQ",
+            direction="SHORT",
+            entry_price=100.0,
+            original_quantity=20.0,
+            remaining_quantity=10.0,
+            stop_loss=110.0,
+            trailing_stop_loss=110.0,
+            highest_price=100.0,
+            lowest_price=100.0,
+            tp1=95.0,
+            tp2=90.0,
+            tp3=85.0,
+            atr=4.0,
+        )
+        self.monitor.place_broker_stop(pos_short, stop_price=110.0)
+        self.mock_t212.place_stop_order.assert_called_with(
+            ticker="QQQ3S_EQ",
+            quantity=-10.0,
+            stop_price=110.0,
+            time_validity="GTC",
+        )
+
+    def test_tracked_position_hysteresis_state_serialization_round_trip(self):
+        """TrackedPosition preserves hysteresis state across JSON serialization and load_state."""
+        pos = TrackedPosition(
+            ticker="3TSM_EQ",
+            underlying="TSM",
+            direction="LONG",
+            entry_price=50.0,
+            original_quantity=100.0,
+            remaining_quantity=50.0,
+            stop_loss=50.0,
+            trailing_stop_loss=50.0,
+            highest_price=53.0,
+            lowest_price=50.0,
+            tp1=52.5,
+            tp2=55.0,
+            tp3=57.5,
+            atr=1.5,
+            tp1_hit=True,
+            tp1_armed_hysteresis=True,
+            tp1_escape_threshold=53.25,
+            tp1_stop_elevated=False,
+        )
+        self.monitor.positions["3TSM_EQ"] = pos
+        self.monitor._save_state()
+
+        # Load fresh state monitor from the same file
+        fresh_monitor = PositionMonitor(
+            t212_client=self.mock_t212,
+            notifier=self.notifier,
+            risk_manager=self.risk_manager,
+            state_file=self.state_file,
+            dry_run=False,
+        )
+        loaded = fresh_monitor.positions.get("3TSM_EQ")
+        self.assertIsNotNone(loaded)
+        self.assertTrue(loaded.tp1_armed_hysteresis)
+        self.assertEqual(loaded.tp1_escape_threshold, 53.25)
+        self.assertFalse(loaded.tp1_stop_elevated)
+        self.assertTrue(loaded.tp1_hit)
+
 
 if __name__ == "__main__":
     unittest.main()

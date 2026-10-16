@@ -278,6 +278,7 @@ class Notifier:
         new_tsl: float,
         locked_in_pnl_pct: float,
         is_triggered: bool = False,
+        event_type: str = "TSL",
     ) -> None:
         """Send a Trailing Stop Loss (TSL) update or execution notification."""
         action_text = (
@@ -286,7 +287,7 @@ class Notifier:
             else f"Trailing Stop ratcheted UP to ${new_tsl:.2f} (Locking in +{locked_in_pnl_pct:.1f}% min gain)."
         )
         note = TradeNotification(
-            event_type="TSL",
+            event_type=event_type,
             ticker=ticker,
             underlying=underlying,
             direction=direction,
@@ -300,6 +301,7 @@ class Notifier:
             pnl_pct=locked_in_pnl_pct,
             rationale=action_text,
         )
+        self.dispatch(note)
     def notify_session_exit(
         self,
         ticker: str,

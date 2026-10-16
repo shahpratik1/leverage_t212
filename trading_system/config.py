@@ -120,8 +120,12 @@ class Settings:
     RSI14_OVERBOUGHT: float = 52.0
     MR_MAX_HOLD_DAYS: int = 4        # Fast mean reversion holding period (eliminates beta decay)
 
-    # Trailing Stop Loss
+    # Trailing Stop Loss & Schmitt Hysteresis Ratcheting
     TSL_ATR_MULTIPLIER: float = 1.2
+    TSL_HYSTERESIS_ATR_MULT: float = 0.5  # Escape buffer past TP1 before elevating stop to TP1
+    TP1_TRIM_PCT: float = 0.50            # Upfront cash profit trim (50%)
+    TP2_TRIM_PCT: float = 0.25            # Second milestone trim (25%)
+    TP3_TRIM_PCT: float = 0.25            # Remaining runner tranche (25%)
 
     # Asymmetric Session Protocol & API Rate Quota Management
     SESSION_CLOSE_CUTOFF_UTC: str = "16:20"  # 10m before 16:30 LSE close
@@ -285,6 +289,16 @@ class Settings:
             raise ValueError(
                 f"Take-profit multiples must satisfy TP1 < TP2 < TP3, "
                 f"got TP1={self.TP1_R_MULTIPLE}, TP2={self.TP2_R_MULTIPLE}, TP3={self.TP3_R_MULTIPLE}"
+            )
+        if self.TSL_HYSTERESIS_ATR_MULT <= 0:
+            raise ValueError(
+                f"TSL_HYSTERESIS_ATR_MULT must be positive, got {self.TSL_HYSTERESIS_ATR_MULT}"
+            )
+        total_trim = round(self.TP1_TRIM_PCT + self.TP2_TRIM_PCT + self.TP3_TRIM_PCT, 4)
+        if total_trim != 1.0:
+            raise ValueError(
+                f"Trim percentages must sum to 1.0, got {total_trim} "
+                f"(TP1={self.TP1_TRIM_PCT}, TP2={self.TP2_TRIM_PCT}, TP3={self.TP3_TRIM_PCT})"
             )
         if self.UNIVERSE_SIZE <= 0:
             raise ValueError(

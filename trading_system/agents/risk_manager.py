@@ -59,6 +59,10 @@ class RiskManager:
         tp2_r: float = 2.0,
         tp3_r: float = 3.0,
         tsl_atr_multiplier: float = 1.2,
+        tsl_hysteresis_atr_mult: float = 0.5,
+        tp1_trim_pct: float = 0.50,
+        tp2_trim_pct: float = 0.25,
+        tp3_trim_pct: float = 0.25,
     ):
         self.max_risk_per_trade = max_risk_per_trade
         self.max_position_pct = max_position_pct
@@ -68,6 +72,10 @@ class RiskManager:
         self.tp2_r = tp2_r
         self.tp3_r = tp3_r
         self.tsl_atr_multiplier = tsl_atr_multiplier
+        self.tsl_hysteresis_atr_mult = tsl_hysteresis_atr_mult
+        self.tp1_trim_pct = tp1_trim_pct
+        self.tp2_trim_pct = tp2_trim_pct
+        self.tp3_trim_pct = tp3_trim_pct
         logger.debug("Initialized RiskManager with max_risk_per_trade=%s", max_risk_per_trade)
 
     def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG") -> float:
@@ -103,6 +111,26 @@ class RiskManager:
             tp2 = entry_price + (self.tp2_r * r_distance)
             tp3 = entry_price + (self.tp3_r * r_distance)
         return round(tp1, 2), round(tp2, 2), round(tp3, 2)
+
+    def calculate_escape_threshold(
+        self,
+        tp1: float,
+        atr: float,
+        direction: str = "LONG",
+        multiplier: Optional[float] = None,
+    ) -> float:
+        """Calculate the escape threshold for Schmitt Hysteresis past TP1.
+
+        Requires price to advance beyond TP1 by (multiplier * ATR) before
+        elevating the Stop Loss to TP1, eliminating zero-distance stop liquidations.
+        """
+        mult = multiplier if multiplier is not None else self.tsl_hysteresis_atr_mult
+        buffer = mult * atr if atr > 0 else tp1 * 0.015
+        if direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP"):
+            escape_price = max(0.01, tp1 - buffer)
+        else:
+            escape_price = tp1 + buffer
+        return round(escape_price, 2)
 
     def calculate_trailing_stop(
         self,

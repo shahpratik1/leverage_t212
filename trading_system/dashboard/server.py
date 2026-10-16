@@ -87,12 +87,19 @@ def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str
             tp3_gain_pct = abs(tp3 - entry) / entry * 100 if entry > 0 else 0.0
 
             status = "ACTIVE"
-            if pos.get("tp2_hit"):
-                status = "TP2 HIT (Trailing Stop Active)"
-            elif pos.get("tp1_hit"):
-                status = "TP1 HIT (Stop at Break-Even)"
-            elif pos.get("is_closed"):
+            tp1_armed_hysteresis = bool(pos.get("tp1_armed_hysteresis", False))
+            tp1_stop_elevated = bool(pos.get("tp1_stop_elevated", False))
+            tp1_escape_threshold = float(pos.get("tp1_escape_threshold") or 0.0)
+
+            if pos.get("is_closed"):
                 status = "CLOSED"
+            elif pos.get("tp2_hit"):
+                status = "TP2 HIT: Trailing Runner Active"
+            elif tp1_armed_hysteresis:
+                esc_str = f"{currency_prefix}{tp1_escape_threshold:.2f}{currency_suffix}" if tp1_escape_threshold > 0 else "Trigger Pending"
+                status = f"TP1 HIT: Break-Even (Hysteresis Armed @ {esc_str})"
+            elif tp1_stop_elevated or pos.get("tp1_hit"):
+                status = "TP1 LOCKED (+1.0R Stop Active)"
 
             rsi3_raw = pos.get("rsi3")
             rsi3_val = float(rsi3_raw) if rsi3_raw is not None else 100.0
@@ -155,6 +162,9 @@ def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str
                 "tp1_hit": pos.get("tp1_hit", False),
                 "tp2_hit": pos.get("tp2_hit", False),
                 "tp3_hit": pos.get("tp3_hit", False),
+                "tp1_armed_hysteresis": tp1_armed_hysteresis,
+                "tp1_stop_elevated": tp1_stop_elevated,
+                "tp1_escape_threshold": round(tp1_escape_threshold, 2),
                 "entry_time": pos.get("entry_time", ""),
                 "atr": round(pos.get("atr", 0.0), 2),
                 "copy_text": (
@@ -195,6 +205,23 @@ def load_recent_history(trades_log_path: str = "trades.jsonl", limit: int = 15) 
         return []
 
 
+def load_recent_notifications(log_path: str = "notifications.jsonl", limit: int = 25) -> List[Dict[str, Any]]:
+    """Load latest records from notifications alert log."""
+    if not os.path.exists(log_path):
+        return []
+    try:
+        lines = []
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    lines.append(json.loads(line))
+        return lines[-limit:][::-1]
+    except Exception as exc:
+        logger.warning("Failed to load notifications log: %s", exc)
+        return []
+
+
 def build_dashboard_data() -> Dict[str, Any]:
     """Compile comprehensive dashboard dataset."""
     universe = LeveragedUniverse()
@@ -217,6 +244,7 @@ def build_dashboard_data() -> Dict[str, Any]:
 
     active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH)
     history = load_recent_history(settings.TRADES_LOG_PATH)
+    recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH)
     active_stops = sum(1 for s in active_signals if s.get("broker_stop_order_id"))
 
     return {
@@ -224,6 +252,7 @@ def build_dashboard_data() -> Dict[str, Any]:
         "mode": "MANUAL_SIGNALS_MODE",
         "active_signals_count": len(active_signals),
         "active_signals": active_signals,
+        "recent_notifications": recent_notifications,
         "pairs_watchlist": pairs,
         "history": history,
         "broker_status": {
@@ -383,6 +412,38 @@ def generate_html_dashboard(output_path: str) -> str:
       </div>
     </section>
 
+    <!-- Recent Trade Activity & Alert History (Audit Log) -->
+    <section class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <div>
+          <h3 class="text-lg font-bold text-white flex items-center gap-2">
+            <span>🔔 Recent Alert & Trade Activity History</span>
+            <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono" id="alerts-badge">0</span>
+          </h3>
+          <p class="text-xs text-slate-400">Desktop notifications, trade triggers, and automated profit-taking exits (TP1 / TP2 / TP3 / SL).</p>
+        </div>
+        <div class="text-xs text-slate-500 font-mono">Real-Time Event Stream</div>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="text-xs uppercase bg-slate-950/60 text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="py-3 px-4">Event</th>
+              <th class="py-3 px-4">Ticker / Asset</th>
+              <th class="py-3 px-4">Price</th>
+              <th class="py-3 px-4">Quantity / P&amp;L</th>
+              <th class="py-3 px-4">Rationale / Milestone</th>
+              <th class="py-3 px-4">Timestamp (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="alerts-table-body" class="divide-y divide-slate-800/60 font-mono text-xs">
+            <!-- Rendered by JS -->
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Manual Execution SOP for User -->
     <section class="bg-gradient-to-r from-indigo-950/40 via-slate-900 to-slate-900 border border-indigo-500/20 rounded-2xl p-6">
       <h3 class="text-base font-bold text-white flex items-center gap-2 mb-3">
@@ -457,6 +518,24 @@ def generate_html_dashboard(output_path: str) -> str:
           ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30">⚡ 3-RSI Mean Reversion (${{s.win_rate_exp || '85%'}} Win-Rate)</span>`
           : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">🚀 Trend Momentum (${{s.win_rate_exp || '72%'}} Win-Rate)</span>`;
 
+        const hysteresisBadge = s.tp1_armed_hysteresis
+          ? `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-amber-950/40 text-amber-300 border-amber-500/30 mb-2.5 shadow-sm">
+               <span class="font-bold flex items-center gap-1.5">
+                 <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                 Schmitt Hysteresis:
+               </span>
+               <span class="font-mono font-bold text-[10px] text-amber-200">ARMED (Elevates @ ${{currPrefix}}${{s.tp1_escape_threshold ? s.tp1_escape_threshold.toFixed(2) : '--'}}${{currSuffix}})</span>
+             </div>`
+          : (s.tp1_stop_elevated || s.tp2_hit
+              ? `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-emerald-950/40 text-emerald-300 border-emerald-500/30 mb-2.5 shadow-sm">
+                   <span class="font-bold flex items-center gap-1.5">
+                     <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                     Milestone Stop Floor:
+                   </span>
+                   <span class="font-mono font-bold text-[10px] text-emerald-200">LOCKED (+1.0R Floor)</span>
+                 </div>`
+              : '');
+
         const stopOrderBadge = s.broker_stop_order_id
           ? `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-emerald-950/60 text-emerald-300 border-emerald-500/30 mb-2.5 shadow-sm">
                <span class="font-bold flex items-center gap-1.5">
@@ -476,6 +555,7 @@ def generate_html_dashboard(output_path: str) -> str:
         const pnlPct = (s.pnl_pct !== undefined && s.pnl_pct !== null) ? s.pnl_pct : 0.0;
         const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-400');
         const pnlSign = pnlPct > 0 ? '+' : '';
+        const statusColor = s.tp1_armed_hysteresis ? 'text-amber-400' : (s.tp1_stop_elevated ? 'text-emerald-400' : 'text-slate-300');
 
         const rsiStrip = (s.rsi3 !== undefined && s.rsi3 !== null)
           ? `<div class="flex flex-wrap items-center gap-1.5 mt-2 pt-2 border-t border-slate-800/60 text-[10px] font-mono text-slate-400">
@@ -513,6 +593,9 @@ def generate_html_dashboard(output_path: str) -> str:
             <div class="mb-2">
               ${{stratBadge}}
             </div>
+
+            <!-- Schmitt Hysteresis Milestone Badge -->
+            ${{hysteresisBadge}}
 
             <!-- Native Broker Stop Order Badge -->
             ${{stopOrderBadge}}
@@ -596,7 +679,7 @@ def generate_html_dashboard(output_path: str) -> str:
 
           <!-- Actions -->
           <div class="pt-3 border-t border-slate-800/80 flex items-center justify-between gap-2">
-            <span class="text-[11px] text-slate-400">Status: <span class="text-emerald-400 font-semibold">${{s.status}}</span></span>
+            <span class="text-[11px] text-slate-400">Status: <span class="${{statusColor}} font-semibold">${{s.status}}</span></span>
             <button onclick="copyToClipboard('${{encodeURIComponent(s.copy_text)}}')" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white text-xs font-medium transition flex items-center gap-1">
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
               Copy Order
@@ -683,12 +766,94 @@ def generate_html_dashboard(output_path: str) -> str:
       const pad = n => String(n).padStart(2, '0');
       countdownEl.innerText = `${{pad(hours)}}:${{pad(minutes)}}:${{pad(seconds)}}`;
     }}
+    function renderAlertsTable() {{
+      const tbody = document.getElementById('alerts-table-body');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      const notifs = INITIAL_DATA.recent_notifications || [];
+      const badge = document.getElementById('alerts-badge');
+      if (badge) badge.innerText = notifs.length;
+
+      if (notifs.length === 0) {{
+        tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-slate-500 font-sans">No recent alerts or execution events recorded.</td></tr>`;
+        return;
+      }}
+
+      notifs.forEach(n => {{
+        const row = document.createElement('tr');
+        row.className = "hover:bg-slate-900/80 transition";
+        const ev = (n.event_type || 'ALERT').toUpperCase();
+        let badgeColor = 'bg-slate-800 text-slate-300 border-slate-700';
+        let badgeIcon = '📢 ' + ev;
+
+        if (ev === 'BUY') {{
+          badgeColor = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
+          badgeIcon = '🟢 BUY';
+        }} else if (ev === 'SELL') {{
+          badgeColor = 'bg-rose-500/10 text-rose-400 border-rose-500/20';
+          badgeIcon = '🔴 SELL';
+        }} else if (ev === 'TP1') {{
+          badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
+          badgeIcon = '🎯 TP1 (+1.0R)';
+        }} else if (ev === 'TP2') {{
+          badgeColor = 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30';
+          badgeIcon = '🎯 TP2 (+2.0R)';
+        }} else if (ev === 'TP3') {{
+          badgeColor = 'bg-purple-500/10 text-purple-300 border-purple-500/30';
+          badgeIcon = '🏆 TP3 (+3.0R RUNNER)';
+        }} else if (ev === 'SL') {{
+          badgeColor = 'bg-rose-500/10 text-rose-300 border-rose-500/30';
+          badgeIcon = '🛑 STOP LOSS';
+        }} else if (ev === 'HYSTERESIS_TP1_RATCHET' || ev.includes('HYSTERESIS')) {{
+          badgeColor = 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30';
+          badgeIcon = '🛡️ TSL ELEVATED (+1.0R)';
+        }} else if (ev === 'TSL' || ev === 'TSL_RATCHET') {{
+          badgeColor = 'bg-amber-500/10 text-amber-300 border-amber-500/30';
+          badgeIcon = '📈 TSL RATCHET';
+        }}
+
+        const pnl = (n.pnl !== null && n.pnl !== undefined) ? Number(n.pnl) : null;
+        const pnlPct = (n.pnl_pct !== null && n.pnl_pct !== undefined) ? Number(n.pnl_pct) : null;
+        let pnlText = '—';
+        if (pnl !== null) {{
+          const color = pnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
+          const sign = pnl >= 0 ? '+' : '';
+          pnlText = `<span class="${{color}} font-bold">${{sign}}$${{pnl.toFixed(2)}} (${{sign}}${{pnlPct !== null ? pnlPct.toFixed(2) : '0.00'}}%)</span>`;
+        }} else if (n.quantity) {{
+          pnlText = `<span class="text-slate-400">${{Number(n.quantity).toFixed(2)}} shs</span>`;
+        }}
+
+        const price = (n.price !== undefined && n.price !== null) ? `$${{Number(n.price).toFixed(2)}}` : '—';
+        const underlyingText = n.underlying ? `(${{n.underlying}})` : (n.direction ? `(${{n.direction}})` : '');
+
+        row.innerHTML = `
+          <td class="py-3 px-4">
+            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-black border ${{badgeColor}}">
+              ${{badgeIcon}}
+            </span>
+          </td>
+          <td class="py-3 px-4 font-bold text-white">
+            ${{n.ticker || '—'}}
+            <span class="text-[11px] font-normal text-slate-400 font-sans ml-1">${{underlyingText}}</span>
+          </td>
+          <td class="py-3 px-4 font-mono text-slate-200">${{price}}</td>
+          <td class="py-3 px-4 font-mono">${{pnlText}}</td>
+          <td class="py-3 px-4 font-sans text-slate-300 text-xs max-w-md truncate" title="${{n.rationale || ''}}">
+            ${{n.rationale || '—'}}
+          </td>
+          <td class="py-3 px-4 text-slate-400 text-[11px] font-mono whitespace-nowrap">${{n.timestamp || '—'}}</td>
+        `;
+        tbody.appendChild(row);
+      }});
+    }}
+
     setInterval(updateCountdown, 1000);
     updateCountdown();
 
     // Initial render
     renderSignals('ALL');
     renderPairsTable();
+    renderAlertsTable();
 
     // Auto-refresh dashboard data every 30s to synchronize with background position monitor
     setInterval(() => {{
@@ -743,6 +908,10 @@ def start_background_position_monitor(
             tp2_r=settings.TP2_R_MULTIPLE,
             tp3_r=settings.TP3_R_MULTIPLE,
             tsl_atr_multiplier=settings.TSL_ATR_MULTIPLIER,
+            tsl_hysteresis_atr_mult=settings.TSL_HYSTERESIS_ATR_MULT,
+            tp1_trim_pct=settings.TP1_TRIM_PCT,
+            tp2_trim_pct=settings.TP2_TRIM_PCT,
+            tp3_trim_pct=settings.TP3_TRIM_PCT,
         )
         monitor = PositionMonitor(
             t212_client=client,
@@ -847,7 +1016,8 @@ def start_local_server(html_file: str, port: int = 8888, open_browser: bool = Tr
                 self.path = f"/{html_name}"
             return super().do_GET()
 
-    with socketserver.TCPServer(("", port), CustomHandler) as httpd:
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("127.0.0.1", port), CustomHandler) as httpd:
         url = f"http://localhost:{port}/{html_name}"
         print(f"\n🚀 Signals Dashboard running live at: {url}")
         print("⚡ COMPLETE AUTOMATION ACTIVE: Polling every 15s for TP1/TP2/TP3 auto-sells")

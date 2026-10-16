@@ -56,6 +56,8 @@ class TrackedPosition:
     is_overnight_eligible: bool = False
     broker_stop_order_id: Optional[str] = None
     tp1_armed_hysteresis: bool = False
+    tp1_escape_threshold: float = 0.0
+    tp1_stop_elevated: bool = False
 
     def __post_init__(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -148,9 +150,8 @@ class PositionMonitor:
 
         try:
             # In Trading 212 Invest/Stocks API:
-            # For LONG positions, Stop Loss sells held shares (negative quantity)
-            # For SHORT positions, Stop Loss buys back shares (positive quantity)
-            order_qty = -abs(pos.remaining_quantity) if pos.direction.upper() == "LONG" else abs(pos.remaining_quantity)
+            # Protective stops for cash equity and 3x/5x leveraged ETPs sell held shares (negative quantity)
+            order_qty = -abs(pos.remaining_quantity)
             logger.info(
                 "Placing native Stop Order on Trading 212 for %s: %.3f shares @ stopPrice $%.2f",
                 pos.ticker, order_qty, price
@@ -190,16 +191,18 @@ class PositionMonitor:
         if not order_id:
             return True
 
-        pos.broker_stop_order_id = None
-        self._save_state()
-
         if self.dry_run or order_id.startswith("DRY_"):
+            pos.broker_stop_order_id = None
+            self._save_state()
             logger.info("[DRY-RUN] Cancelled broker stop order %s for %s", order_id, pos.ticker)
             return True
 
         try:
             logger.info("Canceling broker Stop Order %s for %s on Trading 212", order_id, pos.ticker)
             success = self.t212.cancel_order(order_id)
+            if success:
+                pos.broker_stop_order_id = None
+                self._save_state()
             return success
         except Exception as exc:
             logger.warning("Failed to cancel broker Stop Order %s on Trading 212: %s", order_id, exc)
@@ -413,41 +416,62 @@ class PositionMonitor:
                 pos.lowest_price = current_price
 
             # Check exits in priority order
+            is_short = pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP")
+
             # 1. Stop Loss & Trailing Stop Loss
-            active_stop = max(pos.stop_loss, pos.trailing_stop_loss)
-            if current_price <= active_stop:
+            if is_short:
+                active_stop = min(pos.stop_loss, pos.trailing_stop_loss) if pos.trailing_stop_loss > 0 else pos.stop_loss
+                stop_hit = current_price >= active_stop
+            else:
+                active_stop = max(pos.stop_loss, pos.trailing_stop_loss)
+                stop_hit = current_price <= active_stop
+
+            if stop_hit:
                 event = self._handle_stop_exit(pos, current_price, is_tsl=(active_stop == pos.trailing_stop_loss and pos.tp1_hit))
                 events.append(event)
                 tickers_to_remove.append(ticker)
                 continue
 
             # 2. Take Profit 3 (Final target - Full close)
-            if current_price >= pos.tp3 and not pos.tp3_hit:
+            tp3_hit = (current_price <= pos.tp3) if is_short else (current_price >= pos.tp3)
+            if tp3_hit and not pos.tp3_hit:
                 event = self._handle_tp3_hit(pos, current_price)
                 events.append(event)
                 tickers_to_remove.append(ticker)
                 continue
 
-            # 3. Take Profit 2 (Second trim - 25%)
-            if current_price >= pos.tp2 and not pos.tp2_hit:
-                event = self._handle_tp2_hit(pos, current_price)
+            # 3. Take Profit 1 (First trim - 50% + Breakeven SL + Arm Hysteresis)
+            tp1_hit = (current_price <= pos.tp1) if is_short else (current_price >= pos.tp1)
+            if tp1_hit and not pos.tp1_hit:
+                event = self._handle_tp1_hit(pos, current_price)
                 events.append(event)
 
-            # 4. Take Profit 1 (First trim - 50% + Breakeven SL + Arm Hysteresis)
-            if current_price >= pos.tp1 and not pos.tp1_hit:
-                event = self._handle_tp1_hit(pos, current_price)
+            # 4. Take Profit 2 (Second trim - 25% + Ratchet to TP1)
+            tp2_hit = (current_price <= pos.tp2) if is_short else (current_price >= pos.tp2)
+            if tp2_hit and not pos.tp2_hit:
+                event = self._handle_tp2_hit(pos, current_price)
                 events.append(event)
 
             # 5. Schmitt-Trigger Hysteresis: Elevate stop to TP1 once price clears escape threshold
             if getattr(pos, "tp1_armed_hysteresis", False) and not pos.tp2_hit:
-                escape_offset = 0.5 * pos.atr if pos.atr > 0 else abs(pos.tp1 - pos.entry_price) * 0.5
-                escape_threshold = pos.tp1 + escape_offset if pos.direction.upper() == "LONG" else pos.tp1 - escape_offset
-                escape_cleared = (current_price >= escape_threshold) if pos.direction.upper() == "LONG" else (current_price <= escape_threshold)
+                escape_threshold = getattr(pos, "tp1_escape_threshold", 0.0)
+                if not escape_threshold or escape_threshold <= 0:
+                    escape_threshold = self.risk_manager.calculate_escape_threshold(
+                        tp1=pos.tp1, atr=pos.atr, direction=pos.direction
+                    )
+                    pos.tp1_escape_threshold = escape_threshold
+
+                escape_cleared = (current_price <= escape_threshold) if is_short else (current_price >= escape_threshold)
                 if escape_cleared:
                     pos.tp1_armed_hysteresis = False
-                    pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1) if pos.direction.upper() == "LONG" else min(pos.trailing_stop_loss, pos.tp1)
-                    pos.stop_loss = max(pos.stop_loss, pos.tp1) if pos.direction.upper() == "LONG" else min(pos.stop_loss, pos.tp1)
-                    locked_pct = abs((pos.tp1 - pos.entry_price) / pos.entry_price) * 100
+                    pos.tp1_stop_elevated = True
+                    if pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"):
+                        pos.trailing_stop_loss = min(pos.trailing_stop_loss, pos.tp1) if pos.trailing_stop_loss > 0 else pos.tp1
+                        pos.stop_loss = min(pos.stop_loss, pos.tp1) if pos.stop_loss > 0 else pos.tp1
+                    else:
+                        pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1)
+                        pos.stop_loss = max(pos.stop_loss, pos.tp1)
+                    locked_pct = abs((pos.tp1 - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0.0
                     logger.info(
                         "🎯 %s Schmitt-Trigger Hysteresis ESCAPE: price $%.2f cleared threshold $%.2f. Stop safely elevated to TP1 ($%.2f, +%.1f%% locked)",
                         ticker, current_price, escape_threshold, pos.tp1, locked_pct,
@@ -461,23 +485,26 @@ class PositionMonitor:
                         current_price=current_price,
                         new_tsl=pos.tp1,
                         locked_in_pnl_pct=locked_pct,
+                        event_type="HYSTERESIS_TP1_RATCHET",
                     )
                     events.append({"event": "HYSTERESIS_TP1_RATCHET", "ticker": ticker, "new_tsl": pos.tp1})
 
             # 6. Trailing Stop Ratchet (Ratchets higher with new highs once hysteresis clears)
             if pos.tp1_hit and not getattr(pos, "tp1_armed_hysteresis", False):
+                favorable_price = pos.lowest_price if is_short else pos.highest_price
                 new_tsl = self.risk_manager.calculate_trailing_stop(
                     current_price=current_price,
-                    peak_price=pos.highest_price,
+                    peak_price=favorable_price,
                     atr=pos.atr,
                     current_tsl=pos.trailing_stop_loss,
                     direction=pos.direction,
                 )
-                if new_tsl > pos.trailing_stop_loss:
+                ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
+                if ratcheted:
                     old_tsl = pos.trailing_stop_loss
                     pos.trailing_stop_loss = new_tsl
-                    locked_pct = ((new_tsl - pos.entry_price) / pos.entry_price) * 100
-                    logger.info("%s TSL ratcheted UP: $%.2f -> $%.2f (+%.1f%% locked)", ticker, old_tsl, new_tsl, locked_pct)
+                    locked_pct = ((pos.entry_price - new_tsl) / pos.entry_price * 100) if is_short else ((new_tsl - pos.entry_price) / pos.entry_price * 100)
+                    logger.info("%s TSL ratcheted: $%.2f -> $%.2f (+%.1f%% locked)", ticker, old_tsl, new_tsl, locked_pct)
 
                     # Update native broker stop order on Trading 212
                     self.place_broker_stop(pos, stop_price=new_tsl)
@@ -489,6 +516,7 @@ class PositionMonitor:
                         current_price=current_price,
                         new_tsl=new_tsl,
                         locked_in_pnl_pct=locked_pct,
+                        event_type="TSL_RATCHET",
                     )
                     events.append({"event": "TSL_RATCHET", "ticker": ticker, "new_tsl": new_tsl})
 
@@ -505,11 +533,29 @@ class PositionMonitor:
     # ─────────────────────────────────────────────────────────────
     # Internal Target Handlers
     # ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _calculate_pnl(pos: TrackedPosition, price: float, quantity: float) -> Tuple[float, float]:
+        """Compute realized P&L amount and percentage accounting for direction."""
+        if pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"):
+            diff = pos.entry_price - price
+        else:
+            diff = price - pos.entry_price
+        pnl = quantity * diff
+        pnl_pct = (diff / pos.entry_price) * 100.0 if pos.entry_price > 0 else 0.0
+        return round(pnl, 2), round(pnl_pct, 2)
+
     def _handle_tp1_hit(self, pos: TrackedPosition, price: float) -> Dict[str, Any]:
         """Process TP1 hit: Sell 50%, bank profit, move stop to break-even, arm hysteresis."""
         pos.tp1_hit = True
         pos.tp1_armed_hysteresis = True
-        trim_shares = round(pos.original_quantity * 0.50, 3)
+        pos.tp1_stop_elevated = False
+        pos.tp1_escape_threshold = self.risk_manager.calculate_escape_threshold(
+            tp1=pos.tp1,
+            atr=pos.atr,
+            direction=pos.direction,
+        )
+        trim_pct = getattr(self.risk_manager, "tp1_trim_pct", settings.TP1_TRIM_PCT)
+        trim_shares = round(pos.original_quantity * trim_pct, 3)
         actual_trim = min(trim_shares, pos.remaining_quantity)
         pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
 
@@ -517,8 +563,7 @@ class PositionMonitor:
         pos.stop_loss = pos.entry_price
         pos.trailing_stop_loss = pos.entry_price
 
-        pnl = actual_trim * (price - pos.entry_price)
-        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+        pnl, pnl_pct = self._calculate_pnl(pos, price, actual_trim)
 
         # Cancel pending broker stop order to unblock shares for sell execution
         self.cancel_broker_stop(pos)
@@ -544,18 +589,24 @@ class PositionMonitor:
 
     def _handle_tp2_hit(self, pos: TrackedPosition, price: float) -> Dict[str, Any]:
         """Process TP2 hit: Sell 25% of original, ratchet trailing stop to TP1."""
+        pos.tp1_hit = True
         pos.tp2_hit = True
         pos.tp1_armed_hysteresis = False
-        trim_shares = round(pos.original_quantity * 0.25, 3)
+        pos.tp1_stop_elevated = True
+        trim_pct = getattr(self.risk_manager, "tp2_trim_pct", settings.TP2_TRIM_PCT)
+        trim_shares = round(pos.original_quantity * trim_pct, 3)
         actual_trim = min(trim_shares, pos.remaining_quantity)
         pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
 
         # Ratchet trailing stop to TP1
-        pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1)
-        pos.stop_loss = max(pos.stop_loss, pos.tp1)
+        if pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"):
+            pos.trailing_stop_loss = min(pos.trailing_stop_loss, pos.tp1) if pos.trailing_stop_loss > 0 else pos.tp1
+            pos.stop_loss = min(pos.stop_loss, pos.tp1) if pos.stop_loss > 0 else pos.tp1
+        else:
+            pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1)
+            pos.stop_loss = max(pos.stop_loss, pos.tp1)
 
-        pnl = actual_trim * (price - pos.entry_price)
-        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+        pnl, pnl_pct = self._calculate_pnl(pos, price, actual_trim)
 
         # Cancel pending broker stop order to unblock shares for sell execution
         self.cancel_broker_stop(pos)
@@ -583,6 +634,7 @@ class PositionMonitor:
         """Process TP3 hit: Close remaining runner position with full gains."""
         pos.tp3_hit = True
         pos.tp1_armed_hysteresis = False
+        pos.tp1_stop_elevated = True
         pos.is_closed = True
         shares_to_sell = pos.remaining_quantity
         pos.remaining_quantity = 0.0
@@ -590,8 +642,7 @@ class PositionMonitor:
         # Cancel pending broker stop order on Trading 212
         self.cancel_broker_stop(pos)
 
-        pnl = shares_to_sell * (price - pos.entry_price)
-        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+        pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, shares_to_sell)
@@ -617,8 +668,7 @@ class PositionMonitor:
         # Cancel pending broker stop order on Trading 212
         self.cancel_broker_stop(pos)
 
-        pnl = shares_to_sell * (price - pos.entry_price)
-        pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
+        pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, shares_to_sell)

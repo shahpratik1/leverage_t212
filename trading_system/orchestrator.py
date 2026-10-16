@@ -58,7 +58,13 @@ DEFAULT_UNIVERSE = [
 class Orchestrator:
     """Master controller for 3x Long/Short Quantitative Trading Engine."""
 
-    def __init__(self, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        dry_run: bool = False,
+        notifier: Optional[Notifier] = None,
+        position_monitor: Optional[PositionMonitor] = None,
+        trades_log: Optional[Path | str] = None,
+    ) -> None:
         settings.validate()
         self.dry_run = dry_run
 
@@ -85,7 +91,7 @@ class Orchestrator:
             )
 
         # ── 3. Notification Engine ────────────────────────────────
-        self.notifier = Notifier(
+        self.notifier = notifier or Notifier(
             telegram_bot_token=settings.TELEGRAM_BOT_TOKEN,
             telegram_chat_id=settings.TELEGRAM_CHAT_ID,
             discord_webhook_url=settings.DISCORD_WEBHOOK_URL,
@@ -131,7 +137,7 @@ class Orchestrator:
         )
 
         # ── 6. Active Position & Lifecycle Monitor ───────────────
-        self.position_monitor = PositionMonitor(
+        self.position_monitor = position_monitor or PositionMonitor(
             t212_client=self.t212,
             notifier=self.notifier,
             risk_manager=self.risk_manager,
@@ -146,7 +152,7 @@ class Orchestrator:
                 logger.warning("Initial broker stop sync deferred: %s", exc)
 
         # ── 7. Audit Logging ──────────────────────────────────────
-        self.trades_log = Path(settings.TRADES_LOG_PATH)
+        self.trades_log = Path(trades_log) if trades_log else Path(settings.TRADES_LOG_PATH)
 
         logger.info(
             "Orchestrator initialized — 3x Universe: %d assets, Mode: %s (DryRun: %s)",

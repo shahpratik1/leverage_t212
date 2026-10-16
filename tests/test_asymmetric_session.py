@@ -591,7 +591,7 @@ class TestOrchestratorPreTradeEarningsFilter(unittest.TestCase):
     """Verifies R2.2 Screener / Intake Earnings Gate."""
 
     def setUp(self):
-        self.orchestrator = Orchestrator(dry_run=True)
+        self.orchestrator = Orchestrator(dry_run=True, notifier=Notifier(enable_desktop=False))
 
     def test_screener_candidate_rejected_if_earnings_within_48h(self):
         """Candidate with earnings scheduled in <= 2.0 days is rejected pre-trade."""
