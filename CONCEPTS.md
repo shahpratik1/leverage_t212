@@ -26,3 +26,9 @@ An emergency stop-loss placed significantly outside normal market volatility noi
 *Avoid: Operational stop, trailing stop*
 
 Mean reversion strategies rely on indicator reversion (e.g. price crossing the 5-period SMA) for ordinary exits; tight operational stops inadvertently choke valid dip-buying entries before the snapback materializes.
+
+### Noise Buffer
+An ATR multiplier (e.g. 2.0x–2.5x) applied to stop-loss placement on high-beta leveraged products to absorb intraday microstructure wicks and bid-ask spread noise without prematurely choking a mean-reversion trade.
+*Avoid: Tight stop, scalping stop*
+
+Calibrating the noise buffer to at least 2.2x ATR prevents false-positive exits during peak adverse excursion on 3x leveraged ETPs, allowing short-term relief rallies to develop.
