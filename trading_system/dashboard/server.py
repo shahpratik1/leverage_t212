@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import webbrowser
+import queue
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,56 @@ from trading_system.execution.position_monitor import PositionMonitor
 from trading_system.notifications.notifier import Notifier
 
 logger = logging.getLogger(__name__)
+
+
+class ThreadingDashboardServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """Threaded TCP server allowing multiple concurrent long-lived SSE connections."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class SSEBroadcaster:
+    """Thread-safe event broadcaster for Server-Sent Events (SSE)."""
+    _instance: Optional[SSEBroadcaster] = None
+
+    def __init__(self) -> None:
+        self._subscribers: List[queue.Queue] = []
+        self._lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls) -> SSEBroadcaster:
+        if cls._instance is None:
+            cls._instance = SSEBroadcaster()
+        return cls._instance
+
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=100)
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+
+    def broadcast(self, event_type: str, data: Any) -> None:
+        payload = {
+            "event": event_type,
+            "data": data,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._lock:
+            dead = []
+            for q in self._subscribers:
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                self._subscribers.remove(q)
+
+    publish = broadcast
 
 
 def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str, Any]]:
@@ -862,10 +913,47 @@ def generate_html_dashboard(output_path: str) -> str:
     renderPairsTable();
     renderAlertsTable();
 
-    // Auto-refresh dashboard data every 30s to synchronize with background position monitor
+    // Real-time zero-latency SSE telemetry stream
+    function initSSE() {{
+      if (typeof EventSource !== "undefined") {{
+        try {{
+          const streamUrl = window.location.origin + "/stream";
+          const es = new EventSource(streamUrl);
+          es.addEventListener("snapshot", function(e) {{
+            try {{
+              const payload = JSON.parse(e.data);
+              if (payload && payload.active_signals) {{
+                rawSignals = payload.active_signals;
+                renderSignals(currentFilter);
+                renderPairsTable();
+                renderAlertsTable();
+              }}
+            }} catch (err) {{}}
+          }});
+          es.addEventListener("dashboard_update", function(e) {{
+            try {{
+              const payload = JSON.parse(e.data);
+              if (payload && payload.active_signals) {{
+                rawSignals = payload.active_signals;
+                renderSignals(currentFilter);
+                renderPairsTable();
+                renderAlertsTable();
+              }}
+            }} catch (err) {{}}
+          }});
+          es.onerror = function() {{
+            es.close();
+            setTimeout(initSSE, 5000);
+          }};
+        }} catch (e) {{}}
+      }}
+    }}
+    initSSE();
+
+    // Auto-refresh dashboard fallback every 45s if SSE is not supported
     setInterval(() => {{
       window.location.reload();
-    }}, 30000);
+    }}, 45000);
   </script>
 </body>
 </html>
@@ -873,6 +961,11 @@ def generate_html_dashboard(output_path: str) -> str:
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content)
+
+    try:
+        SSEBroadcaster.get_instance().broadcast("dashboard_update", data)
+    except Exception:
+        pass
 
     logger.info("Generated dashboard HTML at %s", output_path)
     return output_path
@@ -1021,6 +1114,61 @@ def start_background_position_monitor(
     return thread
 
 
+def make_dashboard_handler(web_dir: Path, html_name: str):
+    """Create HTTP request handler supporting dashboard files and SSE event streaming."""
+    class CustomDashboardHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(web_dir), **kwargs)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            # Suppress normal GET 200 log spam for continuous SSE keepalive
+            clean = format % args
+            if "GET /stream" in clean or "GET /events" in clean:
+                return
+            super().log_message(format, *args)
+
+        def do_GET(self):
+            clean_path = self.path.split("?")[0]
+            if clean_path in ("/stream", "/api/stream", "/events"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                broadcaster = SSEBroadcaster.get_instance()
+                q = broadcaster.subscribe()
+                try:
+                    # Emit initial state snapshot immediately
+                    initial_data = build_dashboard_data()
+                    snapshot_str = json.dumps(initial_data)
+                    self.wfile.write(f"event: snapshot\ndata: {snapshot_str}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+
+                    while True:
+                        try:
+                            msg = q.get(timeout=2.0)
+                            event_name = msg.get("event", "message")
+                            data_str = json.dumps(msg.get("data", {}))
+                            self.wfile.write(f"event: {event_name}\ndata: {data_str}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                except (ConnectionResetError, BrokenPipeError, socket.error):
+                    pass
+                finally:
+                    broadcaster.unsubscribe(q)
+                return
+
+            if clean_path in ("/", ""):
+                self.path = f"/{html_name}"
+            return super().do_GET()
+
+    return CustomDashboardHandler
+
+
 def start_local_server_thread(
     html_file: str = "signals_dashboard.html",
     port: int = 8888,
@@ -1030,22 +1178,14 @@ def start_local_server_thread(
     generate_html_dashboard(html_file)
     web_dir = Path(html_file).resolve().parent
     html_name = Path(html_file).name
-
-    class CustomHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=str(web_dir), **kwargs)
-
-        def do_GET(self):
-            if self.path in ("/", ""):
-                self.path = f"/{html_name}"
-            return super().do_GET()
+    HandlerClass = make_dashboard_handler(web_dir, html_name)
 
     socketserver.TCPServer.allow_reuse_address = True
     bind_port = port
     httpd = None
     for attempt in range(5):
         try:
-            httpd = socketserver.TCPServer(("0.0.0.0", bind_port), CustomHandler)
+            httpd = ThreadingDashboardServer(("0.0.0.0", bind_port), HandlerClass)
             break
         except OSError:
             bind_port = port + attempt + 1
@@ -1080,18 +1220,10 @@ def start_local_server(html_file: str, port: int = 8888, open_browser: bool = Tr
 
     web_dir = Path(html_file).parent
     html_name = Path(html_file).name
-
-    class CustomHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=str(web_dir), **kwargs)
-
-        def do_GET(self):
-            if self.path in ("/", ""):
-                self.path = f"/{html_name}"
-            return super().do_GET()
+    HandlerClass = make_dashboard_handler(web_dir, html_name)
 
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("0.0.0.0", port), CustomHandler) as httpd:
+    with ThreadingDashboardServer(("0.0.0.0", port), HandlerClass) as httpd:
         url = f"http://localhost:{port}/{html_name}"
         print(f"\n🚀 Signals Dashboard running live at: {url}")
         print("⚡ COMPLETE AUTOMATION ACTIVE: Polling every 15s for TP1/TP2/TP3 auto-sells")

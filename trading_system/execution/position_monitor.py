@@ -55,6 +55,7 @@ class TrackedPosition:
     earnings_in_days: Optional[float] = None
     is_overnight_eligible: bool = False
     broker_stop_order_id: Optional[str] = None
+    broker_tp_order_id: Optional[str] = None
     tp1_armed_hysteresis: bool = False
     tp1_escape_threshold: float = 0.0
     tp1_stop_elevated: bool = False
@@ -260,6 +261,92 @@ class PositionMonitor:
         except Exception as exc:
             logger.warning("Failed to cancel broker Stop Order %s on Trading 212: %s", order_id, exc)
             return False
+
+    def place_broker_tp_limit(
+        self,
+        pos: TrackedPosition,
+        limit_price: Optional[float] = None,
+        quantity: Optional[float] = None,
+    ) -> Optional[str]:
+        """Place or replace a native GTC Limit Order for Take Profit on Trading 212 broker server."""
+        price = limit_price if limit_price is not None else pos.tp1
+        qty = quantity if quantity is not None else round(pos.remaining_quantity * 0.5, 4)
+        if qty <= 0 or price <= 0:
+            return None
+
+        # Cancel previous broker TP limit order if one exists
+        if pos.broker_tp_order_id:
+            self.cancel_broker_tp_limit(pos)
+
+        if self.dry_run:
+            fake_id = f"DRY_LIMIT_{pos.ticker}_{int(time.time())}"
+            pos.broker_tp_order_id = fake_id
+            self._save_state()
+            logger.info("[DRY-RUN] Would place native broker Limit Order for %s: %.3f shares @ $%.2f",
+                        pos.ticker, qty, price)
+            return fake_id
+
+        try:
+            # In Trading 212 Invest: Sell held shares at limit price
+            order_qty = -abs(qty)
+            logger.info(
+                "Placing native Limit Order on Trading 212 for %s: %.3f shares @ limitPrice $%.2f",
+                pos.ticker, order_qty, price
+            )
+            try:
+                res = self.t212.place_limit_order(
+                    ticker=pos.ticker,
+                    quantity=order_qty,
+                    limit_price=round(price, 2),
+                    time_validity="GTC",
+                )
+            except Exception as first_exc:
+                logger.debug("Limit order with validity GTC failed (%s), attempting DAY...", first_exc)
+                delay = getattr(self.t212, "rate_limit_delay", 1.25)
+                time.sleep(delay)
+                res = self.t212.place_limit_order(
+                    ticker=pos.ticker,
+                    quantity=order_qty,
+                    limit_price=round(price, 2),
+                    time_validity="DAY",
+                )
+            pos.broker_tp_order_id = res.id
+            self._save_state()
+            logger.info("Successfully placed broker Limit Order on Trading 212: %s (id=%s)", pos.ticker, res.id)
+            return res.id
+        except Exception as exc:
+            logger.debug("Placing native broker Limit Order for %s deferred: %s", pos.ticker, exc)
+            return None
+
+    def cancel_broker_tp_limit(self, pos: TrackedPosition) -> bool:
+        """Cancel pending broker TP limit order on Trading 212."""
+        order_id = pos.broker_tp_order_id
+        if not order_id:
+            return True
+
+        if self.dry_run or order_id.startswith("DRY_"):
+            pos.broker_tp_order_id = None
+            self._save_state()
+            logger.info("[DRY-RUN] Cancelled broker limit order %s for %s", order_id, pos.ticker)
+            return True
+
+        try:
+            logger.info("Canceling broker Limit Order %s for %s on Trading 212", order_id, pos.ticker)
+            success = self.t212.cancel_order(order_id)
+            if success:
+                pos.broker_tp_order_id = None
+                self._save_state()
+            return success
+        except Exception as exc:
+            logger.warning("Failed to cancel broker Limit Order %s on Trading 212: %s", order_id, exc)
+            return False
+
+    def cancel_all_broker_orders(self, pos: TrackedPosition) -> None:
+        """Cancel all pending broker orders (Stop Loss and Take Profit Limit) for a position."""
+        if pos.broker_stop_order_id:
+            self.cancel_broker_stop(pos)
+        if pos.broker_tp_order_id:
+            self.cancel_broker_tp_limit(pos)
 
     def sync_broker_stops(self) -> List[str]:
         """Ensure all active positions have an active native GTC Stop Order placed on Trading 212."""
@@ -700,8 +787,8 @@ class PositionMonitor:
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, actual_trim)
 
-        # Cancel pending broker stop order to unblock shares for sell execution
-        self.cancel_broker_stop(pos)
+        # Cancel pending broker stop and limit orders to unblock shares for sell execution
+        self.cancel_all_broker_orders(pos)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, actual_trim)
@@ -743,8 +830,8 @@ class PositionMonitor:
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, actual_trim)
 
-        # Cancel pending broker stop order to unblock shares for sell execution
-        self.cancel_broker_stop(pos)
+        # Cancel pending broker orders to unblock shares for sell execution
+        self.cancel_all_broker_orders(pos)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, actual_trim)
@@ -774,8 +861,8 @@ class PositionMonitor:
         shares_to_sell = pos.remaining_quantity
         pos.remaining_quantity = 0.0
 
-        # Cancel pending broker stop order on Trading 212
-        self.cancel_broker_stop(pos)
+        # Cancel all pending broker orders on Trading 212
+        self.cancel_all_broker_orders(pos)
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 
@@ -800,8 +887,8 @@ class PositionMonitor:
         shares_to_sell = pos.remaining_quantity
         pos.remaining_quantity = 0.0
 
-        # Cancel pending broker stop order on Trading 212
-        self.cancel_broker_stop(pos)
+        # Cancel all pending broker orders on Trading 212
+        self.cancel_all_broker_orders(pos)
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 

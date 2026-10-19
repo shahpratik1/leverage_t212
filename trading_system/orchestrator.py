@@ -479,8 +479,9 @@ class Orchestrator:
             fill_price=fill_price,
         )
 
-        # ── Place Native Broker GTC Stop Order on Trading 212 ────
+        # ── Place Native Broker GTC Stop & Limit Orders on Trading 212 ────
         self.position_monitor.place_broker_stop(pos)
+        self.position_monitor.place_broker_tp_limit(pos)
 
         # ── Dispatch Real-Time Notifications ─────────────────────
         notif_price = pos.entry_price
@@ -801,7 +802,48 @@ def main() -> None:
     parser.add_argument("--dashboard-port", type=int, default=settings.DASHBOARD_PORT, help=f"Port for embedded dashboard server (default: {settings.DASHBOARD_PORT})")
     parser.add_argument("--open-browser", action="store_true", help="Automatically open dashboard in default browser on startup")
     parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
+    parser.add_argument("--backtest", action="store_true", help="Run historical strategy backtest simulator and benchmark report")
+    parser.add_argument("--backtest-symbol", type=str, default="QQQ", help="Underlying asset symbol to backtest (default: QQQ)")
+    parser.add_argument("--backtest-period", type=str, default="1y", help="Historical backtest period (default: 1y)")
+    parser.add_argument("--backtest-strategy", type=str, choices=["3rsi", "momentum", "both"], default="both", help="Strategy filter to backtest (default: both)")
     args = parser.parse_args()
+
+    # Historical backtesting route
+    if args.backtest:
+        from trading_system.backtest.engine import BacktestEngine, generate_synthetic_candles, print_backtest_report
+        candles = None
+        if not args.dry_run:
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(args.backtest_symbol)
+                hist = ticker.history(period=args.backtest_period)
+                if not hist.empty:
+                    candles = []
+                    for dt, row in hist.iterrows():
+                        candles.append({
+                            "date": dt.strftime("%Y-%m-%d"),
+                            "open": float(row["Open"]),
+                            "high": float(row["High"]),
+                            "low": float(row["Low"]),
+                            "close": float(row["Close"]),
+                            "volume": float(row["Volume"]),
+                        })
+            except Exception as e:
+                logger.warning("Could not fetch yfinance data for %s: %s", args.backtest_symbol, e)
+        if not candles:
+            candles = generate_synthetic_candles(args.backtest_symbol, count=160)
+
+        engine_bt = BacktestEngine(
+            initial_capital=settings.DEFAULT_ACCOUNT_EQUITY,
+            leverage=3,
+            max_risk_per_trade=settings.MAX_RISK_PER_TRADE,
+            max_position_pct=settings.MAX_POSITION_PCT,
+            target_vol=settings.TARGET_ANNUAL_VOLATILITY,
+            max_hold_days=settings.MR_MAX_HOLD_DAYS,
+        )
+        res = engine_bt.run(symbol=args.backtest_symbol, candles=candles, strategy_filter=args.backtest_strategy)
+        print_backtest_report(res)
+        return
 
     engine = Orchestrator(
         dry_run=args.dry_run,

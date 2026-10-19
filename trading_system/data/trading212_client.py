@@ -1404,6 +1404,12 @@ class MarketDataProvider:
 
             high_20d = float(daily_data["high"].tail(20).max())
 
+            # 20-day annualized realized volatility for volatility-targeted sizing
+            pct_chg = pd.Series(daily_close).pct_change().tail(20)
+            realized_vol = float(pct_chg.std() * (252 ** 0.5)) if len(pct_chg.dropna()) > 5 else 0.25
+            if not (realized_vol > 0):
+                realized_vol = 0.25
+
             return {
                 "close": current_close,
                 "sma200": round(sma200, 2),
@@ -1418,6 +1424,7 @@ class MarketDataProvider:
                 "rsi14": round(rsi14, 2),
                 "adx": round(adx, 2),
                 "atr": round(atr, 2),
+                "realized_vol": round(realized_vol, 4),
                 "high_20d": round(high_20d, 2),
                 "earnings_in_days": None,
             }
@@ -1485,6 +1492,18 @@ class MarketDataProvider:
         adx = 26.5 if trend == "up" and rsi14 > 55 else (27.0 if trend == "down" and rsi14 < 45 else 18.0)
         high_20d = max(highs[-20:]) if len(highs) >= 20 else max(highs)
 
+        # 20-day annualized realized volatility fallback
+        ret_window = [
+            (closes[i] - closes[i - 1]) / closes[i - 1]
+            for i in range(max(1, len(closes) - 20), len(closes))
+        ]
+        if ret_window:
+            mean_r = sum(ret_window) / len(ret_window)
+            var_r = sum((r - mean_r) ** 2 for r in ret_window) / max(1, len(ret_window) - 1)
+            realized_vol = round((var_r ** 0.5) * (252 ** 0.5), 4)
+        else:
+            realized_vol = 0.25
+
         return {
             "close": current_close,
             "sma200": round(sma200, 2),
@@ -1499,6 +1518,7 @@ class MarketDataProvider:
             "rsi14": round(rsi14, 2),
             "adx": round(adx, 2),
             "atr": round(atr, 2),
+            "realized_vol": round(realized_vol, 4),
             "high_20d": round(high_20d, 2),
             "earnings_in_days": None,
         }

@@ -39,6 +39,7 @@ class DecisionCard:
     strategy_type: str = "momentum"     # 'momentum' or '3rsi_mean_reversion'
     leverage: int = 3                   # 3 or 5 (ETP leverage multiplier)
     earnings_in_days: Optional[float] = None
+    realized_vol: Optional[float] = None
     is_synthetic: bool = False          # Flag indicating whether underlying data was synthetically generated
     timestamp: str = ""                 # ISO format timestamp
 
@@ -64,6 +65,7 @@ class RiskManager:
         tp1_trim_pct: float = 0.50,
         tp2_trim_pct: float = 0.25,
         tp3_trim_pct: float = 0.25,
+        target_annual_volatility: float = 0.20,
     ):
         self.max_risk_per_trade = max_risk_per_trade
         self.max_position_pct = max_position_pct
@@ -77,6 +79,7 @@ class RiskManager:
         self.tp1_trim_pct = tp1_trim_pct
         self.tp2_trim_pct = tp2_trim_pct
         self.tp3_trim_pct = tp3_trim_pct
+        self.target_annual_volatility = target_annual_volatility
         logger.debug("Initialized RiskManager with max_risk_per_trade=%s", max_risk_per_trade)
 
     def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG") -> float:
@@ -155,13 +158,46 @@ class RiskManager:
             # For long, higher is better; ratchet up
             return round(max(current_tsl, new_tsl), 2)
 
+    def calculate_volatility_targeted_size(
+        self,
+        account_equity: float,
+        annualized_vol: float,
+        target_vol: Optional[float] = None,
+        leverage: int = 3,
+    ) -> float:
+        """Calculate dynamic volatility-targeted position notional.
+
+        Formula:
+            Target Notional = (Account Equity * max_position_pct) * (Target Vol / max(0.10, leverage * annualized_vol))
+            Capped at Max Position Notional (Account Equity * max_position_pct).
+
+        Reduces position size proportionally when realized volatility spikes to protect against
+        beta decay and extreme adverse excursion on leveraged products.
+        """
+        tgt_vol = target_vol if target_vol is not None else self.target_annual_volatility
+        max_position_notional = account_equity * self.max_position_pct
+        if annualized_vol <= 0 or account_equity <= 0:
+            return max_position_notional
+
+        effective_vol = max(0.10, leverage * annualized_vol)
+        vol_budget = max_position_notional * (tgt_vol / effective_vol)
+        return min(max_position_notional, round(vol_budget, 2))
+
     def calculate_position_size(
-        self, account_equity: float, entry_price: float, stop_loss: float
+        self,
+        account_equity: float,
+        entry_price: float,
+        stop_loss: float,
+        realized_vol: Optional[float] = None,
+        leverage: int = 3,
     ) -> Tuple[float, float, float]:
         """Calculate number of shares, notional position, and actual risk amount.
 
         Formula:
-            Position Notional = min((Account Equity * max_risk) / Stop_Distance_Pct, Account Equity * max_position_pct)
+            Risk Notional = (Account Equity * max_risk) / Stop_Distance_Pct
+            Max Notional = Account Equity * max_position_pct
+            Vol Notional = calculate_volatility_targeted_size(...)
+            Position Notional = min(Risk Notional, Max Notional, [Vol Notional if realized_vol])
         """
         if entry_price <= 0:
             return 0.0, 0.0, 0.0
@@ -176,6 +212,16 @@ class RiskManager:
 
         max_position_notional = account_equity * self.max_position_pct
         position_notional = min(position_notional_from_risk, max_position_notional)
+
+        # Apply volatility-targeted sizing if realized_vol is available
+        if realized_vol is not None and realized_vol > 0.05:
+            vol_notional = self.calculate_volatility_targeted_size(
+                account_equity=account_equity,
+                annualized_vol=realized_vol,
+                leverage=leverage,
+            )
+            position_notional = min(position_notional, vol_notional)
+
         raw_shares = position_notional / entry_price
         shares = max(1.0, round(raw_shares, 2)) if position_notional > 0 else 0.0
         position_notional = round(shares * entry_price, 2)
@@ -197,6 +243,7 @@ class RiskManager:
         """Generate a complete DecisionCard from technical metrics and debate consensus."""
         entry_price = metrics.get("close", 0.0)
         atr = metrics.get("atr", 0.0)
+        realized_vol = metrics.get("realized_vol")
 
         # Policy: if 5x exists or is passed, replace it with 3x (cap at MAX_LEVERAGE = 3)
         from trading_system.data.leveraged_universe import LeveragedUniverse
@@ -229,7 +276,11 @@ class RiskManager:
             decision_action = "DO_NOT_TRADE"
         else:
             shares, position_notional, actual_risk = self.calculate_position_size(
-                account_equity, entry_price, stop_loss
+                account_equity,
+                entry_price,
+                stop_loss,
+                realized_vol=realized_vol,
+                leverage=resolved_leverage,
             )
             risk_pct_of_equity = (
                 actual_risk / account_equity if account_equity > 0 else 0.0
@@ -262,6 +313,7 @@ class RiskManager:
                 and str(metrics.get("earnings_in_days")).replace(".", "", 1).isdigit()
                 else None
             ),
+            realized_vol=realized_vol,
             is_synthetic=bool(metrics.get("is_synthetic", False)),
             timestamp=datetime.now(timezone.utc).isoformat(),
         )

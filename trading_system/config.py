@@ -103,6 +103,7 @@ class Settings:
     TP1_R_MULTIPLE: float = 1.0
     TP2_R_MULTIPLE: float = 2.0
     TP3_R_MULTIPLE: float = 3.0
+    TARGET_ANNUAL_VOLATILITY: float = 0.20  # 20% annual target volatility for volatility-targeted sizing
 
     # Screener parameters
     SCREENER_MIN_SETUP_SCORE: str = "favorable"
@@ -148,6 +149,8 @@ class Settings:
 
     # Universe & Mode
     USE_LEVERAGED_3X: bool = True
+    ENABLE_CRYPTO_3X: bool = True
+    ENABLE_COMMODITIES_3X: bool = True
     ENABLE_5X_LEVERAGE: bool = False  # Policy: if 5x exists then replace it with 3x
     PREFER_5X_LEVERAGE: bool = False
     MAX_LEVERAGE: int = 3  # Maximum allowed leverage multiplier (strict 3x cap)

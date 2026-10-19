@@ -1,0 +1,130 @@
+"""Tests for Historical Backtesting Engine and Strategy Benchmark Simulator."""
+
+import unittest
+from trading_system.backtest.engine import (
+    BacktestEngine,
+    BacktestResult,
+    SimulatedTrade,
+    generate_synthetic_candles,
+)
+
+
+class TestBacktestEngine(unittest.TestCase):
+    def setUp(self):
+        self.engine = BacktestEngine(
+            initial_capital=10000.0,
+            leverage=3,
+            max_risk_per_trade=0.005,
+            max_position_pct=0.05,
+            target_vol=0.20,
+            max_hold_days=4,
+        )
+
+    def test_indicator_calculations(self):
+        """Verify SMA, RSI, ATR, and Realized Vol math functions."""
+        closes = [100.0 + i for i in range(30)]
+        sma10 = self.engine._calculate_sma(closes, 10)
+        self.assertEqual(len(sma10), 30)
+        self.assertAlmostEqual(sma10[8], 104.0)  # expanding mean of 100..108
+        self.assertAlmostEqual(sma10[9], 104.5)  # rolling mean of 100..109
+
+        # RSI should be 100 for strictly increasing closes
+        rsi3 = self.engine._calculate_rsi(closes, 3)
+        self.assertEqual(len(rsi3), 30)
+        self.assertAlmostEqual(rsi3[-1], 100.0)
+
+        # Realized vol on constant positive returns
+        vol = self.engine._calculate_realized_vol(closes, 20)
+        self.assertEqual(len(vol), 30)
+        self.assertIsNotNone(vol[-1])
+        self.assertGreater(vol[-1], 0.0)
+
+    def test_simulation_with_synthetic_candles(self):
+        """Run full backtest over synthetic candles and verify metrics."""
+        candles = generate_synthetic_candles("QQQ", count=120)
+        res = self.engine.run(symbol="QQQ", candles=candles, strategy_filter="both")
+
+        self.assertIsInstance(res, BacktestResult)
+        self.assertEqual(res.symbol, "QQQ")
+        self.assertEqual(res.initial_capital, 10000.0)
+        self.assertGreater(res.total_trades, 0)
+        self.assertGreaterEqual(res.win_rate_pct, 0.0)
+        self.assertLessEqual(res.win_rate_pct, 100.0)
+        self.assertGreaterEqual(res.profit_factor, 0.0)
+        self.assertGreaterEqual(res.max_drawdown_pct, 0.0)
+        self.assertLessEqual(res.max_drawdown_pct, 100.0)
+
+        # Ensure trade serialization works
+        res_dict = res.to_dict()
+        self.assertIn("trades", res_dict)
+        self.assertEqual(len(res_dict["trades"]), len(res.trades))
+
+    def test_max_hold_days_enforced(self):
+        """Verify simulated trades do not exceed the max_hold_days limit."""
+        candles = generate_synthetic_candles("NVDA", count=100)
+        res = self.engine.run(symbol="NVDA", candles=candles)
+        for t in res.trades:
+            self.assertLessEqual(t.hold_days, self.engine.max_hold_days)
+
+    def test_insufficient_candles_raises_error(self):
+        """Verify ValueError is raised if candle series is too short."""
+        short_candles = [
+            {"date": "2025-01-01", "open": 100, "high": 105, "low": 95, "close": 102, "volume": 1000}
+            for _ in range(10)
+        ]
+        with self.assertRaises(ValueError):
+            self.engine.run(symbol="QQQ", candles=short_candles)
+
+    def test_tp1_be_and_tsl_progression(self):
+        """Construct synthetic scenario where price hits TP1, ratchets to BE, then hits TP2 and TP3."""
+        # Baseline warm-up candles (30 rising candles from 60 to 110)
+        candles = []
+        for i in range(30):
+            p = 60.0 + i * (50.0 / 30.0)
+            candles.append({
+                "date": f"2025-01-{(i%28)+1:02d}",
+                "open": round(p - 0.5, 2),
+                "high": round(p + 1.0, 2),
+                "low": round(p - 1.0, 2),
+                "close": round(p, 2),
+                "volume": 5000000,
+            })
+
+        # Candle 30 & 31: oversold dip to 92 (close 92 > sma ~85, RSI3 < 22)
+        candles.append({
+            "date": "2025-02-01",
+            "open": 108.0,
+            "high": 108.0,
+            "low": 97.0,
+            "close": 98.0,
+            "volume": 10000000,
+        })
+        candles.append({
+            "date": "2025-02-02",
+            "open": 97.0,
+            "high": 97.0,
+            "low": 91.0,
+            "close": 92.0,
+            "volume": 10000000,
+        })
+
+        # Candle 32: massive surge to 135 (hits TP1, TP2, and TP3)
+        candles.append({
+            "date": "2025-02-03",
+            "open": 93.0,
+            "high": 135.0,
+            "low": 92.0,
+            "close": 130.0,
+            "volume": 15000000,
+        })
+
+        res = self.engine.run(symbol="TEST", candles=candles, strategy_filter="3rsi")
+        self.assertGreaterEqual(len(res.trades), 1)
+        first_trade = res.trades[0]
+        self.assertTrue(first_trade.tp1_hit)
+        self.assertEqual(first_trade.exit_reason, "TP3")
+        self.assertGreater(first_trade.realized_pnl, 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
