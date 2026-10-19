@@ -110,12 +110,19 @@ def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str
             sma5 = pos.get("sma5", None)
             win_rate_exp = pos.get("win_rate_exp", "85%" if "3rsi" in strategy_type else "72%")
 
-            earnings_in_days = pos.get("earnings_in_days")
+            earnings_in_days_raw = pos.get("earnings_in_days")
+            earnings_days: Optional[float] = None
+            if earnings_in_days_raw is not None:
+                try:
+                    earnings_days = float(earnings_in_days_raw)
+                except (ValueError, TypeError):
+                    earnings_days = None
+
             if direction == "SHORT":
                 overnight_status = "INTRADAY SHORT (Flattens 16:20 UTC)"
                 overnight_badge_class = "bg-rose-500/10 text-rose-300 border-rose-500/30"
-            elif earnings_in_days is not None and 0 <= float(earnings_in_days) <= 1.0:
-                overnight_status = f"EARNINGS BLACKOUT ({float(earnings_in_days):.1f}d — Flattens 16:20 UTC)"
+            elif earnings_days is not None and 0 <= earnings_days <= 1.0:
+                overnight_status = f"EARNINGS BLACKOUT ({earnings_days:.1f}d — Flattens 16:20 UTC)"
                 overnight_badge_class = "bg-amber-500/10 text-amber-300 border-amber-500/30"
             elif pos.get("tp1_hit"):
                 overnight_status = "OVERNIGHT ELIGIBLE (TP1 Breakeven Active)"
@@ -138,7 +145,7 @@ def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str
                 "win_rate_exp": win_rate_exp,
                 "overnight_status": overnight_status,
                 "overnight_badge_class": overnight_badge_class,
-                "earnings_in_days": earnings_in_days,
+                "earnings_in_days": earnings_days,
                 "entry_price": round(entry, 2),
                 "current_price": round(current_price, 2),
                 "pnl_pct": round(pnl_pct, 2),
@@ -874,17 +881,9 @@ def generate_html_dashboard(output_path: str) -> str:
 def start_background_position_monitor(
     html_file: str = "signals_dashboard.html",
     interval_seconds: int = 15,
+    dry_run: Optional[bool] = None,
 ) -> threading.Thread:
-    """Launch autonomous background monitor thread for continuous price checking and auto-sells.
-
-    Watches open positions every `interval_seconds` (default: 15s).
-    When price hits TP1, TP2, TP3, SL, or TSL:
-    - Automatically cancels resting broker stops (unblocking shares)
-    - Executes the market sell on Trading 212 API
-    - Ratchets stops to break-even or trailing
-    - Places the new server-side protective stop on Trading 212
-    - Sends multi-channel alerts and regenerates the dashboard HTML
-    """
+    """Launch autonomous background monitor thread for continuous price checking and auto-sells."""
     def _monitor_loop() -> None:
         logger.info("⚡ Background Autonomous Position Monitor started (polling every %ds)", interval_seconds)
         client = Trading212Client(
@@ -913,12 +912,13 @@ def start_background_position_monitor(
             tp2_trim_pct=settings.TP2_TRIM_PCT,
             tp3_trim_pct=settings.TP3_TRIM_PCT,
         )
+        is_dry_run = dry_run if dry_run is not None else (not getattr(settings, "LIVE_TRADING_ENABLED", False))
         monitor = PositionMonitor(
             t212_client=client,
             notifier=notifier,
             risk_manager=risk_manager,
             state_file=settings.ACTIVE_TRADES_PATH,
-            dry_run=False,
+            dry_run=is_dry_run,
         )
 
         last_dashboard_render = time.time()
@@ -928,6 +928,28 @@ def start_background_position_monitor(
             try:
                 # Reload active positions in case state changed
                 monitor.positions = monitor._load_state()
+
+                # Check market open status to prevent unnecessary API calls
+                now_utc = datetime.now(timezone.utc)
+                active_tickers = list(monitor.positions.keys()) if monitor.positions else ["QQQ3l_EQ", "SPY_US_EQ"]
+                market_is_open = client.is_any_market_open(active_tickers, current_time=now_utc)
+
+                if not market_is_open:
+                    now = time.time()
+                    if now - getattr(_monitor_loop, "_last_closed_notice_time", 0.0) >= 1800.0:
+                        logger.info(
+                            "🌙 Markets CLOSED (LSE 08:00-16:30 UTC, US 14:30-21:00 UTC). "
+                            "Entering adaptive low-frequency power-save mode to conserve API counts."
+                        )
+                        _monitor_loop._last_closed_notice_time = now
+
+                    # Still refresh static HTML dashboard every 5 minutes
+                    if now - last_dashboard_render >= 300.0:
+                        generate_html_dashboard(html_file)
+                        last_dashboard_render = now
+
+                    time.sleep(60.0)
+                    continue
 
                 if monitor.positions:
                     now = time.time()
@@ -1017,7 +1039,7 @@ def start_local_server(html_file: str, port: int = 8888, open_browser: bool = Tr
             return super().do_GET()
 
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("127.0.0.1", port), CustomHandler) as httpd:
+    with socketserver.TCPServer(("0.0.0.0", port), CustomHandler) as httpd:
         url = f"http://localhost:{port}/{html_name}"
         print(f"\n🚀 Signals Dashboard running live at: {url}")
         print("⚡ COMPLETE AUTOMATION ACTIVE: Polling every 15s for TP1/TP2/TP3 auto-sells")

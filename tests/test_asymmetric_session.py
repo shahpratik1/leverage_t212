@@ -639,6 +639,31 @@ class TestOrchestratorPreTradeEarningsFilter(unittest.TestCase):
         self.assertEqual(card.ticker, "AAPL")
         self.assertEqual(card.earnings_in_days, 14.0)
 
+    def test_screener_candidate_accepted_if_earnings_is_string_or_none(self):
+        """Candidate with string or None earnings_in_days passes safely without float conversion error."""
+        candidate = ScreenerResult(
+            ticker="AAPL",
+            bias="bullish",
+            bias_confidence=0.85,
+            setup_score="favorable",
+            setup_confidence=0.80,
+            catalyst_risk=0.10,
+            overall_confidence=0.82,
+            metrics={
+                "close": 230.0,
+                "rsi": 55.0,
+                "adx": 26.0,
+                "atr": 4.0,
+                "earnings_in_days": "None within 7d",
+            },
+        )
+
+        card = self.orchestrator.deep_analyse(candidate)
+        self.assertIsNotNone(card)
+        self.assertEqual(card.ticker, "AAPL")
+        self.assertIsNone(card.earnings_in_days)
+
 
 if __name__ == "__main__":
     unittest.main()
+

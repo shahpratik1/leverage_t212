@@ -156,8 +156,11 @@ class LayaScreener:
         rsi14: float = metrics.get("rsi14", metrics.get("rsi", 50.0))
         sma5: float = metrics.get("sma5", close)
 
-        earnings_info: str = str(
-            metrics.get("earnings_in_days", "None within 7d")
+        earnings_val = metrics.get("earnings_in_days")
+        earnings_info: str = (
+            f"{earnings_val:.1f}d"
+            if isinstance(earnings_val, (int, float))
+            else (str(earnings_val) if earnings_val is not None else "None within 7d")
         )
 
         state: str = (

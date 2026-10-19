@@ -39,6 +39,7 @@ class DecisionCard:
     strategy_type: str = "momentum"     # 'momentum' or '3rsi_mean_reversion'
     leverage: int = 3                   # 3 or 5 (ETP leverage multiplier)
     earnings_in_days: Optional[float] = None
+    is_synthetic: bool = False          # Flag indicating whether underlying data was synthetically generated
     timestamp: str = ""                 # ISO format timestamp
 
     def __post_init__(self) -> None:
@@ -255,7 +256,13 @@ class RiskManager:
             rationale=synthesis,
             strategy_type=strategy_type,
             leverage=resolved_leverage,
-            earnings_in_days=metrics.get("earnings_in_days"),
+            earnings_in_days=(
+                float(metrics.get("earnings_in_days"))
+                if metrics.get("earnings_in_days") is not None
+                and str(metrics.get("earnings_in_days")).replace(".", "", 1).isdigit()
+                else None
+            ),
+            is_synthetic=bool(metrics.get("is_synthetic", False)),
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 

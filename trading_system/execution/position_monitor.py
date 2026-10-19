@@ -58,6 +58,7 @@ class TrackedPosition:
     tp1_armed_hysteresis: bool = False
     tp1_escape_threshold: float = 0.0
     tp1_stop_elevated: bool = False
+    scale_calibrated: bool = False
 
     def __post_init__(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -98,24 +99,76 @@ class PositionMonitor:
         card: DecisionCard,
         atr: float = 0.0,
         earnings_in_days: Optional[float] = None,
+        fill_price: Optional[float] = None,
     ) -> TrackedPosition:
         """Register a newly opened trade for active lifecycle tracking."""
+        # On Trading 212 Invest/Stocks, all leveraged ETPs (both 3x Long and 3x Inverse Short)
+        # are spot instruments bought long; an increasing ETP price represents profit.
+        is_cfd_short = (
+            card.direction.upper() == "SHORT"
+            and not (
+                card.trading212_ticker.endswith("_EQ")
+                or card.trading212_ticker.endswith(".L")
+                or card.direction.upper().endswith("_ETP")
+            )
+        )
+
+        # Derive relative price proportions from DecisionCard
+        stop_dist_pct = abs(card.entry_price - card.stop_loss) / card.entry_price if card.entry_price > 0 else 0.05
+        tp1_dist_pct = abs(card.take_profit_1 - card.entry_price) / card.entry_price if card.entry_price > 0 else 0.05
+        tp2_dist_pct = abs(card.take_profit_2 - card.entry_price) / card.entry_price if card.entry_price > 0 else 0.10
+        tp3_dist_pct = abs(card.take_profit_3 - card.entry_price) / card.entry_price if card.entry_price > 0 else 0.15
+        atr_pct = (atr / card.entry_price) if (atr > 0 and card.entry_price > 0) else 0.02
+
+        if fill_price and fill_price > 0:
+            entry_price = round(fill_price, 4)
+            if is_cfd_short:
+                stop_loss = round(entry_price * (1.0 + stop_dist_pct), 2)
+                trailing_stop_loss = stop_loss
+                tp1 = round(max(0.01, entry_price * (1.0 - tp1_dist_pct)), 2)
+                tp2 = round(max(0.01, entry_price * (1.0 - tp2_dist_pct)), 2)
+                tp3 = round(max(0.01, entry_price * (1.0 - tp3_dist_pct)), 2)
+            else:
+                stop_loss = round(max(0.01, entry_price * (1.0 - stop_dist_pct)), 2)
+                trailing_stop_loss = stop_loss
+                tp1 = round(entry_price * (1.0 + tp1_dist_pct), 2)
+                tp2 = round(entry_price * (1.0 + tp2_dist_pct), 2)
+                tp3 = round(entry_price * (1.0 + tp3_dist_pct), 2)
+            calibrated_atr = round(entry_price * atr_pct, 4)
+        else:
+            entry_price = card.entry_price
+            stop_loss = card.stop_loss
+            trailing_stop_loss = card.trailing_stop_loss or card.stop_loss
+            tp1 = card.take_profit_1
+            tp2 = card.take_profit_2
+            tp3 = card.take_profit_3
+            calibrated_atr = atr or (card.entry_price * 0.02)
+
+        raw_earnings = earnings_in_days if earnings_in_days is not None else getattr(card, "earnings_in_days", None)
+        parsed_earnings: Optional[float] = None
+        if raw_earnings is not None:
+            try:
+                parsed_earnings = float(raw_earnings)
+            except (ValueError, TypeError):
+                parsed_earnings = None
+
         pos = TrackedPosition(
             ticker=card.trading212_ticker,
             underlying=card.ticker,
             direction=card.direction,
-            entry_price=card.entry_price,
+            entry_price=entry_price,
             original_quantity=card.position_size_shares,
             remaining_quantity=card.position_size_shares,
-            stop_loss=card.stop_loss,
-            trailing_stop_loss=card.trailing_stop_loss or card.stop_loss,
-            highest_price=card.entry_price,
-            lowest_price=card.entry_price,
-            tp1=card.take_profit_1,
-            tp2=card.take_profit_2,
-            tp3=card.take_profit_3,
-            atr=atr or (card.entry_price * 0.02),
-            earnings_in_days=earnings_in_days if earnings_in_days is not None else getattr(card, "earnings_in_days", None),
+            stop_loss=stop_loss,
+            trailing_stop_loss=trailing_stop_loss,
+            highest_price=entry_price,
+            lowest_price=entry_price,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            atr=calibrated_atr,
+            earnings_in_days=parsed_earnings,
+            scale_calibrated=bool(fill_price and fill_price > 0),
         )
         self.positions[card.trading212_ticker] = pos
         self._save_state()
@@ -290,7 +343,11 @@ class PositionMonitor:
                     if not pos.tp1_hit:
                         positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
                         tickers_to_remove.append(ticker)
-                    elif pos.earnings_in_days is not None and 0 <= pos.earnings_in_days <= (settings.EARNINGS_BLACKOUT_HOURS / 24.0):
+                    elif (
+                        pos.earnings_in_days is not None
+                        and isinstance(pos.earnings_in_days, (int, float))
+                        and 0 <= pos.earnings_in_days <= (settings.EARNINGS_BLACKOUT_HOURS / 24.0)
+                    ):
                         positions_to_close.append((pos, "EARNINGS_BLACKOUT_EXIT", current_price))
                         tickers_to_remove.append(ticker)
                     else:
@@ -407,6 +464,71 @@ class PositionMonitor:
             if not current_price or current_price <= 0:
                 continue
 
+            # ── 1. GBX (Pence) vs Base Currency Normalization ──
+            # Many LSE instruments quote in GBX (pence), e.g. 9173 pence vs £91.73 entry
+            if current_price > 500 and pos.entry_price < 200 and abs((current_price / 100.0) - pos.entry_price) / pos.entry_price < 0.35:
+                logger.info("Normalizing GBX pence price to base currency for %s: %.2f -> %.4f", ticker, current_price, current_price / 100.0)
+                current_price = round(current_price / 100.0, 4)
+            elif pos.entry_price > 500 and current_price < 200 and abs((pos.entry_price / 100.0) - current_price) / current_price < 0.35:
+                logger.info("Normalizing registered entry from GBX pence to base currency for %s: %.2f -> %.4f", ticker, pos.entry_price, pos.entry_price / 100.0)
+                pos.entry_price = round(pos.entry_price / 100.0, 4)
+                pos.stop_loss = round(pos.stop_loss / 100.0, 4)
+                pos.trailing_stop_loss = round(pos.trailing_stop_loss / 100.0, 4)
+                pos.tp1 = round(pos.tp1 / 100.0, 4)
+                pos.tp2 = round(pos.tp2 / 100.0, 4)
+                pos.tp3 = round(pos.tp3 / 100.0, 4)
+                if getattr(pos, "tp1_escape_threshold", 0.0) > 0:
+                    pos.tp1_escape_threshold = round(pos.tp1_escape_threshold / 100.0, 4)
+                pos.highest_price = round(pos.highest_price / 100.0, 4)
+                pos.lowest_price = round(pos.lowest_price / 100.0, 4)
+                pos.atr = round(pos.atr / 100.0, 4)
+                self.place_broker_stop(pos)
+                self._save_state()
+
+            # ── 2. Scale Discrepancy Calibration (Underlying vs ETP) ──
+            # If price differs by > 30% from registered entry on initial tick, this is an underlying-vs-ETP scale mismatch.
+            # Recalibrate levels to actual live price instead of triggering a false stop liquidation.
+            # GUARD: Only runs on initial tick check (scale_calibrated guard) to avoid misinterpreting flash crashes.
+            is_cfd_short = (pos.tp1 < pos.entry_price) if (pos.tp1 > 0 and pos.entry_price > 0) else (
+                pos.direction.upper() == "SHORT" and not (
+                    pos.ticker.endswith("_EQ") or pos.ticker.endswith(".L") or pos.direction.upper().endswith("_ETP")
+                )
+            )
+            if not getattr(pos, "scale_calibrated", False):
+                pos.scale_calibrated = True
+                if not pos.tp1_hit and pos.remaining_quantity == pos.original_quantity and pos.entry_price > 0:
+                    scale_diff = abs(current_price - pos.entry_price) / pos.entry_price
+                    if scale_diff > 0.30:
+                        logger.warning(
+                            "Scale calibration for %s: live price %.2f differs from registered entry %.2f by %.1f%% (>30%%). "
+                            "Recalibrating position levels to live instrument scale to prevent false stop-out.",
+                            ticker, current_price, pos.entry_price, scale_diff * 100.0
+                        )
+                        stop_dist_pct = abs(pos.entry_price - pos.stop_loss) / pos.entry_price if pos.entry_price > 0 else 0.05
+                        tp1_dist_pct = abs(pos.tp1 - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.05
+                        tp2_dist_pct = abs(pos.tp2 - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.10
+                        tp3_dist_pct = abs(pos.tp3 - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.15
+                        atr_pct = (pos.atr / pos.entry_price) if (pos.atr > 0 and pos.entry_price > 0) else 0.02
+
+                        pos.entry_price = current_price
+                        pos.highest_price = current_price
+                        pos.lowest_price = current_price
+                        if is_cfd_short:
+                            pos.stop_loss = round(current_price * (1.0 + stop_dist_pct), 2)
+                            pos.trailing_stop_loss = pos.stop_loss
+                            pos.tp1 = round(max(0.01, current_price * (1.0 - tp1_dist_pct)), 2)
+                            pos.tp2 = round(max(0.01, current_price * (1.0 - tp2_dist_pct)), 2)
+                            pos.tp3 = round(max(0.01, current_price * (1.0 - tp3_dist_pct)), 2)
+                        else:
+                            pos.stop_loss = round(max(0.01, current_price * (1.0 - stop_dist_pct)), 2)
+                            pos.trailing_stop_loss = pos.stop_loss
+                            pos.tp1 = round(current_price * (1.0 + tp1_dist_pct), 2)
+                            pos.tp2 = round(current_price * (1.0 + tp2_dist_pct), 2)
+                            pos.tp3 = round(current_price * (1.0 + tp3_dist_pct), 2)
+                        pos.atr = round(current_price * atr_pct, 4)
+                        self.place_broker_stop(pos)
+                        self._save_state()
+
             pos.last_update_time = datetime.now(timezone.utc).isoformat()
 
             # Track peak price
@@ -416,7 +538,11 @@ class PositionMonitor:
                 pos.lowest_price = current_price
 
             # Check exits in priority order
-            is_short = pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP")
+            is_short = (pos.tp1 < pos.entry_price) if (pos.tp1 > 0 and pos.entry_price > 0) else (
+                pos.direction.upper() == "SHORT" and not (
+                    pos.ticker.endswith("_EQ") or pos.ticker.endswith(".L") or pos.direction.upper().endswith("_ETP")
+                )
+            )
 
             # 1. Stop Loss & Trailing Stop Loss
             if is_short:
@@ -503,7 +629,11 @@ class PositionMonitor:
                 if ratcheted:
                     old_tsl = pos.trailing_stop_loss
                     pos.trailing_stop_loss = new_tsl
-                    locked_pct = ((pos.entry_price - new_tsl) / pos.entry_price * 100) if is_short else ((new_tsl - pos.entry_price) / pos.entry_price * 100)
+                    locked_pct = (
+                        ((pos.entry_price - new_tsl) / pos.entry_price * 100)
+                        if is_short
+                        else ((new_tsl - pos.entry_price) / pos.entry_price * 100)
+                    ) if pos.entry_price > 0 else 0.0
                     logger.info("%s TSL ratcheted: $%.2f -> $%.2f (+%.1f%% locked)", ticker, old_tsl, new_tsl, locked_pct)
 
                     # Update native broker stop order on Trading 212
@@ -536,7 +666,12 @@ class PositionMonitor:
     @staticmethod
     def _calculate_pnl(pos: TrackedPosition, price: float, quantity: float) -> Tuple[float, float]:
         """Compute realized P&L amount and percentage accounting for direction."""
-        if pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"):
+        is_short = (pos.tp1 < pos.entry_price) if (pos.tp1 > 0 and pos.entry_price > 0) else (
+            pos.direction.upper() == "SHORT" and not (
+                pos.ticker.endswith("_EQ") or pos.ticker.endswith(".L") or pos.direction.upper().endswith("_ETP")
+            )
+        )
+        if is_short:
             diff = pos.entry_price - price
         else:
             diff = price - pos.entry_price
@@ -715,11 +850,13 @@ class PositionMonitor:
     # State Persistence
     # ─────────────────────────────────────────────────────────────
     def _save_state(self) -> None:
-        """Persist current active positions to state file."""
+        """Persist current active positions to state file atomically."""
         try:
             raw = {t: asdict(pos) for t, pos in self.positions.items()}
-            with open(self.state_file, "w", encoding="utf-8") as f:
+            tmp_file = f"{self.state_file}.tmp.{os.getpid()}"
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(raw, f, indent=2)
+            os.replace(tmp_file, self.state_file)
         except Exception as exc:
             logger.warning("Failed to save position monitor state to %s: %s", self.state_file, exc)
 

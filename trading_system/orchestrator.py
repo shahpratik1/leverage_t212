@@ -175,6 +175,8 @@ class Orchestrator:
                 daily = MarketDataProvider.get_daily_candles(symbol, period="1y")
                 hourly = MarketDataProvider.get_hourly_candles(symbol, period="1mo")
                 metrics = MarketDataProvider.compute_indicators(daily, hourly)
+                if metrics:
+                    metrics["is_synthetic"] = MarketDataProvider.is_ticker_synthetic(symbol)
                 return symbol, metrics
             except Exception as exc:
                 logger.error("Failed to ingest %s: %s", symbol, exc)
@@ -239,11 +241,18 @@ class Orchestrator:
         logger.info("═══ System 2 Deliberation for %s (%s | %s) ═══", underlying, direction, strategy_type)
 
         # ── Pre-Trade Earnings Blackout Check (48h Gate - R2.2) ──
-        earnings_in_days = metrics.get("earnings_in_days")
-        if earnings_in_days is not None and 0 <= float(earnings_in_days) <= 2.0:
+        earnings_raw = metrics.get("earnings_in_days")
+        earnings_in_days: Optional[float] = None
+        if earnings_raw is not None:
+            try:
+                earnings_in_days = float(earnings_raw)
+            except (ValueError, TypeError):
+                earnings_in_days = None
+
+        if earnings_in_days is not None and 0 <= earnings_in_days <= 2.0:
             logger.warning(
                 "Pre-trade earnings filter: %s rejected due to impending earnings in %.1f days (<= 48h blackout)",
-                underlying, float(earnings_in_days)
+                underlying, earnings_in_days
             )
             return None
 
@@ -363,8 +372,33 @@ class Orchestrator:
             self._log_trade(card, executed=False, reason=reason)
             return False
 
+        # ── CRITICAL LIVE TRADING SAFETY GATE: Refuse live execution if data was synthetic ──
+        is_synthetic = (
+            getattr(card, "is_synthetic", False)
+            or MarketDataProvider.is_ticker_synthetic(card.ticker)
+            or getattr(MarketDataProvider, "LAST_FETCH_WAS_SYNTHETIC", False)
+        )
+        if not self.dry_run and is_synthetic:
+            logger.critical(
+                "CRITICAL LIVE TRADING SAFETY GATE: Market data for %s (%s) was generated synthetically! "
+                "Refusing to place real broker order. Verify live data connection or API keys.",
+                card.trading212_ticker, card.ticker
+            )
+            self._log_trade(card, executed=False, reason="Blocked by Safety Interceptor: Market data was synthetic")
+            return False
+        # ── Pre-Execution Market Hours Gate ──────────────────────
+        if not self.dry_run and not self.t212.is_market_open(card.trading212_ticker):
+            info = Trading212Client.get_market_session_info(card.trading212_ticker)
+            logger.warning(
+                "Execution held: Market for %s (%s) is CLOSED right now (%s UTC, current %s UTC). Refusing to submit rejected order.",
+                card.trading212_ticker, info["exchange"], info["open_time_utc"], info["current_time_utc"]
+            )
+            self._log_trade(card, executed=False, reason=f"Market closed ({info['exchange']} session: {info['open_time_utc']}-{info['close_time_utc']} UTC)")
+            return False
+
         # ── Execute Entry Order on Trading 212 ───────────────────
         order_id = "DRY_RUN_ORDER"
+        fill_price: Optional[float] = None
         if not self.dry_run:
             try:
                 logger.info(
@@ -377,6 +411,18 @@ class Orchestrator:
                 )
                 order_id = entry_order.id
                 logger.info("Order executed successfully: id=%s", order_id)
+                if entry_order.fill_price > 0:
+                    fill_price = entry_order.fill_price
+                else:
+                    try:
+                        time.sleep(1.0)
+                        positions_fresh = self.t212.get_portfolio(force_refresh=True)
+                        for p in positions_fresh:
+                            if p.ticker == card.trading212_ticker and p.average_price > 0:
+                                fill_price = p.average_price
+                                break
+                    except Exception as port_exc:
+                        logger.debug("Could not retrieve post-order portfolio fill price: %s", port_exc)
             except Trading212Error as exc:
                 logger.error("Execution failed for %s: %s", card.trading212_ticker, exc)
                 self._log_trade(card, executed=False, reason=str(exc))
@@ -390,34 +436,40 @@ class Orchestrator:
             card,
             atr=atr,
             earnings_in_days=card.earnings_in_days,
+            fill_price=fill_price,
         )
 
         # ── Place Native Broker GTC Stop Order on Trading 212 ────
         self.position_monitor.place_broker_stop(pos)
 
         # ── Dispatch Real-Time Notifications ─────────────────────
+        notif_price = pos.entry_price
+        notif_sl = pos.stop_loss
+        notif_tp1 = pos.tp1
+        notif_tp2 = pos.tp2
+        notif_tp3 = pos.tp3
         if card.direction == "LONG":
             self.notifier.notify_buy(
                 ticker=card.trading212_ticker,
                 underlying=card.ticker,
-                price=card.entry_price,
+                price=notif_price,
                 quantity=card.position_size_shares,
-                sl=card.stop_loss,
-                tp1=card.take_profit_1,
-                tp2=card.take_profit_2,
-                tp3=card.take_profit_3,
+                sl=notif_sl,
+                tp1=notif_tp1,
+                tp2=notif_tp2,
+                tp3=notif_tp3,
                 rationale=card.rationale,
             )
         else:
             self.notifier.notify_sell(
                 ticker=card.trading212_ticker,
                 underlying=card.ticker,
-                price=card.entry_price,
+                price=notif_price,
                 quantity=card.position_size_shares,
-                sl=card.stop_loss,
-                tp1=card.take_profit_1,
-                tp2=card.take_profit_2,
-                tp3=card.take_profit_3,
+                sl=notif_sl,
+                tp1=notif_tp1,
+                tp2=notif_tp2,
+                tp3=notif_tp3,
                 is_short_entry=True,
                 rationale=card.rationale,
             )
@@ -616,6 +668,19 @@ class Orchestrator:
         while True:
             try:
                 now = time.time()
+                now_utc = datetime.now(timezone.utc)
+                active_tickers = list(self.position_monitor.positions.keys()) if self.position_monitor.positions else ["QQQ3l_EQ", "SPY_US_EQ"]
+                market_open = self.t212.is_any_market_open(active_tickers, current_time=now_utc)
+
+                if not market_open and not self.dry_run:
+                    if now - getattr(self, "_last_closed_loop_log", 0.0) >= 1800.0:
+                        logger.info(
+                            "🌙 Markets CLOSED (LSE 08:00-16:30 UTC, US 14:30-21:00 UTC). "
+                            "Suspending universe scan and position polling to conserve API quota."
+                        )
+                        self._last_closed_loop_log = now
+                    time.sleep(min(300, monitor_interval_seconds * 10))
+                    continue
 
                 # 1. Check if it's time for a full scan cycle
                 if now - last_scan_time >= scan_interval_minutes * 60:

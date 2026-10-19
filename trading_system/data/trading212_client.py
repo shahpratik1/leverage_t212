@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import email.utils
+import csv
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 try:
@@ -970,20 +971,81 @@ class Trading212Client:
             fill_price=float(data.get("fillPrice", 0.0)),
         )
 
-    def is_market_open(self, ticker: str) -> bool:
-        """Check if market is open for a given ticker."""
-        if not ticker.endswith("_US_EQ"):
-            return True
-
-        now_utc = datetime.now(timezone.utc)
-        if now_utc.weekday() >= 5:  # Saturday or Sunday
-            return False
-
+    @staticmethod
+    def get_market_session_info(ticker: str, now_utc: Optional[datetime] = None) -> Dict[str, Any]:
+        """Resolve market hours, exchange, and open status for any ticker in UTC."""
         from datetime import time as dt_time
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        weekday = now_utc.weekday()  # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
         current_time = now_utc.time()
-        market_open = dt_time(14, 30)
-        market_close = dt_time(21, 0)
-        return market_open <= current_time <= market_close
+
+        upper_ticker = ticker.upper()
+        # 1. London Stock Exchange (LSE) ETPs & Equities
+        if (
+            upper_ticker.endswith("L_EQ")
+            or upper_ticker.endswith(".L")
+            or upper_ticker.endswith("_GB_EQ")
+            or any(upper_ticker.startswith(x) for x in ("QQQ3", "QQQS", "QQQ5", "QQ3S", "3USL", "3USS", "3LNV", "3SNV", "3LTS", "3STS", "AAP3", "AAPS", "3SEM", "3TSM", "3TYS", "3UKX", "3DES"))
+        ):
+            exchange = "LSE"
+            open_time = dt_time(8, 0)
+            close_time = dt_time(16, 30)
+            tz_name = "UTC (London 08:00-16:30)"
+        # 2. US Equities / ETFs (NYSE / NASDAQ)
+        elif upper_ticker.endswith("_US_EQ") or upper_ticker in (
+            "QQQ", "SPY", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "SOXX", "GOOGL", "AMZN", "META", "BRK-B"
+        ):
+            exchange = "US"
+            open_time = dt_time(14, 30)
+            close_time = dt_time(21, 0)
+            tz_name = "UTC (New York 14:30-21:00 / 09:30-16:00 EST)"
+        # 3. German Xetra / Frankfurt
+        elif upper_ticker.endswith("D_EQ") or upper_ticker.endswith("_DE_EQ"):
+            exchange = "XETRA"
+            open_time = dt_time(8, 0)
+            close_time = dt_time(16, 30)
+            tz_name = "UTC (Frankfurt 08:00-16:30)"
+        # 4. Tokyo Stock Exchange
+        elif upper_ticker.endswith("_JP_EQ"):
+            exchange = "TSE"
+            open_time = dt_time(0, 0)
+            close_time = dt_time(6, 0)
+            tz_name = "UTC (Tokyo 00:00-06:00)"
+        else:
+            # Default to LSE session for European leveraged universe instruments
+            exchange = "LSE_DEFAULT"
+            open_time = dt_time(8, 0)
+            close_time = dt_time(16, 30)
+            tz_name = "UTC (08:00-16:30)"
+
+        is_weekend = weekday >= 5
+        is_open = (not is_weekend) and (open_time <= current_time <= close_time)
+
+        return {
+            "ticker": ticker,
+            "exchange": exchange,
+            "is_open": is_open,
+            "is_weekend": is_weekend,
+            "open_time_utc": open_time.strftime("%H:%M"),
+            "close_time_utc": close_time.strftime("%H:%M"),
+            "tz_name": tz_name,
+            "current_time_utc": current_time.strftime("%H:%M:%S"),
+        }
+
+    def is_market_open(self, ticker: str, current_time: Optional[datetime] = None) -> bool:
+        """Check if market is open for a given ticker."""
+        info = Trading212Client.get_market_session_info(ticker, now_utc=current_time)
+        return bool(info["is_open"])
+
+    def is_any_market_open(
+        self, tickers: Optional[List[str]] = None, current_time: Optional[datetime] = None
+    ) -> bool:
+        """Check if at least one market is open across provided tickers (or primary universe)."""
+        if not tickers:
+            tickers = ["QQQ3l_EQ", "SPY_US_EQ"]
+        return any(self.is_market_open(t, current_time=current_time) for t in tickers)
 
     def close(self) -> None:
         """Close the client."""
@@ -994,44 +1056,126 @@ class Trading212Client:
 class MarketDataProvider:
     """Fetches OHLCV market candles and computes quantitative technical indicators."""
 
-    @staticmethod
-    def get_daily_candles(symbol: str, period: str = "1y") -> Any:
-        """Get daily OHLCV candles (returns DataFrame if pandas available, else list of dicts)."""
-        if HAS_DATA_LIBS and yf is not None:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval="1d")
-            if df.empty:
-                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-            df.reset_index(inplace=True)
-            df.rename(
-                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
-                inplace=True,
-            )
-            return df[["open", "high", "low", "close", "volume"]]
+    LAST_FETCH_WAS_SYNTHETIC: bool = False
+    SYNTHETIC_TICKERS: set = set()
 
-        # Pure Python fallback via Yahoo Finance Chart API
-        return MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1y", interval="1d")
+    @classmethod
+    def is_ticker_synthetic(cls, symbol: str) -> bool:
+        """Check if candles for a specific symbol were synthetically generated."""
+        return symbol.upper() in cls.SYNTHETIC_TICKERS or cls.LAST_FETCH_WAS_SYNTHETIC
 
     @staticmethod
-    def get_hourly_candles(symbol: str, period: str = "1mo") -> Any:
-        """Get 1H OHLCV candles."""
-        if HAS_DATA_LIBS and yf is not None:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval="1h")
-            if df.empty:
-                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-            df.reset_index(inplace=True)
-            df.rename(
-                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
-                inplace=True,
-            )
-            return df[["open", "high", "low", "close", "volume"]]
+    def _map_to_stooq_symbol(symbol: str) -> str:
+        """Map generic ticker symbols to Stooq query format."""
+        clean = symbol.upper().replace("^", "")
+        mapping = {
+            "QQQ": "qqq.us",
+            "SPY": "spy.us",
+            "NVDA": "nvda.us",
+            "AAPL": "aapl.us",
+            "TSLA": "tsla.us",
+            "MSFT": "msft.us",
+            "AMZN": "amzn.us",
+            "GOOGL": "googl.us",
+            "SOXX": "soxx.us",
+            "GLD": "gld.us",
+            "SLV": "slv.us",
+            "USO": "uso.us",
+            "TSM": "tsm.us",
+            "TLT": "tlt.us",
+            "FTSE": "^ukx",
+            "GDAXI": "^dax",
+            "HSI": "^hsi",
+            "STOXX50E": "^sx5e",
+        }
+        return mapping.get(clean, f"{clean.lower()}.us")
 
-        return MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1mo", interval="1h")
+    @staticmethod
+    def _fetch_stooq_data(symbol: str) -> List[Dict[str, float]]:
+        """Fetch historical daily candles from free institutional Stooq CSV endpoint."""
+        stooq_sym = MarketDataProvider._map_to_stooq_symbol(symbol)
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                lines = resp.read().decode("utf-8").strip().splitlines()
+            if len(lines) < 5:
+                return []
+            reader = csv.DictReader(lines)
+            candles = []
+            for row in reader:
+                try:
+                    c = float(row.get("Close", 0))
+                    o = float(row.get("Open", 0))
+                    h = float(row.get("High", 0))
+                    l = float(row.get("Low", 0))
+                    v_raw = row.get("Volume", 0)
+                    v = float(v_raw) if v_raw and v_raw != "-" else 0.0
+                    if c > 0 and o > 0:
+                        candles.append({"open": o, "high": h, "low": l, "close": c, "volume": v})
+                except (ValueError, KeyError):
+                    continue
+            candles.reverse()
+            return candles
+        except Exception as exc:
+            logger.debug("Stooq data fetch unavailable for %s (%s)", symbol, exc)
+            return []
+
+    @staticmethod
+    def _fetch_polygon_data(symbol: str, api_key: str) -> List[Dict[str, float]]:
+        """Fetch daily candles from Polygon.io API."""
+        if not api_key:
+            return []
+        clean = symbol.upper().replace("^", "")
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+        end = now.strftime("%Y-%m-%d")
+        url = f"https://api.polygon.io/v2/aggs/ticker/{clean}/range/1/day/{start}/{end}?apiKey={api_key}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Trading212-3xEngine/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            results = data.get("results", [])
+            candles = []
+            for bar in results:
+                candles.append({
+                    "open": float(bar["o"]),
+                    "high": float(bar["h"]),
+                    "low": float(bar["l"]),
+                    "close": float(bar["c"]),
+                    "volume": float(bar.get("v", 0)),
+                })
+            return candles
+        except Exception as exc:
+            logger.debug("Polygon data fetch unavailable for %s (%s)", symbol, exc)
+            return []
+
+    @staticmethod
+    def _fetch_finnhub_data(symbol: str, api_key: str) -> List[Dict[str, float]]:
+        """Fetch daily candles from Finnhub API."""
+        if not api_key:
+            return []
+        clean = symbol.upper().replace("^", "")
+        now_ts = int(time.time())
+        from_ts = now_ts - (365 * 86400)
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={clean}&resolution=D&from={from_ts}&to={now_ts}&token={api_key}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Trading212-3xEngine/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if data.get("s") != "ok":
+                return []
+            candles = []
+            for o, h, l, c, v in zip(data["o"], data["h"], data["l"], data["c"], data.get("v", [])):
+                candles.append({"open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v or 0)})
+            return candles
+        except Exception as exc:
+            logger.debug("Finnhub data fetch unavailable for %s (%s)", symbol, exc)
+            return []
 
     @staticmethod
     def _fetch_yahoo_chart_data(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Dict[str, float]]:
-        """Fetch raw candles from Yahoo Finance JSON endpoint, falling back to high-fidelity synthetic data if blocked."""
+        """Fetch raw candles from Yahoo Finance JSON endpoint."""
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_str}&interval={interval}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         try:
@@ -1048,9 +1192,95 @@ class MarketDataProvider:
             if candles:
                 return candles
         except Exception as exc:
-            logger.debug("Live Yahoo Finance fetch unavailable for %s (%s) — using institutional market data fallback", symbol, exc)
+            logger.debug("Live Yahoo Finance fetch unavailable for %s (%s)", symbol, exc)
+        return []
 
-        return MarketDataProvider._generate_synthetic_candles(symbol, range_str=range_str, interval=interval)
+    @staticmethod
+    def get_daily_candles(symbol: str, period: str = "1y") -> Any:
+        """Get daily OHLCV candles across yfinance, Yahoo Chart, Stooq, Polygon, Finnhub, or synthetic fallback."""
+        # 1. Try yfinance if installed
+        if HAS_DATA_LIBS and yf is not None:
+            try:
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(period=period, interval="1d")
+                if not df.empty:
+                    df.reset_index(inplace=True)
+                    df.rename(
+                        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
+                        inplace=True,
+                    )
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                    MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                    return df[["open", "high", "low", "close", "volume"]]
+            except Exception as yf_exc:
+                logger.debug("yfinance history failed for %s (%s)", symbol, yf_exc)
+
+        # 2. Try raw Yahoo Finance Chart API
+        candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1y", interval="1d")
+        if candles:
+            MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+            MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+            return candles
+
+        # 3. Try free institutional Stooq CSV endpoint
+        candles = MarketDataProvider._fetch_stooq_data(symbol)
+        if candles:
+            MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+            MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+            return candles
+
+        # 4. Try Polygon.io if key configured
+        try:
+            from trading_system.config import settings
+            poly_key = getattr(settings, "POLYGON_API_KEY", "")
+            if poly_key:
+                candles = MarketDataProvider._fetch_polygon_data(symbol, poly_key)
+                if candles:
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                    MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                    return candles
+        except Exception:
+            pass
+
+        # 5. Try Finnhub if key configured
+        try:
+            from trading_system.config import settings
+            finnhub_key = getattr(settings, "FINNHUB_API_KEY", "")
+            if finnhub_key:
+                candles = MarketDataProvider._fetch_finnhub_data(symbol, finnhub_key)
+                if candles:
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                    MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                    return candles
+        except Exception:
+            pass
+
+        # 6. Fallback to synthetic candles (tagged as synthetic for safety)
+        MarketDataProvider.SYNTHETIC_TICKERS.add(symbol.upper())
+        MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = True
+        return MarketDataProvider._generate_synthetic_candles(symbol, range_str="1y", interval="1d")
+
+    @staticmethod
+    def get_hourly_candles(symbol: str, period: str = "1mo") -> Any:
+        """Get 1H OHLCV candles."""
+        if HAS_DATA_LIBS and yf is not None:
+            try:
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(period=period, interval="1h")
+                if not df.empty:
+                    df.reset_index(inplace=True)
+                    df.rename(
+                        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
+                        inplace=True,
+                    )
+                    return df[["open", "high", "low", "close", "volume"]]
+            except Exception:
+                pass
+
+        candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1mo", interval="1h")
+        if candles:
+            return candles
+        return MarketDataProvider._generate_synthetic_candles(symbol, range_str="1mo", interval="1h")
 
     @staticmethod
     def _generate_synthetic_candles(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Dict[str, float]]:
@@ -1189,7 +1419,7 @@ class MarketDataProvider:
                 "adx": round(adx, 2),
                 "atr": round(atr, 2),
                 "high_20d": round(high_20d, 2),
-                "earnings_in_days": "None within 7d",
+                "earnings_in_days": None,
             }
 
         # 2. Pure Python list-of-dicts calculation fallback
@@ -1270,5 +1500,5 @@ class MarketDataProvider:
             "adx": round(adx, 2),
             "atr": round(atr, 2),
             "high_20d": round(high_20d, 2),
-            "earnings_in_days": "None within 7d",
+            "earnings_in_days": None,
         }
