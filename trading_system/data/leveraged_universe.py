@@ -314,7 +314,110 @@ CURATED_3X_PAIRS: List[LeveragedPair] = [
         short_3x_name="WisdomTree Brent Crude Oil 3x Daily Short",
         currency="USD",
     ),
+    # ── Worldwide Sovereign Indices & Thematics ────────────────────
+    LeveragedPair(
+        underlying_symbol="EWY",
+        name="South Korea (MSCI Korea)",
+        category="Global Index",
+        long_3x_ticker="3KORl_EQ",
+        long_3x_name="Leverage Shares 3x Long South Korea ETP",
+        short_3x_ticker="SKORl_EQ",
+        short_3x_name="Leverage Shares -3x Short South Korea ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="EWJ",
+        name="Japan (MSCI Japan / Nikkei 225)",
+        category="Global Index",
+        long_3x_ticker="JPN3l_EQ",
+        long_3x_name="Leverage Shares 3x Long Japan ETP",
+        short_3x_ticker="JPNSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Japan ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="^FCHI",
+        name="France CAC 40",
+        category="Global Index",
+        long_3x_ticker="3CACl_EQ",
+        long_3x_name="WisdomTree CAC 40 3x Daily Leveraged",
+        short_3x_ticker="3CSAl_EQ",
+        short_3x_name="WisdomTree CAC 40 3x Daily Short",
+        currency="EUR",
+    ),
+    LeveragedPair(
+        underlying_symbol="FTSEMIB.MI",
+        name="Italy FTSE MIB",
+        category="Global Index",
+        long_3x_ticker="3ITLl_EQ",
+        long_3x_name="WisdomTree FTSE MIB 3x Daily Leveraged",
+        short_3x_ticker="3ITSl_EQ",
+        short_3x_name="WisdomTree FTSE MIB 3x Daily Short",
+        currency="EUR",
+    ),
+    LeveragedPair(
+        underlying_symbol="INDA",
+        name="India (MSCI India)",
+        category="Global Index",
+        long_3x_ticker="3INDl_EQ",
+        long_3x_name="Leverage Shares 3x Long India ETP",
+        short_3x_ticker="INDSl_EQ",
+        short_3x_name="Leverage Shares -3x Short India ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="BOTZ",
+        name="Artificial Intelligence & Robotics",
+        category="Thematic",
+        long_3x_ticker="GPT3l_EQ",
+        long_3x_name="Leverage Shares 3x Long Artificial Intelligence ETP",
+        short_3x_ticker="GPTSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Artificial Intelligence ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="AMD",
+        name="Advanced Micro Devices",
+        category="Tech Equity",
+        long_3x_ticker="AMD3l_EQ",
+        long_3x_name="Leverage Shares 3x Long AMD",
+        short_3x_ticker="3SAMl_EQ",
+        short_3x_name="GraniteShares 3x Short AMD",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="ASML",
+        name="ASML Holding (Lithography)",
+        category="Global Tech",
+        long_3x_ticker="3ASMl_EQ",
+        long_3x_name="Leverage Shares 3x Long ASML",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="EUR",
+    ),
 ]
+
+
+INDEX_ALIASES: Dict[str, str] = {
+    "^N225": "EWJ",
+    "N225": "EWJ",
+    "NIKKEI": "EWJ",
+    "^KS11": "EWY",
+    "KS11": "EWY",
+    "KOSPI": "EWY",
+    "CAC40": "^FCHI",
+    "^CAC40": "^FCHI",
+    "FCHI": "^FCHI",
+    "FTSEMIB": "FTSEMIB.MI",
+    "MIB": "FTSEMIB.MI",
+    "FTSE_MIB": "FTSEMIB.MI",
+    "NIFTY": "INDA",
+    "^NSEI": "INDA",
+    "NSEI": "INDA",
+    "NIFTY50": "INDA",
+    "ASML.AS": "ASML",
+    "ASML.NA": "ASML",
+}
 
 
 class LeveragedUniverse:
@@ -325,6 +428,7 @@ class LeveragedUniverse:
         self._underlying_map: Dict[str, LeveragedPair] = {
             p.underlying_symbol.upper(): p for p in self.pairs
         }
+        self.aliases: Dict[str, str] = dict(INDEX_ALIASES)
         self._5x_to_3x_map: Dict[str, str] = {}
         for p in self.pairs:
             if p.long_5x_ticker and p.long_3x_ticker:
@@ -341,8 +445,15 @@ class LeveragedUniverse:
         return [p.underlying_symbol for p in self.pairs]
 
     def get_pair_for_underlying(self, underlying: str) -> Optional[LeveragedPair]:
-        """Lookup leveraged pair by underlying ticker."""
-        return self._underlying_map.get(underlying.upper())
+        """Lookup leveraged pair by underlying ticker or index alias."""
+        key = underlying.upper()
+        pair = self._underlying_map.get(key)
+        if pair:
+            return pair
+        alias_target = self.aliases.get(key)
+        if alias_target:
+            return self._underlying_map.get(alias_target.upper())
+        return None
 
     def has_5x_leverage(self, underlying: str, direction: Optional[str] = None) -> bool:
         """Check whether 5x leverage is available for the given underlying asset on Trading 212."""

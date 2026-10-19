@@ -204,11 +204,34 @@ class Orchestrator:
     # ─────────────────────────────────────────────────────────────
     # Phase 1 — Data Ingestion (Parallel Subagents)
     # ─────────────────────────────────────────────────────────────
-    def ingest_universe_data(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch OHLCV and compute indicators for liquid underlyings in parallel using worker threads."""
+    def ingest_universe_data(self, filter_active_sessions: bool = True) -> Dict[str, Dict[str, Any]]:
+        """Fetch OHLCV and compute indicators for liquid underlyings in parallel using worker threads.
+
+        Applies session-gated filtering to skip assets whose underlying and ETP exchanges
+        are closed, eliminating API quota exhaustion on dormant markets.
+        """
         universe_metrics: Dict[str, Dict[str, Any]] = {}
-        total = len(self.universe)
         start_time = time.time()
+
+        # Session-aware filtering
+        assets_to_ingest = self.universe
+        if filter_active_sessions:
+            active_assets = [
+                sym for sym in self.universe
+                if Trading212Client.is_asset_session_active(sym)
+            ]
+            dormant_count = len(self.universe) - len(active_assets)
+            if dormant_count > 0:
+                logger.info(
+                    "Session-gated filter: %d / %d assets active; skipped %d closed/dormant assets to preserve API quota",
+                    len(active_assets), len(self.universe), dormant_count
+                )
+            assets_to_ingest = active_assets
+
+        total = len(assets_to_ingest)
+        if total == 0:
+            logger.info("Session-gated filter: 0 assets active in current session window.")
+            return {}
 
         def _fetch_asset(symbol: str) -> tuple[str, Optional[Dict[str, Any]]]:
             try:
@@ -228,7 +251,7 @@ class Orchestrator:
         )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel_ingestion_workers) as executor:
-            future_to_symbol = {executor.submit(_fetch_asset, sym): sym for sym in self.universe}
+            future_to_symbol = {executor.submit(_fetch_asset, sym): sym for sym in assets_to_ingest}
             completed = 0
             for future in concurrent.futures.as_completed(future_to_symbol):
                 completed += 1

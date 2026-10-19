@@ -86,8 +86,8 @@ class Settings:
     LLM_QUICK_MODEL: str = "gpt-4o-mini"
 
     # Parallel Concurrency & Intelligent Model Routing
-    PARALLEL_INGESTION_WORKERS: int = 12
-    PARALLEL_DELIBERATION_WORKERS: int = 5
+    PARALLEL_INGESTION_WORKERS: int = 24
+    PARALLEL_DELIBERATION_WORKERS: int = 8
     ENABLE_SPECULATIVE_ROUTING: bool = True
     SPECULATIVE_CONFIDENCE_THRESHOLD: float = 0.75
 

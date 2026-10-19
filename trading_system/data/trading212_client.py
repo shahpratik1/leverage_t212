@@ -982,39 +982,98 @@ class Trading212Client:
         current_time = now_utc.time()
 
         upper_ticker = ticker.upper()
-        # 1. London Stock Exchange (LSE) ETPs & Equities
-        if (
+
+        # 1. Crypto (24/7)
+        if "BTC" in upper_ticker or "ETH" in upper_ticker:
+            exchange = "CRYPTO"
+            open_time = dt_time(0, 0)
+            close_time = dt_time(23, 59, 59)
+            tz_name = "UTC (24/7)"
+            is_weekend = False
+            is_open = True
+            return {
+                "ticker": ticker,
+                "exchange": exchange,
+                "is_open": is_open,
+                "is_weekend": is_weekend,
+                "open_time_utc": open_time.strftime("%H:%M"),
+                "close_time_utc": close_time.strftime("%H:%M"),
+                "tz_name": tz_name,
+                "current_time_utc": current_time.strftime("%H:%M:%S"),
+            }
+
+        # 2. Tokyo Stock Exchange (TSE) - 00:00 to 06:00 UTC
+        if upper_ticker.endswith("_JP_EQ") or upper_ticker.endswith(".T") or upper_ticker in ("^N225", "N225", "NIKKEI"):
+            exchange = "TSE"
+            open_time = dt_time(0, 0)
+            close_time = dt_time(6, 0)
+            tz_name = "UTC (Tokyo 00:00-06:00)"
+
+        # 3. Seoul Korea Exchange (KRX) - 00:00 to 06:30 UTC
+        elif upper_ticker.endswith(".KS") or upper_ticker.endswith(".KQ") or upper_ticker in ("^KS11", "KS11", "KOSPI"):
+            exchange = "KRX"
+            open_time = dt_time(0, 0)
+            close_time = dt_time(6, 30)
+            tz_name = "UTC (Seoul 00:00-06:30)"
+
+        # 4. National Stock Exchange of India (NSE) - 03:45 to 10:00 UTC
+        elif upper_ticker.endswith(".NS") or upper_ticker in ("^NSEI", "NSEI", "NIFTY", "NIFTY50"):
+            exchange = "NSE"
+            open_time = dt_time(3, 45)
+            close_time = dt_time(10, 0)
+            tz_name = "UTC (Mumbai 03:45-10:00)"
+
+        # 5. Paris Euronext - 08:00 to 16:30 UTC
+        elif upper_ticker.endswith(".PA") or upper_ticker in ("^FCHI", "CAC40", "FCHI"):
+            exchange = "EURONEXT"
+            open_time = dt_time(8, 0)
+            close_time = dt_time(16, 30)
+            tz_name = "UTC (Paris 08:00-16:30)"
+
+        # 6. Borsa Italiana Milan - 08:00 to 16:30 UTC
+        elif upper_ticker.endswith(".MI") or upper_ticker in ("FTSEMIB.MI", "FTSEMIB", "MIB"):
+            exchange = "BORSA_ITALIANA"
+            open_time = dt_time(8, 0)
+            close_time = dt_time(16, 30)
+            tz_name = "UTC (Milan 08:00-16:30)"
+
+        # 7. German Xetra / Frankfurt - 08:00 to 16:30 UTC
+        elif upper_ticker.endswith("D_EQ") or upper_ticker.endswith("_DE_EQ") or upper_ticker in ("^GDAXI", "DAX"):
+            exchange = "XETRA"
+            open_time = dt_time(8, 0)
+            close_time = dt_time(16, 30)
+            tz_name = "UTC (Frankfurt 08:00-16:30)"
+
+        # 8. London Stock Exchange (LSE) ETPs & Equities - 08:00 to 16:30 UTC
+        elif (
             upper_ticker.endswith("L_EQ")
             or upper_ticker.endswith(".L")
             or upper_ticker.endswith("_GB_EQ")
-            or any(upper_ticker.startswith(x) for x in ("QQQ3", "QQQS", "QQQ5", "QQ3S", "3USL", "3USS", "3LNV", "3SNV", "3LTS", "3STS", "AAP3", "AAPS", "3SEM", "3TSM", "3TYS", "3UKX", "3DES"))
+            or any(upper_ticker.startswith(x) for x in (
+                "QQQ3", "QQQS", "QQQ5", "QQ3S", "3USL", "3USS", "3LNV", "3SNV",
+                "3LTS", "3STS", "AAP3", "AAPS", "3SEM", "3TSM", "3TYS", "3UKX",
+                "3DES", "3KOR", "SKOR", "JPN3", "JPNS", "3CAC", "3CSA", "3ITL",
+                "3ITS", "3IND", "INDS", "GPT3", "GPTS", "AMD3", "3SAM", "3ASM",
+            ))
         ):
             exchange = "LSE"
             open_time = dt_time(8, 0)
             close_time = dt_time(16, 30)
             tz_name = "UTC (London 08:00-16:30)"
-        # 2. US Equities / ETFs (NYSE / NASDAQ)
+
+        # 9. US Equities / ETFs (NYSE / NASDAQ) - 14:30 to 21:00 UTC
         elif upper_ticker.endswith("_US_EQ") or upper_ticker in (
-            "QQQ", "SPY", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "SOXX", "GOOGL", "AMZN", "META", "BRK-B"
+            "QQQ", "SPY", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "SOXX", "GOOGL",
+            "AMZN", "META", "BRK-B", "BOTZ", "EWY", "EWJ", "INDA", "GLD", "SLV",
+            "CPER", "BNO", "USO", "TLT", "ASML",
         ):
             exchange = "US"
             open_time = dt_time(14, 30)
             close_time = dt_time(21, 0)
             tz_name = "UTC (New York 14:30-21:00 / 09:30-16:00 EST)"
-        # 3. German Xetra / Frankfurt
-        elif upper_ticker.endswith("D_EQ") or upper_ticker.endswith("_DE_EQ"):
-            exchange = "XETRA"
-            open_time = dt_time(8, 0)
-            close_time = dt_time(16, 30)
-            tz_name = "UTC (Frankfurt 08:00-16:30)"
-        # 4. Tokyo Stock Exchange
-        elif upper_ticker.endswith("_JP_EQ"):
-            exchange = "TSE"
-            open_time = dt_time(0, 0)
-            close_time = dt_time(6, 0)
-            tz_name = "UTC (Tokyo 00:00-06:00)"
+
+        # 10. Default to LSE session for European leveraged universe instruments
         else:
-            # Default to LSE session for European leveraged universe instruments
             exchange = "LSE_DEFAULT"
             open_time = dt_time(8, 0)
             close_time = dt_time(16, 30)
@@ -1033,6 +1092,88 @@ class Trading212Client:
             "tz_name": tz_name,
             "current_time_utc": current_time.strftime("%H:%M:%S"),
         }
+
+    @classmethod
+    def is_asset_session_active(
+        cls,
+        ticker: str,
+        now_utc: Optional[datetime] = None,
+        buffer_minutes: int = 30,
+    ) -> bool:
+        """Return True if either the underlying exchange or its corresponding European ETP is open
+        or within buffer_minutes of open.
+        """
+        from datetime import datetime, timezone
+        from trading_system.data.leveraged_universe import LeveragedUniverse
+
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        upper = ticker.upper()
+        if "BTC" in upper or "ETH" in upper:
+            return True
+
+        universe = LeveragedUniverse()
+        tickers_to_check = [ticker]
+        pair = universe.get_pair_for_underlying(ticker)
+        if pair:
+            if pair.long_3x_ticker and pair.long_3x_ticker != "None":
+                tickers_to_check.append(pair.long_3x_ticker)
+            if pair.short_3x_ticker and pair.short_3x_ticker != "None":
+                tickers_to_check.append(pair.short_3x_ticker)
+            if pair.underlying_symbol:
+                tickers_to_check.append(pair.underlying_symbol)
+        else:
+            # Check if ticker is itself an execution ETP
+            for p in universe.pairs:
+                if upper in (p.long_3x_ticker.upper(), p.short_3x_ticker.upper(),
+                             (p.long_5x_ticker or "").upper(), (p.short_5x_ticker or "").upper()):
+                    tickers_to_check.append(p.underlying_symbol)
+                    break
+
+        # Also add underlying cash exchange indices for international assets
+        if any(x in upper for x in ("EWY", "3KOR", "SKOR", "KOR")):
+            tickers_to_check.extend(["^KS11", "EWY"])
+        if any(x in upper for x in ("EWJ", "JPN3", "JPNS", "N225", "NIKKEI")):
+            tickers_to_check.extend(["^N225", "EWJ"])
+        if any(x in upper for x in ("INDA", "3IND", "INDS", "NIFTY")):
+            tickers_to_check.extend(["^NSEI", "INDA"])
+        if any(x in upper for x in ("FCHI", "3CAC", "3CSA", "CAC")):
+            tickers_to_check.extend(["^FCHI"])
+        if any(x in upper for x in ("FTSEMIB", "3ITL", "3ITS", "MIB")):
+            tickers_to_check.extend(["FTSEMIB.MI"])
+
+        tickers_to_check = list(dict.fromkeys(tickers_to_check))
+
+        for t in tickers_to_check:
+            info = cls.get_market_session_info(t, now_utc=now_utc)
+            if info.get("exchange") == "CRYPTO":
+                return True
+            if info.get("is_open"):
+                return True
+
+            weekday = now_utc.weekday()
+            # If weekend
+            if info.get("is_weekend"):
+                # Check for Sunday night open within buffer_minutes (e.g. Tokyo/Seoul opening Monday 00:00 UTC)
+                if weekday == 6:  # Sunday
+                    open_parts = [int(p) for p in info["open_time_utc"].split(":")]
+                    if open_parts[0] == 0 and open_parts[1] == 0:
+                        mins_until_midnight = (24 * 60) - (now_utc.hour * 60 + now_utc.minute)
+                        if 0 <= mins_until_midnight <= buffer_minutes:
+                            return True
+                continue
+
+            # Weekday check: is now within buffer_minutes before open?
+            open_parts = [int(p) for p in info["open_time_utc"].split(":")]
+            open_min = open_parts[0] * 60 + open_parts[1]
+            curr_min = now_utc.hour * 60 + now_utc.minute
+
+            diff = open_min - curr_min
+            if 0 <= diff <= buffer_minutes:
+                return True
+
+        return False
 
     def is_market_open(self, ticker: str, current_time: Optional[datetime] = None) -> bool:
         """Check if market is open for a given ticker."""
