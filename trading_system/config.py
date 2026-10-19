@@ -142,6 +142,10 @@ class Settings:
     NOTIFICATIONS_LOG_PATH: str = "notifications.jsonl"
     ACTIVE_TRADES_PATH: str = "active_trades.json"
 
+    # Embedded Dashboard Server
+    ENABLE_EMBEDDED_DASHBOARD: bool = True
+    DASHBOARD_PORT: int = 8888
+
     # Universe & Mode
     USE_LEVERAGED_3X: bool = True
     ENABLE_5X_LEVERAGE: bool = False  # Policy: if 5x exists then replace it with 3x
@@ -219,6 +223,17 @@ class Settings:
         env_prefer_5x = os.environ.get("PREFER_5X_LEVERAGE")
         if env_prefer_5x is not None:
             self.PREFER_5X_LEVERAGE = env_prefer_5x.strip().lower() in ("1", "true", "yes", "t")
+
+        env_dashboard = os.environ.get("ENABLE_EMBEDDED_DASHBOARD")
+        if env_dashboard is not None:
+            self.ENABLE_EMBEDDED_DASHBOARD = env_dashboard.strip().lower() in ("1", "true", "yes", "t")
+
+        env_port = os.environ.get("DASHBOARD_PORT")
+        if env_port:
+            try:
+                self.DASHBOARD_PORT = int(env_port.strip())
+            except ValueError:
+                pass
 
         if self.WATCHLIST is None:
             env_watchlist = os.environ.get("WATCHLIST")

@@ -20,7 +20,7 @@ import webbrowser
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from trading_system.agents.risk_manager import RiskManager
 from trading_system.config import settings
@@ -1019,6 +1019,58 @@ def start_background_position_monitor(
     thread = threading.Thread(target=_monitor_loop, daemon=True, name="PositionMonitorDaemon")
     thread.start()
     return thread
+
+
+def start_local_server_thread(
+    html_file: str = "signals_dashboard.html",
+    port: int = 8888,
+    open_browser: bool = False,
+) -> Tuple[Optional[threading.Thread], Optional[socketserver.TCPServer], str]:
+    """Start the dashboard HTTP server in a background daemon thread."""
+    generate_html_dashboard(html_file)
+    web_dir = Path(html_file).resolve().parent
+    html_name = Path(html_file).name
+
+    class CustomHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(web_dir), **kwargs)
+
+        def do_GET(self):
+            if self.path in ("/", ""):
+                self.path = f"/{html_name}"
+            return super().do_GET()
+
+    socketserver.TCPServer.allow_reuse_address = True
+    bind_port = port
+    httpd = None
+    for attempt in range(5):
+        try:
+            httpd = socketserver.TCPServer(("0.0.0.0", bind_port), CustomHandler)
+            break
+        except OSError:
+            bind_port = port + attempt + 1
+
+    if not httpd:
+        logger.warning("Could not bind dashboard server to any port in range %d-%d", port, port + 5)
+        return None, None, ""
+
+    url = f"http://localhost:{bind_port}/{html_name}"
+
+    def _serve():
+        try:
+            httpd.serve_forever()
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True, name="DashboardServerThread")
+    thread.start()
+    logger.info("🚀 Signals Dashboard running live at: %s", url)
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    return thread, httpd, url
 
 
 def start_local_server(html_file: str, port: int = 8888, open_browser: bool = True) -> None:

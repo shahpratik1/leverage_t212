@@ -64,6 +64,9 @@ class Orchestrator:
         notifier: Optional[Notifier] = None,
         position_monitor: Optional[PositionMonitor] = None,
         trades_log: Optional[Path | str] = None,
+        enable_dashboard: Optional[bool] = None,
+        dashboard_port: Optional[int] = None,
+        open_browser: bool = False,
     ) -> None:
         settings.validate()
         self.dry_run = dry_run
@@ -154,12 +157,49 @@ class Orchestrator:
         # ── 7. Audit Logging ──────────────────────────────────────
         self.trades_log = Path(trades_log) if trades_log else Path(settings.TRADES_LOG_PATH)
 
+        # ── 8. Embedded Dashboard Web Server ──────────────────────
+        self.dashboard_thread = None
+        self.dashboard_server = None
+        self.dashboard_url = ""
+        self._generate_html_dashboard = None
+
+        if enable_dashboard is None:
+            # Auto-detect test runner environment to avoid binding ports during unit tests
+            is_testing = "unittest" in sys.modules and any("test" in arg.lower() for arg in sys.argv)
+            enable_dashboard = False if is_testing else getattr(settings, "ENABLE_EMBEDDED_DASHBOARD", True)
+
+        self.enable_dashboard = enable_dashboard
+        self.dashboard_port = dashboard_port or getattr(settings, "DASHBOARD_PORT", 8888)
+
+        if self.enable_dashboard:
+            try:
+                from trading_system.dashboard.server import (
+                    generate_html_dashboard,
+                    start_local_server_thread,
+                )
+                self._generate_html_dashboard = generate_html_dashboard
+                self.dashboard_thread, self.dashboard_server, self.dashboard_url = start_local_server_thread(
+                    port=self.dashboard_port,
+                    open_browser=open_browser,
+                )
+            except Exception as exc:
+                logger.warning("Failed to start embedded dashboard server: %s", exc)
+
         logger.info(
-            "Orchestrator initialized — 3x Universe: %d assets, Mode: %s (DryRun: %s)",
+            "Orchestrator initialized — 3x Universe: %d assets, Mode: %s (DryRun: %s, Dashboard: %s)",
             len(self.universe),
             "LIVE" if settings.USE_LIVE else "DEMO",
             self.dry_run,
+            self.dashboard_url if self.enable_dashboard and self.dashboard_url else "DISABLED",
         )
+
+    def _update_dashboard(self) -> None:
+        """Regenerate signals_dashboard.html if embedded dashboard is enabled."""
+        if self.enable_dashboard and self._generate_html_dashboard:
+            try:
+                self._generate_html_dashboard("signals_dashboard.html")
+            except Exception as exc:
+                logger.debug("Dashboard regeneration skipped: %s", exc)
 
     # ─────────────────────────────────────────────────────────────
     # Phase 1 — Data Ingestion (Parallel Subagents)
@@ -647,6 +687,7 @@ class Orchestrator:
 
         # Step 4: Execution & Logging via Synchronized Batch Coordinator
         executed_cards = self.execute_trades_batch(candidate_cards)
+        self._update_dashboard()
         logger.info("Cycle finished. %d trades executed.", len(executed_cards))
         return executed_cards
 
@@ -714,6 +755,7 @@ class Orchestrator:
                                 pass
 
                     self.position_monitor.monitor_tick(current_prices)
+                    self._update_dashboard()
 
                 time.sleep(monitor_interval_seconds)
 
@@ -727,6 +769,13 @@ class Orchestrator:
     def shutdown(self) -> None:
         """Clean up resources."""
         logger.info("Shutting down trading engine…")
+        if getattr(self, "dashboard_server", None):
+            try:
+                logger.info("Stopping embedded dashboard server…")
+                self.dashboard_server.shutdown()
+                self.dashboard_server.server_close()
+            except Exception as exc:
+                logger.debug("Dashboard server shutdown notice: %s", exc)
         self.t212.close()
         logger.info("Shutdown complete.")
 
@@ -748,10 +797,18 @@ def main() -> None:
     parser.add_argument("--interval", type=int, default=60, help="Minutes between full universe scans (default: 60)")
     parser.add_argument("--monitor-interval", type=int, default=30, help="Seconds between position monitor ticks (default: 30)")
     parser.add_argument("--dry-run", action="store_true", help="Run in paper-trade mode without real order execution")
+    parser.add_argument("--no-dashboard", action="store_true", help="Disable the embedded local signals dashboard web server")
+    parser.add_argument("--dashboard-port", type=int, default=settings.DASHBOARD_PORT, help=f"Port for embedded dashboard server (default: {settings.DASHBOARD_PORT})")
+    parser.add_argument("--open-browser", action="store_true", help="Automatically open dashboard in default browser on startup")
     parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
     args = parser.parse_args()
 
-    engine = Orchestrator(dry_run=args.dry_run)
+    engine = Orchestrator(
+        dry_run=args.dry_run,
+        enable_dashboard=not args.no_dashboard,
+        dashboard_port=args.dashboard_port,
+        open_browser=args.open_browser,
+    )
 
     # Test all 7 notification formats if requested
     if args.test_notifications:
