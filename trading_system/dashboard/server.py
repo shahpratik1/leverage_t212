@@ -1218,7 +1218,7 @@ def start_local_server(html_file: str, port: int = 8888, open_browser: bool = Tr
     # Launch autonomous background position monitor for 100% automated TP1/TP2/TP3 execution
     start_background_position_monitor(html_file=html_file, interval_seconds=15)
 
-    web_dir = Path(html_file).parent
+    web_dir = Path(html_file).resolve().parent
     html_name = Path(html_file).name
     HandlerClass = make_dashboard_handler(web_dir, html_name)
 
