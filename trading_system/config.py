@@ -85,6 +85,16 @@ class Settings:
     LLM_DEEP_MODEL: str = "gpt-4o"
     LLM_QUICK_MODEL: str = "gpt-4o-mini"
 
+    # Google Antigravity SDK Settings
+    GEMINI_API_KEY: str = ""
+    AGY_MODEL: Optional[str] = None  # None = use Antigravity default (gemini-3.8-flash)
+    AGY_AGENT_BEHAVIOR: str = "AUTONOMOUS"  # 'AUTONOMOUS' or 'INTERACTIVE'
+    AGY_ENABLE_SUBAGENTS: bool = True
+    AGY_MAX_SUBAGENT_DEPTH: int = 2
+    AGY_USE_LOCAL_MODEL: bool = False
+    AGY_LOCAL_MODEL_PATH: str = ""
+    AGY_APP_DATA_DIR: Optional[str] = None
+
     # Parallel Concurrency & Intelligent Model Routing
     PARALLEL_INGESTION_WORKERS: int = 24
     PARALLEL_DELIBERATION_WORKERS: int = 8
@@ -318,6 +328,16 @@ class Settings:
                 self.RECONCILIATION_INTERVAL_SECONDS = int(env_reconcile.strip())
             except ValueError:
                 pass
+
+        # Google Antigravity SDK environment variables
+        self.GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+        self.AGY_MODEL = os.environ.get("AGY_MODEL", self.AGY_MODEL)
+        self.AGY_AGENT_BEHAVIOR = os.environ.get("AGY_AGENT_BEHAVIOR", self.AGY_AGENT_BEHAVIOR).upper()
+        self.AGY_LOCAL_MODEL_PATH = os.environ.get("AGY_LOCAL_MODEL_PATH", self.AGY_LOCAL_MODEL_PATH)
+        self.AGY_APP_DATA_DIR = os.environ.get("AGY_APP_DATA_DIR", self.AGY_APP_DATA_DIR)
+        env_local = os.environ.get("AGY_USE_LOCAL_MODEL")
+        if env_local is not None:
+            self.AGY_USE_LOCAL_MODEL = env_local.strip().lower() in ("1", "true", "yes", "t")
 
         if not self.PANIC_FLATTEN_TOKEN:
             self.PANIC_FLATTEN_TOKEN = os.environ.get("PANIC_FLATTEN_TOKEN", "")

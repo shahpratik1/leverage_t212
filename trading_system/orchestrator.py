@@ -41,6 +41,7 @@ from trading_system.screener.laya_screener import LayaScreener, ScreenerResult
 from trading_system.agents.technical_agent import TechnicalAnalyst
 from trading_system.agents.fundamental_agent import FundamentalAnalyst
 from trading_system.agents.debate_engine import DebateEngine
+from trading_system.agents.antigravity_agent import AntigravityTradingAgent
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ class Orchestrator:
             debate_rounds=3,
             speculative_routing=settings.ENABLE_SPECULATIVE_ROUTING,
             speculative_threshold=settings.SPECULATIVE_CONFIDENCE_THRESHOLD,
+            gemini_api_key=settings.GEMINI_API_KEY,
         )
         self.parallel_ingestion_workers = settings.PARALLEL_INGESTION_WORKERS
         self.parallel_deliberation_workers = settings.PARALLEL_DELIBERATION_WORKERS
@@ -137,6 +139,13 @@ class Orchestrator:
             tp2_r=settings.TP2_R_MULTIPLE,
             tp3_r=settings.TP3_R_MULTIPLE,
             tsl_atr_multiplier=settings.TSL_ATR_MULTIPLIER,
+        )
+        self.antigravity_agent = AntigravityTradingAgent(
+            t212_client=self.t212,
+            notifier=self.notifier,
+            risk_manager=self.risk_manager,
+            gemini_api_key=settings.GEMINI_API_KEY,
+            model=settings.AGY_MODEL,
         )
 
         # ── 6. Active Position & Lifecycle Monitor ───────────────
@@ -284,6 +293,7 @@ class Orchestrator:
         """Filter universe using Laya NLI router for Bullish and Bearish setups."""
         logger.info("Screening %d assets for 3x Long/Short momentum (ADX >= %.1f)…",
                     len(universe_metrics), settings.MIN_ADX_TREND)
+        AntigravityTradingAgent.set_active_universe_metrics(universe_metrics)
         candidates = self.screener.scan_universe(universe_metrics)
         logger.info(
             "System 1 passed %d high-momentum candidates: %s",
@@ -874,14 +884,16 @@ class Orchestrator:
 
                     for ticker, pos in self.position_monitor.positions.items():
                         if ticker not in current_prices:
+                            # Keep last known valid price from broker/position to avoid cross-asset price contamination
+                            if getattr(pos, "current_price", 0.0) > 0:
+                                current_prices[ticker] = pos.current_price
+                            # Fetch underlying price ONLY for underlying symbol, never assign to ETP ticker
                             try:
                                 daily = MarketDataProvider.get_daily_candles(pos.underlying, period="5d")
                                 if hasattr(daily, "empty") and not daily.empty:
                                     current_prices[pos.underlying] = float(daily["close"].iloc[-1])
-                                    current_prices[ticker] = float(daily["close"].iloc[-1])
                                 elif isinstance(daily, list) and daily:
                                     current_prices[pos.underlying] = float(daily[-1]["close"])
-                                    current_prices[ticker] = float(daily[-1]["close"])
                             except Exception:
                                 pass
 
@@ -940,6 +952,7 @@ def main() -> None:
     parser.add_argument("--dashboard-port", type=int, default=settings.DASHBOARD_PORT, help=f"Port for embedded dashboard server (default: {settings.DASHBOARD_PORT})")
     parser.add_argument("--open-browser", action="store_true", help="Automatically open dashboard in default browser on startup")
     parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
+    parser.add_argument("--agentic", action="store_true", help="Enable Google Antigravity autonomous multi-agent reasoning system")
     parser.add_argument("--backtest", action="store_true", help="Run historical strategy backtest simulator and benchmark report")
     parser.add_argument("--backtest-symbol", type=str, default="QQQ", help="Underlying asset symbol to backtest (default: QQQ)")
     parser.add_argument("--backtest-period", type=str, default="1y", help="Historical backtest period (default: 1y)")

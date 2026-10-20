@@ -1246,16 +1246,18 @@ def start_background_position_monitor(
                     except Exception as port_exc:
                         logger.debug("Portfolio fetch notice: %s", port_exc)
 
-                    # Fallback pricing if needed
+                    # Fallback pricing if needed (preserve position current_price, never assign underlying price to ETP ticker)
                     for ticker, pos in monitor.positions.items():
                         if ticker not in current_prices:
+                            if getattr(pos, "current_price", 0.0) > 0:
+                                current_prices[ticker] = pos.current_price
                             try:
                                 from trading_system.data.trading212_client import MarketDataProvider
                                 candles = MarketDataProvider.get_daily_candles(pos.underlying, period="5d")
                                 if hasattr(candles, "empty") and not candles.empty:
-                                    current_prices[ticker] = float(candles["close"].iloc[-1])
+                                    current_prices[pos.underlying] = float(candles["close"].iloc[-1])
                                 elif isinstance(candles, list) and candles:
-                                    current_prices[ticker] = float(candles[-1]["close"])
+                                    current_prices[pos.underlying] = float(candles[-1]["close"])
                             except Exception:
                                 pass
 

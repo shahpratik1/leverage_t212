@@ -47,6 +47,26 @@ class DecisionCard:
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
 
+    @property
+    def position_size(self) -> float:
+        """Alias for position_size_shares."""
+        return self.position_size_shares
+
+    @property
+    def tp1(self) -> float:
+        """Alias for take_profit_1."""
+        return self.take_profit_1
+
+    @property
+    def tp2(self) -> float:
+        """Alias for take_profit_2."""
+        return self.take_profit_2
+
+    @property
+    def tp3(self) -> float:
+        """Alias for take_profit_3."""
+        return self.take_profit_3
+
 
 class RiskManager:
     """Risk Manager agent that enforces position sizing and calculates entry/exit levels."""
