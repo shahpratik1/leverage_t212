@@ -66,6 +66,13 @@ class RiskManager:
         tp2_trim_pct: float = 0.25,
         tp3_trim_pct: float = 0.25,
         target_annual_volatility: float = 0.20,
+        enforce_spread_gate: Optional[bool] = None,
+        max_bid_ask_spread_pct: Optional[float] = None,
+        enforce_correlation_limits: Optional[bool] = None,
+        max_sector_positions: Optional[int] = None,
+        max_portfolio_beta_heat: Optional[float] = None,
+        enforce_daily_circuit_breaker: Optional[bool] = None,
+        daily_max_drawdown_pct: Optional[float] = None,
     ):
         self.max_risk_per_trade = max_risk_per_trade
         self.max_position_pct = max_position_pct
@@ -80,7 +87,64 @@ class RiskManager:
         self.tp2_trim_pct = tp2_trim_pct
         self.tp3_trim_pct = tp3_trim_pct
         self.target_annual_volatility = target_annual_volatility
+
+        # Advanced Risk & Safety Gates
+        from trading_system.config import settings
+        self.enforce_spread_gate = getattr(settings, "ENFORCE_SPREAD_GATE", True) if enforce_spread_gate is None else enforce_spread_gate
+        self.max_bid_ask_spread_pct = getattr(settings, "MAX_BID_ASK_SPREAD_PCT", 0.0035) if max_bid_ask_spread_pct is None else max_bid_ask_spread_pct
+        self.enforce_correlation_limits = getattr(settings, "ENFORCE_CORRELATION_LIMITS", True) if enforce_correlation_limits is None else enforce_correlation_limits
+        self.max_sector_positions = getattr(settings, "MAX_SECTOR_POSITIONS", 2) if max_sector_positions is None else max_sector_positions
+        self.max_portfolio_beta_heat = getattr(settings, "MAX_PORTFOLIO_BETA_HEAT", 3.0) if max_portfolio_beta_heat is None else max_portfolio_beta_heat
+        self.enforce_daily_circuit_breaker = getattr(settings, "ENFORCE_DAILY_CIRCUIT_BREAKER", True) if enforce_daily_circuit_breaker is None else enforce_daily_circuit_breaker
+        self.daily_max_drawdown_pct = getattr(settings, "DAILY_MAX_DRAWDOWN_PCT", 0.02) if daily_max_drawdown_pct is None else daily_max_drawdown_pct
+
+        self.is_circuit_breaker_tripped: bool = False
+        self.session_start_equity: Optional[float] = None
+        self.current_drawdown_pct: float = 0.0
+
         logger.debug("Initialized RiskManager with max_risk_per_trade=%s", max_risk_per_trade)
+
+    def check_circuit_breaker(
+        self, current_equity: float, session_start_equity: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """Check if portfolio daily drawdown exceeds circuit breaker threshold.
+
+        Returns:
+            Tuple[bool, str]: (is_tripped, explanation)
+        """
+        if not self.enforce_daily_circuit_breaker:
+            return False, "Circuit breaker disabled"
+
+        if session_start_equity is not None and session_start_equity > 0:
+            self.session_start_equity = session_start_equity
+        elif self.session_start_equity is None or self.session_start_equity <= 0:
+            self.session_start_equity = current_equity
+            return False, "Session baseline established"
+
+        if self.session_start_equity <= 0:
+            return False, "Invalid session baseline"
+
+        drawdown = (current_equity - self.session_start_equity) / self.session_start_equity
+        self.current_drawdown_pct = drawdown
+
+        if drawdown <= -self.daily_max_drawdown_pct:
+            self.is_circuit_breaker_tripped = True
+            msg = (
+                f"🚨 CIRCUIT BREAKER TRIPPED: Daily drawdown {drawdown*100:.2f}% "
+                f"breached -{self.daily_max_drawdown_pct*100:.1f}% limit! "
+                f"Equity: ${current_equity:.2f} vs Start: ${self.session_start_equity:.2f}."
+            )
+            logger.critical(msg)
+            return True, msg
+
+        return False, f"Drawdown {drawdown*100:.2f}% within safe threshold (-{self.daily_max_drawdown_pct*100:.1f}%)"
+
+    def reset_circuit_breaker(self, new_session_equity: Optional[float] = None) -> None:
+        """Reset the circuit breaker for a new session day."""
+        self.is_circuit_breaker_tripped = False
+        self.current_drawdown_pct = 0.0
+        if new_session_equity and new_session_equity > 0:
+            self.session_start_equity = new_session_equity
 
     def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG") -> float:
         """Calculate stop loss based on ATR and minimum percentage distance.
@@ -321,11 +385,31 @@ class RiskManager:
     calculate_decision_card = generate_decision_card
 
     def validate_trade(
-        self, card: DecisionCard, account_cash: float, existing_positions: List[Any]
+        self,
+        card: DecisionCard,
+        account_cash: float,
+        existing_positions: List[Any],
+        spread_pct: Optional[float] = None,
+        account_equity: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """Validate whether a trade should be executed."""
         if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
             return False, f"Decision is {card.decision}, not an entry decision"
+
+        # 1. Daily Drawdown Circuit Breaker Gate
+        if self.enforce_daily_circuit_breaker and self.is_circuit_breaker_tripped:
+            return (
+                False,
+                f"Daily circuit breaker tripped (Drawdown {self.current_drawdown_pct*100:.2f}% breached -{self.daily_max_drawdown_pct*100:.1f}%)",
+            )
+
+        # 2. Bid-Ask Spread Gate
+        if self.enforce_spread_gate and spread_pct is not None:
+            if spread_pct > self.max_bid_ask_spread_pct:
+                return (
+                    False,
+                    f"Bid-ask spread too wide ({spread_pct*100:.2f}% > {self.max_bid_ask_spread_pct*100:.2f}%)",
+                )
 
         from trading_system.config import settings
         max_allowed_leverage = getattr(settings, "MAX_LEVERAGE", 3)
@@ -350,6 +434,45 @@ class RiskManager:
             pos_ticker = getattr(pos, "ticker", None)
             if pos_ticker == card.trading212_ticker or pos_ticker == card.ticker:
                 return False, f"Already holding a position in {card.trading212_ticker}"
+
+        # 3. Sector Concentration & Aggregate Beta Heat Limits
+        if self.enforce_correlation_limits:
+            from trading_system.data.leveraged_universe import LeveragedUniverse
+            univ = LeveragedUniverse()
+            candidate_sector = univ.get_category_for_symbol(card.ticker)
+
+            sector_count = 0
+            total_active_beta_notional = 0.0
+
+            if existing_positions:
+                for pos in existing_positions:
+                    pos_ticker = getattr(pos, "ticker", "") or ""
+                    pos_underlying = getattr(pos, "underlying", "") or pos_ticker
+                    pos_sector = univ.get_category_for_symbol(pos_underlying or pos_ticker)
+                    if pos_sector == candidate_sector:
+                        sector_count += 1
+
+                    pos_qty = float(getattr(pos, "remaining_quantity", getattr(pos, "quantity", 0.0)) or 0.0)
+                    pos_price = float(getattr(pos, "entry_price", getattr(pos, "current_price", getattr(pos, "average_price", 0.0))) or 0.0)
+                    # Convert GBX pence quotes to base units (£/$) if needed
+                    if pos_price > 500 and (pos_ticker.endswith("l_EQ") or pos_ticker.startswith("3TSM") or pos_ticker.startswith("3LZP")):
+                        pos_price = pos_price / 100.0
+                    pos_notional = pos_qty * pos_price
+                    pos_lev = 3 if any(k in pos_ticker for k in ("3l_EQ", "3Sl_EQ", "3L", "3S", "3US", "QQQ3", "3NVD", "3LTS", "AAP3", "MSF3")) else 1
+                    total_active_beta_notional += (pos_notional * pos_lev)
+
+                if sector_count >= self.max_sector_positions:
+                    return False, f"Sector concentration limit reached for {candidate_sector} ({sector_count} >= {self.max_sector_positions})"
+
+            effective_equity = account_equity if (account_equity and account_equity > 0) else (account_cash + total_active_beta_notional / 3.0)
+            if effective_equity > 0:
+                candidate_beta_notional = card.position_notional * card.leverage
+                new_total_beta_heat = (total_active_beta_notional + candidate_beta_notional) / effective_equity
+                if new_total_beta_heat > self.max_portfolio_beta_heat:
+                    return (
+                        False,
+                        f"Aggregate portfolio beta heat ceiling exceeded ({new_total_beta_heat:.2f}x > {self.max_portfolio_beta_heat:.2f}x)",
+                    )
 
         return True, "All checks passed"
 

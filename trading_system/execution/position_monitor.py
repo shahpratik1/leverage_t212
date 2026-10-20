@@ -60,6 +60,7 @@ class TrackedPosition:
     tp1_escape_threshold: float = 0.0
     tp1_stop_elevated: bool = False
     scale_calibrated: bool = False
+    current_price: Optional[float] = None
 
     def __post_init__(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -91,6 +92,31 @@ class PositionMonitor:
         self.dry_run = dry_run
         self.positions: Dict[str, TrackedPosition] = self._load_state()
         self._last_session_close_date: str = ""
+        self.is_halted: bool = False
+        if os.path.exists(self.halt_marker_file):
+            self.is_halted = True
+
+    @property
+    def halt_marker_file(self) -> str:
+        return f"{self.state_file}.halted"
+
+    def is_system_halted(self) -> bool:
+        """Check whether system is in emergency halt state (in-memory or persistent marker)."""
+        if self.is_halted:
+            return True
+        if os.path.exists(self.halt_marker_file):
+            self.is_halted = True
+            return True
+        return False
+
+    def resume_trading(self) -> None:
+        """Clear emergency halt state and delete persistent halt marker file."""
+        self.is_halted = False
+        if os.path.exists(self.halt_marker_file):
+            try:
+                os.remove(self.halt_marker_file)
+            except Exception as exc:
+                logger.warning("Could not remove halt marker file: %s", exc)
 
     # ─────────────────────────────────────────────────────────────
     # Trade Registration
@@ -210,16 +236,16 @@ class PositionMonitor:
                 "Placing native Stop Order on Trading 212 for %s: %.3f shares @ stopPrice $%.2f",
                 pos.ticker, order_qty, price
             )
-            # Try GTC first (standard for persistent protective stops), fallback to DAY
+            # Try GOOD_TILL_CANCEL first (standard for persistent protective stops), fallback to DAY
             try:
                 res = self.t212.place_stop_order(
                     ticker=pos.ticker,
                     quantity=order_qty,
                     stop_price=round(price, 2),
-                    time_validity="GTC",
+                    time_validity="GOOD_TILL_CANCEL",
                 )
             except Exception as first_exc:
-                logger.debug("Stop order with validity GTC failed (%s), attempting DAY...", first_exc)
+                logger.debug("Stop order with validity GOOD_TILL_CANCEL failed (%s), attempting DAY...", first_exc)
                 # Respect rate limit spacing before fallback order submission
                 delay = getattr(self.t212, "rate_limit_delay", 1.25)
                 time.sleep(delay)
@@ -298,10 +324,10 @@ class PositionMonitor:
                     ticker=pos.ticker,
                     quantity=order_qty,
                     limit_price=round(price, 2),
-                    time_validity="GTC",
+                    time_validity="GOOD_TILL_CANCEL",
                 )
             except Exception as first_exc:
-                logger.debug("Limit order with validity GTC failed (%s), attempting DAY...", first_exc)
+                logger.debug("Limit order with validity GOOD_TILL_CANCEL failed (%s), attempting DAY...", first_exc)
                 delay = getattr(self.t212, "rate_limit_delay", 1.25)
                 time.sleep(delay)
                 res = self.t212.place_limit_order(
@@ -363,10 +389,351 @@ class PositionMonitor:
                 order_id = self.place_broker_stop(pos)
                 if order_id:
                     synced.append(ticker)
+                delay = getattr(self.t212, "rate_limit_delay", 1.25)
+                time.sleep(delay)
         if synced:
             self._save_state()
             logger.info("Synced native broker stops for %d positions: %s", len(synced), synced)
         return synced
+
+    def apply_daily_rollover_stops(self) -> List[Dict[str, Any]]:
+        """Apply new-day session stop loss elevation to permanently lock in prior-day gains.
+
+        Rule: For any active position sitting in profit from yesterday (peak > entry),
+        ratchet the stop loss to at least Entry + 50% of the peak unrealized gain,
+        or Chandelier ATR trail (Peak - 1.5 * ATR), whichever is higher.
+        """
+        results = []
+        for ticker, pos in list(self.positions.items()):
+            if pos.is_closed or pos.remaining_quantity <= 0 or pos.entry_price <= 0:
+                continue
+
+            is_short = (pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"))
+            peak = pos.lowest_price if is_short else pos.highest_price
+
+            # Check if position experienced positive gain
+            has_gain = (peak < pos.entry_price) if is_short else (peak > pos.entry_price)
+            if not has_gain:
+                continue
+
+            gain_amt = (pos.entry_price - peak) if is_short else (peak - pos.entry_price)
+            # 50% profit lock
+            target_50pct = (pos.entry_price - 0.50 * gain_amt) if is_short else (pos.entry_price + 0.50 * gain_amt)
+
+            # Chandelier ATR trail
+            atr_trail_dist = max(pos.atr * 1.5, peak * 0.015) if pos.atr > 0 else (peak * 0.02)
+            target_chandelier = (peak + atr_trail_dist) if is_short else (peak - atr_trail_dist)
+
+            # Choose the tighter of the two (higher for long, lower for short)
+            recommended_sl = min(target_50pct, target_chandelier) if is_short else max(target_50pct, target_chandelier)
+            recommended_sl = round(recommended_sl, 2)
+
+            # Check if this ratchets tighter than current stop
+            should_ratchet = (recommended_sl < pos.trailing_stop_loss) if is_short else (recommended_sl > pos.trailing_stop_loss)
+            if should_ratchet:
+                old_sl = pos.trailing_stop_loss
+                pos.trailing_stop_loss = recommended_sl
+                pos.stop_loss = recommended_sl
+                # If TP1 level is reached or surpassed, ensure TP1 state aligns
+                if (recommended_sl >= pos.tp1 if not is_short else recommended_sl <= pos.tp1):
+                    pos.tp1_armed_hysteresis = False
+                    pos.tp1_stop_elevated = True
+
+                locked_pct = abs((recommended_sl - pos.entry_price) / pos.entry_price) * 100.0 if pos.entry_price > 0 else 0.0
+                logger.info(
+                    "🌅 Daily Session Rollover: %s stop ratcheted $%.2f -> $%.2f (Peak: $%.2f, +%.2f%% locked)",
+                    ticker, old_sl, recommended_sl, peak, locked_pct,
+                )
+                self.place_broker_stop(pos, stop_price=recommended_sl)
+                if hasattr(self.notifier, "notify_tsl"):
+                    try:
+                        self.notifier.notify_tsl(
+                            ticker=pos.ticker,
+                            underlying=pos.underlying,
+                            direction=pos.direction,
+                            current_price=pos.current_price or recommended_sl,
+                            new_tsl=recommended_sl,
+                            locked_in_pnl_pct=locked_pct,
+                            event_type="DAILY_ROLLOVER_RATCHET",
+                        )
+                    except Exception as notif_exc:
+                        logger.debug("Rollover notification notice: %s", notif_exc)
+
+                results.append({
+                    "ticker": ticker,
+                    "old_sl": old_sl,
+                    "new_sl": recommended_sl,
+                    "peak": peak,
+                    "locked_pct": round(locked_pct, 2),
+                })
+        if results:
+            self._save_state()
+        return results
+
+    def reconcile_with_broker(self, adopt_untracked: bool = True) -> Dict[str, Any]:
+        """Reconcile local active positions with actual broker portfolio.
+
+        Detects:
+        - Positions closed externally (stopped out via native stop, limit filled, or manual app close)
+        - Partial quantity mismatches and external trims
+        - Untracked broker positions (with automatic adoption)
+        """
+        summary: Dict[str, Any] = {
+            "closed_externally": [],
+            "quantity_synced": [],
+            "untracked_broker_positions": [],
+            "adopted_from_broker": [],
+            "expired_stops_restored": [],
+        }
+
+        try:
+            broker_portfolio = self.t212.get_portfolio(force_refresh=True)
+        except Exception as exc:
+            logger.warning("Broker reconciliation skipped — portfolio fetch failed: %s", exc)
+            return summary
+
+        broker_map = {p.ticker: p for p in broker_portfolio if getattr(p, "quantity", 0.0) > 0}
+
+        # Query pending broker orders to associate native stop and limit orders
+        stop_orders_by_ticker: Dict[str, Any] = {}
+        limit_orders_by_ticker: Dict[str, Any] = {}
+        try:
+            if hasattr(self.t212, "get_orders"):
+                open_orders = self.t212.get_orders(force_refresh=True)
+                for o in open_orders:
+                    o_ticker = o.get("ticker") if isinstance(o, dict) else getattr(o, "ticker", "")
+                    o_type = str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
+                    if "STOP" in o_type:
+                        stop_orders_by_ticker[o_ticker] = o
+                    elif "LIMIT" in o_type:
+                        limit_orders_by_ticker[o_ticker] = o
+        except Exception as ord_exc:
+            logger.debug("Reconciliation open orders fetch notice: %s", ord_exc)
+
+        # 1. Check local positions against broker
+        for ticker, pos in list(self.positions.items()):
+            if pos.is_closed:
+                continue
+
+            if ticker not in broker_map:
+                # In live mode, if position is missing from broker, mark closed externally
+                if not self.dry_run:
+                    logger.warning(
+                        "Reconciliation: %s not found in broker portfolio! Marked closed externally.",
+                        ticker,
+                    )
+                    pos.is_closed = True
+                    pos.remaining_quantity = 0.0
+                    pos.last_update_time = datetime.now(timezone.utc).isoformat()
+                    self.cancel_all_broker_orders(pos)
+                    summary["closed_externally"].append(ticker)
+
+                    # Dispatch notification
+                    if hasattr(self.notifier, "notify_stop_loss"):
+                        try:
+                            self.notifier.notify_stop_loss(
+                                ticker=pos.ticker,
+                                underlying=pos.underlying,
+                                price=pos.stop_loss,
+                                quantity=pos.original_quantity,
+                                realized_pnl=0.0,
+                                realized_pnl_pct=0.0,
+                                is_tsl=False,
+                                details="Reconciliation: Position closed on broker (Native stop hit, limit filled, or manual close)",
+                            )
+                        except Exception as notif_exc:
+                            logger.debug("Reconciliation exit notification failed: %s", notif_exc)
+            else:
+                bp = broker_map[ticker]
+                cur_px = bp.current_price if bp.current_price > 0 else bp.average_price
+                if cur_px > 0:
+                    pos.current_price = cur_px
+                    pos.highest_price = max(pos.highest_price, cur_px)
+                    pos.lowest_price = min(pos.lowest_price, cur_px)
+
+                # Link native stop order from broker if missing or unlinked
+                if ticker in stop_orders_by_ticker:
+                    so = stop_orders_by_ticker[ticker]
+                    so_id = str(so.get("id") if isinstance(so, dict) else getattr(so, "id", ""))
+                    so_price = float(so.get("stopPrice", 0.0) if isinstance(so, dict) else getattr(so, "stop_price", 0.0))
+                    if so_id and (not pos.broker_stop_order_id or pos.broker_stop_order_id.startswith("DRY_") or pos.broker_stop_order_id != so_id):
+                        pos.broker_stop_order_id = so_id
+                    if so_price > 0 and not pos.tp1_hit:
+                        pos.stop_loss = so_price
+                        pos.trailing_stop_loss = so_price
+                else:
+                    # Broker has NO active stop order for this open position (it expired overnight or was cancelled)
+                    if pos.broker_stop_order_id and not pos.broker_stop_order_id.startswith("DRY_"):
+                        logger.warning(
+                            "Reconciliation: Native broker stop order %s for %s has EXPIRED or was cancelled on broker! Auto-healing...",
+                            pos.broker_stop_order_id, ticker,
+                        )
+                        pos.broker_stop_order_id = None
+                        summary["expired_stops_restored"].append(ticker)
+                        # Re-place immediately with GOOD_TILL_CANCEL
+                        self.place_broker_stop(pos)
+
+                # Link native TP limit order from broker
+                if ticker in limit_orders_by_ticker:
+                    lo = limit_orders_by_ticker[ticker]
+                    lo_id = str(lo.get("id") if isinstance(lo, dict) else getattr(lo, "id", ""))
+                    if lo_id and (not pos.broker_tp_order_id or pos.broker_tp_order_id.startswith("DRY_") or pos.broker_tp_order_id != lo_id):
+                        pos.broker_tp_order_id = lo_id
+                else:
+                    if pos.broker_tp_order_id and not pos.broker_tp_order_id.startswith("DRY_"):
+                        logger.debug("Reconciliation: Native broker TP order %s for %s is no longer open (filled or expired).",
+                                     pos.broker_tp_order_id, ticker)
+                        pos.broker_tp_order_id = None
+
+                if abs(bp.quantity - pos.remaining_quantity) > 1e-4:
+                    logger.info(
+                        "Reconciliation: %s quantity mismatch (local: %.3f, broker: %.3f). Synchronizing.",
+                        ticker, pos.remaining_quantity, bp.quantity,
+                    )
+                    pos.remaining_quantity = bp.quantity
+                    pos.last_update_time = datetime.now(timezone.utc).isoformat()
+                    summary["quantity_synced"].append((ticker, bp.quantity))
+                    if pos.remaining_quantity <= 0:
+                        pos.is_closed = True
+                        self.cancel_all_broker_orders(pos)
+
+        # 2. Check for untracked positions on broker and adopt them
+        for b_ticker, bp in broker_map.items():
+            if b_ticker not in self.positions or self.positions[b_ticker].is_closed:
+                summary["untracked_broker_positions"].append((b_ticker, bp.quantity))
+                if adopt_untracked:
+                    from trading_system.data.leveraged_universe import LeveragedUniverse
+                    univ = LeveragedUniverse()
+                    pair = univ.get_pair_for_etp(b_ticker)
+                    underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
+                    direction = "LONG"
+                    if pair and (b_ticker == pair.short_3x_ticker or b_ticker == pair.short_5x_ticker):
+                        direction = "SHORT"
+
+                    avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
+                    cur_px = bp.current_price if bp.current_price > 0 else avg_px
+
+                    # Check if broker already has a live pending stop order for this position
+                    so = stop_orders_by_ticker.get(b_ticker)
+                    so_id = str(so.get("id") if isinstance(so, dict) else getattr(so, "id", "")) if so else None
+                    so_price = float(so.get("stopPrice", 0.0) if isinstance(so, dict) else getattr(so, "stop_price", 0.0)) if so else 0.0
+
+                    if so_price > 0:
+                        sl = round(so_price, 2)
+                        sl_dist = abs(avg_px - sl)
+                    else:
+                        sl_dist = round(avg_px * 0.05, 2)
+                        sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
+
+                    tp1 = round(avg_px + sl_dist, 2) if direction == "LONG" else round(avg_px - sl_dist, 2)
+                    tp2 = round(avg_px + 2 * sl_dist, 2) if direction == "LONG" else round(avg_px - 2 * sl_dist, 2)
+                    tp3 = round(avg_px + 3 * sl_dist, 2) if direction == "LONG" else round(avg_px - 3 * sl_dist, 2)
+
+                    broker_stop_id = so_id if so_id else (f"DRY_STOP_{b_ticker}_{int(time.time())}" if self.dry_run else None)
+
+                    lo = limit_orders_by_ticker.get(b_ticker)
+                    lo_id = str(lo.get("id") if isinstance(lo, dict) else getattr(lo, "id", "")) if lo else None
+                    broker_tp_id = lo_id if lo_id else (f"DRY_LIMIT_{b_ticker}_{int(time.time())}" if self.dry_run else None)
+
+                    adopted_pos = TrackedPosition(
+                        ticker=b_ticker,
+                        underlying=underlying,
+                        direction=direction,
+                        entry_price=avg_px,
+                        original_quantity=bp.quantity,
+                        remaining_quantity=bp.quantity,
+                        stop_loss=sl,
+                        trailing_stop_loss=sl,
+                        highest_price=max(avg_px, cur_px),
+                        lowest_price=min(avg_px, cur_px),
+                        tp1=tp1,
+                        tp2=tp2,
+                        tp3=tp3,
+                        atr=round(avg_px * 0.025, 2),
+                        strategy_type="broker_placed",
+                        broker_stop_order_id=broker_stop_id,
+                        broker_tp_order_id=broker_tp_id,
+                        scale_calibrated=True,
+                        current_price=cur_px,
+                    )
+                    self.positions[b_ticker] = adopted_pos
+                    summary["adopted_from_broker"].append(b_ticker)
+                    logger.info(
+                        "Reconciliation: Adopted broker-placed position %s (%s, %.3f shares @ $%.2f, SL: $%.2f, StopID: %s)",
+                        b_ticker, underlying, bp.quantity, avg_px, sl, broker_stop_id,
+                    )
+
+        if (
+            summary["closed_externally"]
+            or summary["quantity_synced"]
+            or summary["adopted_from_broker"]
+            or summary.get("expired_stops_restored")
+        ):
+            self._save_state()
+
+        return summary
+
+    def panic_flatten_all(self) -> Dict[str, Any]:
+        """Emergency fail-safe: cancel all broker orders and liquidate all open positions."""
+        logger.critical("🚨 EMERGENCY PANIC FLATTEN TRIGGERED! Liquidating all positions and cancelling orders.")
+        results: Dict[str, Any] = {
+            "cancelled_stops": 0,
+            "liquidated_positions": [],
+            "failed_liquidations": [],
+        }
+        self.is_halted = True
+        try:
+            with open(self.halt_marker_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "halted": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "reason": "Emergency Panic Flatten"
+                }, f, indent=2)
+        except Exception as exc:
+            logger.warning("Could not write persistent halt marker to %s: %s", self.halt_marker_file, exc)
+
+        for ticker, pos in list(self.positions.items()):
+            if pos.is_closed:
+                continue
+
+            # 1. Cancel all orders on broker
+            try:
+                self.cancel_all_broker_orders(pos)
+                results["cancelled_stops"] += 1
+            except Exception as exc:
+                logger.error("Failed to cancel orders for %s during panic flatten: %s", ticker, exc)
+
+            # 2. Sell / liquidate remaining quantity
+            if pos.remaining_quantity > 0 and not self.dry_run:
+                try:
+                    success = self._execute_sell(pos.ticker, pos.remaining_quantity)
+                    if success:
+                        results["liquidated_positions"].append((ticker, pos.remaining_quantity))
+                    else:
+                        results["failed_liquidations"].append((ticker, pos.remaining_quantity))
+                except Exception as exc:
+                    logger.error("Failed to liquidate %s during panic flatten: %s", ticker, exc)
+                    results["failed_liquidations"].append((ticker, pos.remaining_quantity))
+            else:
+                results["liquidated_positions"].append((ticker, pos.remaining_quantity))
+
+            pos.is_closed = True
+            pos.remaining_quantity = 0.0
+            pos.last_update_time = datetime.now(timezone.utc).isoformat()
+
+        self._save_state()
+
+        # Notify via all channels
+        if hasattr(self.notifier, "notify_alert"):
+            try:
+                self.notifier.notify_alert(
+                    "🚨 EMERGENCY PANIC FLATTEN EXECUTED",
+                    f"Liquidated: {len(results['liquidated_positions'])} positions, Cancelled stops: {results['cancelled_stops']}. System halted.",
+                )
+            except Exception as notif_exc:
+                logger.debug("Panic flatten notification skipped: %s", notif_exc)
+
+        return results
 
     # ─────────────────────────────────────────────────────────────
     # Asymmetric Session Protocol (16:20 UTC Gap Evacuation & Quota Management)
@@ -527,6 +894,9 @@ class PositionMonitor:
         Returns:
             List of event summaries generated during this tick.
         """
+        if getattr(self, "is_halted", False):
+            return []
+
         events = []
 
         # 1. Asymmetric Session Protocol Check (16:20 UTC cutoff)
@@ -716,6 +1086,7 @@ class PositionMonitor:
                 if ratcheted:
                     old_tsl = pos.trailing_stop_loss
                     pos.trailing_stop_loss = new_tsl
+                    pos.stop_loss = min(pos.stop_loss, new_tsl) if is_short else max(pos.stop_loss, new_tsl)
                     locked_pct = (
                         ((pos.entry_price - new_tsl) / pos.entry_price * 100)
                         if is_short
@@ -789,11 +1160,16 @@ class PositionMonitor:
 
         # Cancel pending broker stop and limit orders to unblock shares for sell execution
         self.cancel_all_broker_orders(pos)
+        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        if not self.dry_run and delay > 0:
+            time.sleep(delay)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, actual_trim)
+        if not self.dry_run and delay > 0:
+            time.sleep(delay)
 
-        # Update native broker stop order on Trading 212 to Break-Even for remaining shares
+        # Update native broker stop order on Trading 212 for remaining shares
         self.place_broker_stop(pos, stop_price=pos.entry_price)
 
         # Notify
@@ -832,9 +1208,14 @@ class PositionMonitor:
 
         # Cancel pending broker orders to unblock shares for sell execution
         self.cancel_all_broker_orders(pos)
+        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        if not self.dry_run and delay > 0:
+            time.sleep(delay)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, actual_trim)
+        if not self.dry_run and delay > 0:
+            time.sleep(delay)
 
         # Update native broker stop order on Trading 212 for remaining shares
         self.place_broker_stop(pos, stop_price=pos.trailing_stop_loss)
@@ -863,6 +1244,9 @@ class PositionMonitor:
 
         # Cancel all pending broker orders on Trading 212
         self.cancel_all_broker_orders(pos)
+        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        if not self.dry_run and delay > 0:
+            time.sleep(delay)
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 
@@ -889,6 +1273,9 @@ class PositionMonitor:
 
         # Cancel all pending broker orders on Trading 212
         self.cancel_all_broker_orders(pos)
+        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        if not self.dry_run and delay > 0:
+            time.sleep(delay)
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 

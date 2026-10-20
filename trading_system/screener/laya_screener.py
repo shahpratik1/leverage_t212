@@ -374,7 +374,29 @@ class LayaScreener:
             reverse=True,
         )
 
-        return passed[: self.top_n]
+        # Diversified selection across market categories/sectors
+        # Ensures balanced representation across Tech, Indices, Commodities, Bonds, Crypto, Currencies
+        try:
+            from trading_system.data.leveraged_universe import LeveragedUniverse
+            univ = LeveragedUniverse()
+            category_counts: Dict[str, int] = {}
+            diversified: List[ScreenerResult] = []
+            overflow: List[ScreenerResult] = []
+            max_per_category = 2
+
+            for r in passed:
+                cat = univ.get_category_for_symbol(r.ticker)
+                count = category_counts.get(cat, 0)
+                if count < max_per_category:
+                    diversified.append(r)
+                    category_counts[cat] = count + 1
+                else:
+                    overflow.append(r)
+
+            return (diversified + overflow)[: self.top_n]
+        except Exception as exc:
+            logger.debug("Sector-diversified selection fallback: %s", exc)
+            return passed[: self.top_n]
 
     # ------------------------------------------------------------------
     # Filter predicate

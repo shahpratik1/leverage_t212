@@ -171,7 +171,7 @@ class TestMilestoneTSLHysteresis(unittest.TestCase):
             ticker="QQQ3l_EQ",
             quantity=-5.0,
             stop_price=410.0,
-            time_validity="GTC",
+            time_validity="GOOD_TILL_CANCEL",
         )
 
     def test_tp2_second_trim_25pct_and_clears_hysteresis(self):
@@ -388,7 +388,7 @@ class TestMilestoneTSLHysteresis(unittest.TestCase):
             ticker="QQQ3l_EQ",
             quantity=-7.5,
             stop_price=390.0,
-            time_validity="GTC",
+            time_validity="GOOD_TILL_CANCEL",
         )
 
         # Short position (cash inverse ETP)
@@ -413,7 +413,7 @@ class TestMilestoneTSLHysteresis(unittest.TestCase):
             ticker="QQQ3S_EQ",
             quantity=-10.0,
             stop_price=110.0,
-            time_validity="GTC",
+            time_validity="GOOD_TILL_CANCEL",
         )
 
     def test_tracked_position_hysteresis_state_serialization_round_trip(self):

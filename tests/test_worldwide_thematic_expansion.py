@@ -214,5 +214,105 @@ class TestWorldwideThematicExpansion(unittest.TestCase):
                         self.assertEqual(set(metrics.keys()), {"SPY", "QQQ"})
 
 
+    def test_multi_asset_worldwide_curated_expansion(self):
+        """Verify all 63 multi-asset pairs, aliases, crypto sessions, and categories."""
+        # 1. Total pairs count
+        self.assertEqual(len(self.universe.pairs), 63)
+
+        # 2. Key newly added assets lookup
+        expanded_checks = {
+            "UNG": ("Commodity", "3NGLl_EQ", "3NGSl_EQ"),
+            "URNM": ("Commodity", "URNMl_EQ", None),
+            "COFF": ("Commodity", "3COFl_EQ", "3COSVl_EQ"),
+            "WEAT": ("Commodity", "3WHLl_EQ", "3WETl_EQ"),
+            "3GIL": ("Fixed Income", "3GILl_EQ", "3GISl_EQ"),
+            "BUND": ("Fixed Income", "3BUNl_EQ", "3BUSl_EQ"),
+            "HYG": ("Fixed Income", "HYGl_EQ", None),
+            "SOL-USD": ("Crypto", "3SOLl_EQ", "3SOSl_EQ"),
+            "XRP-USD": ("Crypto", "XRPl_EQ", None),
+            "ADA-USD": ("Crypto", "ADAl_EQ", None),
+            "XLF": ("Sector ETF", "3LFLl_EQ", "3SFLl_EQ"),
+            "XLE": ("Sector ETF", "3LENl_EQ", "3SENl_EQ"),
+            "XLV": ("Sector ETF", "3LHLl_EQ", None),
+            "XLI": ("Sector ETF", "XLIl_EQ", None),
+            "SMH": ("Sector ETF", "3SMHl_EQ", "3SMSl_EQ"),
+            "NVO": ("Global Equity", "3NONl_EQ", None),
+            "MC.PA": ("Global Equity", "3LVHl_EQ", None),
+            "TM": ("Global Equity", "3TYTl_EQ", None),
+            "EURUSD=X": ("Currency", "USEUl_EQ", "EUUSl_EQ"),
+            "GBPUSD=X": ("Currency", "GBUSl_EQ", "USGBl_EQ"),
+            # Frontier themes: Quantum, Space, Memory, AI Infrastructure, Cybersecurity
+            "IONQ": ("Quantum Computing", "IONQl1_EQ", None),
+            "RGTI": ("Quantum Computing", "RGT3l_EQ", None),
+            "IBM": ("Quantum Computing", "IBM_US_EQ", None),
+            "RKLB": ("Space & Aerospace", "RKL3l_EQ", None),
+            "LUNR": ("Space & Aerospace", "LUNRl_EQ", None),
+            "MU": ("Memory & Storage", "MU2l_EQ", None),
+            "WDC": ("Memory & Storage", "WDC_US_EQ", None),
+            "AVGO": ("AI Infrastructure", "AVG3l_EQ", "SAVGl_EQ"),
+            "PLTR": ("AI Infrastructure", "3LPAl_EQ", "3SPAl_EQ"),
+            "ARM": ("AI Infrastructure", "ARM3l_EQ", None),
+            "CIBR": ("Cybersecurity", "CIBRl_EQ", None),
+        }
+
+        for underlying, (category, expected_long, expected_short) in expanded_checks.items():
+            pair = self.universe.get_pair_for_underlying(underlying)
+            self.assertIsNotNone(pair, f"Missing pair for {underlying}")
+            self.assertEqual(pair.category, category)
+            self.assertEqual(pair.long_3x_ticker, expected_long)
+            if expected_short is not None:
+                self.assertEqual(pair.short_3x_ticker, expected_short)
+            self.assertEqual(self.universe.get_execution_ticker(underlying, "LONG"), expected_long)
+            if expected_short is not None:
+                self.assertEqual(self.universe.get_execution_ticker(underlying, "SHORT"), expected_short)
+
+        # 3. Aliases resolution
+        self.assertEqual(self.universe.get_execution_ticker("NATGAS", "LONG"), "3NGLl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("COFFEE", "LONG"), "3COFl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("WHEAT", "LONG"), "3WHLl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("GILTS", "LONG"), "3GILl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("GERMAN_BUND", "LONG"), "3BUNl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("LVMH", "LONG"), "3LVHl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("NOVO", "LONG"), "3NONl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("TOYOTA", "LONG"), "3TYTl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("EURUSD", "LONG"), "USEUl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("GBPUSD", "LONG"), "GBUSl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SOL", "LONG"), "3SOLl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("XRP", "LONG"), "XRPl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("ADA", "LONG"), "ADAl_EQ")
+        # Frontier thematic aliases
+        self.assertEqual(self.universe.get_execution_ticker("MICRON", "LONG"), "MU2l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("BROADCOM", "LONG"), "AVG3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("PALANTIR", "LONG"), "3LPAl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("ROCKETLAB", "LONG"), "RKL3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("RIGETTI", "LONG"), "RGT3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPACE", "LONG"), "LUNRl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("CYBER", "LONG"), "CIBRl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("CYBERSECURITY", "LONG"), "CIBRl_EQ")
+
+        # 4. Weekend 24/7 crypto availability for new tokens
+        sat_date = datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc)
+        self.assertTrue(Trading212Client.is_asset_session_active("SOL-USD", now_utc=sat_date))
+        self.assertTrue(Trading212Client.is_asset_session_active("XRP-USD", now_utc=sat_date))
+        self.assertTrue(Trading212Client.is_asset_session_active("ADA-USD", now_utc=sat_date))
+
+        # 5. Category resolution via get_category_for_symbol
+        self.assertEqual(self.universe.get_category_for_symbol("SOL-USD"), "Crypto")
+        self.assertEqual(self.universe.get_category_for_symbol("3SOLl_EQ"), "Crypto")
+        self.assertEqual(self.universe.get_category_for_symbol("EURUSD=X"), "Currency")
+        self.assertEqual(self.universe.get_category_for_symbol("USEUl_EQ"), "Currency")
+        self.assertEqual(self.universe.get_category_for_symbol("XLF"), "Sector ETF")
+        self.assertEqual(self.universe.get_category_for_symbol("3LFLl_EQ"), "Sector ETF")
+        self.assertEqual(self.universe.get_category_for_symbol("BUND"), "Fixed Income")
+        self.assertEqual(self.universe.get_category_for_symbol("3GIL"), "Fixed Income")
+        self.assertEqual(self.universe.get_category_for_symbol("UNG"), "Commodity")
+        self.assertEqual(self.universe.get_category_for_symbol("IONQ"), "Quantum Computing")
+        self.assertEqual(self.universe.get_category_for_symbol("RKLB"), "Space & Aerospace")
+        self.assertEqual(self.universe.get_category_for_symbol("MU"), "Memory & Storage")
+        self.assertEqual(self.universe.get_category_for_symbol("AVGO"), "AI Infrastructure")
+        self.assertEqual(self.universe.get_category_for_symbol("CIBR"), "Cybersecurity")
+
+
 if __name__ == "__main__":
     unittest.main()
+

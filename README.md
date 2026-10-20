@@ -1,6 +1,6 @@
 # 3x & 5x Leveraged Quantitative Trading System
 
-[![Tests: 20/20 Passing](https://img.shields.io/badge/Tests-20%2F20%20Passing-emerald)](https://github.com)
+[![Tests: 107/107 Passing](https://img.shields.io/badge/Tests-107%2F107%20Passing-emerald)](https://github.com)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
 [![Broker: Trading 212](https://img.shields.io/badge/Broker-Trading%20212%20Invest-indigo)](https://trading212.com)
 [![Strategy: 3--RSI Mean Reversion](https://img.shields.io/badge/Strategy-3--RSI%20Mean%20Reversion-amber)](docs/strategy-3rsi.md)
@@ -16,13 +16,20 @@ The system pairs **System 1 (Laya Fast Reflex Screener, `<10ms` triage)** with *
 
 1. **Zero CFD Financing or Borrowing Costs**:
    - Executes both Long and Short market directions via standard spot equity orders on the London Stock Exchange (LSE) using paired **3x Long** and **3x Inverse Short** ETPs (GraniteShares, Leverage Shares, WisdomTree). Eliminates overnight CFD swap/interest fees.
-2. **Crash-Resilient Hybrid Broker Execution**:
-   - Automatically posts **native server-side GTC/DAY Stop Loss orders** (`POST /equity/orders/stop`) directly to Trading 212 upon trade entry. If your computer disconnects, restarts, or loses power, capital remains protected on the broker's matching engine.
+2. **Crash-Resilient Hybrid Broker Execution & State Reconciliation**:
+   - Automatically posts **native server-side GTC/DAY Stop Loss orders** (`POST /equity/orders/stop`) directly to Trading 212 upon trade entry. Continuous background reconciliation loop detects external fills, app closes, and synchronizes live share quantities.
 3. **Volatility Drag & Beta Decay Shield**:
    - Neutralizes the mathematical decay inherent to daily rebalanced leveraged instruments ($\frac{L_t}{L_0} \approx (\frac{S_t}{S_0})^\beta e^{\frac{\beta - \beta^2}{2} V_t}$) via Larry Connors' **3-RSI Mean Reversion model** ($\text{RSI}_3 \le 20$, exit at 5-SMA or $+1.0\text{R}$) with a strict **$\le 4$-day holding cap** and **ADX $\ge 20$** trend gating.
-4. **16:20 UTC Asymmetric Session Gap Protocol**:
+4. **Calculated Risk Gates (Spread, Beta Heat & Circuit Breaker)**:
+   - **Bid-Ask Spread Gate**: Real-time screening blocks entries when ETP relative spread $> 0.35\%$, protecting against illiquid London session spreads.
+   - **Sector Concentration & Beta Heat**: Enforces maximum concurrent exposure limits per sector (max 2 positions) and an aggregate portfolio beta ceiling ($\le 3.0\text{x}$ equity).
+   - **Daily Circuit Breaker**: Automatically suspends trading for 24h if portfolio daily drawdown breaches $-2.0\%$.
+5. **High-Throughput In-Memory Candle Cache**:
+   - Zero-latency cached market data ingestion eliminates API quota exhaustion and reduces universe screening overhead from seconds to milliseconds.
+6. **16:20 UTC Asymmetric Session Gap Protocol & Remote Panic Flatten**:
    - Automatically evacuates unhedged trades 10 minutes before the European market close (16:30 UTC), preventing catastrophic gap risk while US benchmark markets continue trading until 21:00 UTC.
-5. **Interactive Live Dashboard**:
+   - Features a one-click dashboard emergency **Panic Flatten** kill switch that instantly liquidates all positions and cancels active stops.
+7. **Interactive Live Dashboard**:
    - Zero-dependency local web interface (`http://localhost:8888`) featuring live broker connection status, real-time working stop order badges, price monitoring, and 1-click clipboard trade cards.
 
 ---

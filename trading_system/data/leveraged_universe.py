@@ -395,6 +395,326 @@ CURATED_3X_PAIRS: List[LeveragedPair] = [
         short_3x_name="N/A",
         currency="EUR",
     ),
+    # ── Commodities Expansion (Natural Gas, Uranium, Coffee, Wheat) ──────────
+    LeveragedPair(
+        underlying_symbol="UNG",
+        name="Natural Gas",
+        category="Commodity",
+        long_3x_ticker="3NGLl_EQ",
+        long_3x_name="WisdomTree Natural Gas 3x Daily Leveraged",
+        short_3x_ticker="3NGSl_EQ",
+        short_3x_name="WisdomTree Natural Gas 3x Daily Short",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="URNM",
+        name="Uranium & Nuclear Energy",
+        category="Commodity",
+        long_3x_ticker="URNMl_EQ",
+        long_3x_name="Global X Uranium ETF (ETP)",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="COFF",
+        name="Coffee",
+        category="Commodity",
+        long_3x_ticker="3COFl_EQ",
+        long_3x_name="WisdomTree Coffee 3x Daily Leveraged",
+        short_3x_ticker="3COSVl_EQ",
+        short_3x_name="WisdomTree Coffee 3x Daily Short",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="WEAT",
+        name="Wheat (Agriculture)",
+        category="Commodity",
+        long_3x_ticker="3WHLl_EQ",
+        long_3x_name="WisdomTree Wheat 3x Daily Leveraged",
+        short_3x_ticker="3WETl_EQ",
+        short_3x_name="WisdomTree Wheat 3x Daily Short",
+        currency="USD",
+    ),
+    # ── Sovereign Bonds & Fixed Income Expansion ──────────────────────────────
+    LeveragedPair(
+        underlying_symbol="3GIL",
+        name="UK Gilts (10Y Gilt)",
+        category="Fixed Income",
+        long_3x_ticker="3GILl_EQ",
+        long_3x_name="WisdomTree UK Gilts 10Y 3x Daily Leveraged",
+        short_3x_ticker="3GISl_EQ",
+        short_3x_name="WisdomTree UK Gilts 10Y 3x Daily Short",
+        currency="GBP",
+    ),
+    LeveragedPair(
+        underlying_symbol="BUND",
+        name="German Euro-Bund (10Y Bund)",
+        category="Fixed Income",
+        long_3x_ticker="3BUNl_EQ",
+        long_3x_name="WisdomTree Euro-Bund 10Y 3x Daily Leveraged",
+        short_3x_ticker="3BUSl_EQ",
+        short_3x_name="WisdomTree Euro-Bund 10Y 3x Daily Short",
+        currency="EUR",
+    ),
+    LeveragedPair(
+        underlying_symbol="HYG",
+        name="High Yield Corporate Bonds",
+        category="Fixed Income",
+        long_3x_ticker="HYGl_EQ",
+        long_3x_name="iShares $ High Yield Corp Bond UCITS ETF",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    # ── Expanded 24/7 Crypto ──────────────────────────────────────────────────
+    LeveragedPair(
+        underlying_symbol="SOL-USD",
+        name="Solana",
+        category="Crypto",
+        long_3x_ticker="3SOLl_EQ",
+        long_3x_name="Leverage Shares 3x Long Solana ETP",
+        short_3x_ticker="3SOSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Solana ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="XRP-USD",
+        name="Ripple (XRP)",
+        category="Crypto",
+        long_3x_ticker="XRPl_EQ",
+        long_3x_name="21Shares Ripple XRP ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="ADA-USD",
+        name="Cardano (ADA)",
+        category="Crypto",
+        long_3x_ticker="ADAl_EQ",
+        long_3x_name="21Shares Cardano ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    # ── Macro Sector SPDRs & Thematic ETFs ────────────────────────────────────
+    LeveragedPair(
+        underlying_symbol="XLF",
+        name="Financial Select Sector",
+        category="Sector ETF",
+        long_3x_ticker="3LFLl_EQ",
+        long_3x_name="GraniteShares 3x Long Financials ETP",
+        short_3x_ticker="3SFLl_EQ",
+        short_3x_name="GraniteShares 3x Short Financials ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="XLE",
+        name="Energy Select Sector",
+        category="Sector ETF",
+        long_3x_ticker="3LENl_EQ",
+        long_3x_name="GraniteShares 3x Long Energy ETP",
+        short_3x_ticker="3SENl_EQ",
+        short_3x_name="GraniteShares 3x Short Energy ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="XLV",
+        name="Health Care Select Sector",
+        category="Sector ETF",
+        long_3x_ticker="3LHLl_EQ",
+        long_3x_name="GraniteShares 3x Long Healthcare ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="XLI",
+        name="Industrial Select Sector",
+        category="Sector ETF",
+        long_3x_ticker="XLIl_EQ",
+        long_3x_name="Industrial Select Sector SPDR Fund",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="SMH",
+        name="VanEck Semiconductor ETF",
+        category="Sector ETF",
+        long_3x_ticker="3SMHl_EQ",
+        long_3x_name="Leverage Shares 3x Long Semiconductors ETP",
+        short_3x_ticker="3SMSl_EQ",
+        short_3x_name="Leverage Shares -3x Short Semiconductors ETP",
+        currency="USD",
+    ),
+    # ── Worldwide Blue-Chips & Global Equities ────────────────────────────────
+    LeveragedPair(
+        underlying_symbol="NVO",
+        name="Novo Nordisk (Denmark)",
+        category="Global Equity",
+        long_3x_ticker="3NONl_EQ",
+        long_3x_name="Leverage Shares 3x Long Novo Nordisk",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="MC.PA",
+        name="LVMH Moet Hennessy (France)",
+        category="Global Equity",
+        long_3x_ticker="3LVHl_EQ",
+        long_3x_name="Leverage Shares 3x Long LVMH",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="EUR",
+    ),
+    LeveragedPair(
+        underlying_symbol="TM",
+        name="Toyota Motor (Japan)",
+        category="Global Equity",
+        long_3x_ticker="3TYTl_EQ",
+        long_3x_name="Leverage Shares 3x Long Toyota Motor",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    # ── Currency ETPs (Spot FX Proxy on Invest) ──────────────────────────────
+    LeveragedPair(
+        underlying_symbol="EURUSD=X",
+        name="USD / EUR Currency Pair",
+        category="Currency",
+        long_3x_ticker="USEUl_EQ",
+        long_3x_name="WisdomTree Long USD Short EUR ETP",
+        short_3x_ticker="EUUSl_EQ",
+        short_3x_name="WisdomTree Long EUR Short USD ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="GBPUSD=X",
+        name="USD / GBP Currency Pair",
+        category="Currency",
+        long_3x_ticker="GBUSl_EQ",
+        long_3x_name="WisdomTree Long USD Short GBP ETP",
+        short_3x_ticker="USGBl_EQ",
+        short_3x_name="WisdomTree Long GBP Short USD ETP",
+        currency="USD",
+    ),
+    # ── Quantum Computing Frontier Theme ────────────────────────────────────
+    LeveragedPair(
+        underlying_symbol="IONQ",
+        name="IonQ (Trapped-Ion Quantum Computing)",
+        category="Quantum Computing",
+        long_3x_ticker="IONQl1_EQ",
+        long_3x_name="Leverage Shares 3x Long IONQ ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="RGTI",
+        name="Rigetti Computing (Superconducting Quantum)",
+        category="Quantum Computing",
+        long_3x_ticker="RGT3l_EQ",
+        long_3x_name="Leverage Shares 3x Long Rigetti Computing ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="IBM",
+        name="IBM (Enterprise Quantum Heron & AI Infra)",
+        category="Quantum Computing",
+        long_3x_ticker="IBM_US_EQ",
+        long_3x_name="International Business Machines Corp",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    # ── Space & Aerospace Frontier Theme ────────────────────────────────────
+    LeveragedPair(
+        underlying_symbol="RKLB",
+        name="Rocket Lab (Orbital Launch & Space Systems)",
+        category="Space & Aerospace",
+        long_3x_ticker="RKL3l_EQ",
+        long_3x_name="Leverage Shares 3x Long Rocket Lab ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="LUNR",
+        name="Global X Space Tech & Satellite ETF",
+        category="Space & Aerospace",
+        long_3x_ticker="LUNRl_EQ",
+        long_3x_name="Global X Space Tech ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    # ── Memory & High-Bandwidth Storage (HBM & AI Data) ─────────────────────
+    LeveragedPair(
+        underlying_symbol="MU",
+        name="Micron Technology (HBM3e Memory Leader)",
+        category="Memory & Storage",
+        long_3x_ticker="MU2l_EQ",
+        long_3x_name="Leverage Shares 2x Micron Technology ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="WDC",
+        name="Western Digital (Enterprise Flash & Storage)",
+        category="Memory & Storage",
+        long_3x_ticker="WDC_US_EQ",
+        long_3x_name="Western Digital Corp",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    # ── Trillion-Dollar Mega-Caps & Enterprise AI Infrastructure ───────────
+    LeveragedPair(
+        underlying_symbol="AVGO",
+        name="Broadcom (AI Custom Silicon & XPU Networking)",
+        category="AI Infrastructure",
+        long_3x_ticker="AVG3l_EQ",
+        long_3x_name="Leverage Shares 3x Long Broadcom ETP",
+        short_3x_ticker="SAVGl_EQ",
+        short_3x_name="Leverage Shares -3x Short Broadcom ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="PLTR",
+        name="Palantir (Enterprise AI & Defense Operating System)",
+        category="AI Infrastructure",
+        long_3x_ticker="3LPAl_EQ",
+        long_3x_name="GraniteShares 3x Long Palantir ETP",
+        short_3x_ticker="3SPAl_EQ",
+        short_3x_name="GraniteShares 3x Short Palantir ETP",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="ARM",
+        name="ARM Holdings (Global AI Architecture)",
+        category="AI Infrastructure",
+        long_3x_ticker="ARM3l_EQ",
+        long_3x_name="Leverage Shares 3x Long ARM ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
+    LeveragedPair(
+        underlying_symbol="CIBR",
+        name="Cybersecurity & Cloud Defense ETF",
+        category="Cybersecurity",
+        long_3x_ticker="CIBRl_EQ",
+        long_3x_name="First Trust Nasdaq Cybersecurity ETP",
+        short_3x_ticker="None",
+        short_3x_name="N/A",
+        currency="USD",
+    ),
 ]
 
 
@@ -417,6 +737,35 @@ INDEX_ALIASES: Dict[str, str] = {
     "NIFTY50": "INDA",
     "ASML.AS": "ASML",
     "ASML.NA": "ASML",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+    "ADA": "ADA-USD",
+    "NATGAS": "UNG",
+    "NG=F": "UNG",
+    "KC=F": "COFF",
+    "COFFEE": "COFF",
+    "WHEAT": "WEAT",
+    "ZW=F": "WEAT",
+    "GILTS": "3GIL",
+    "GLTS": "3GIL",
+    "FGBL": "BUND",
+    "GERMAN_BUND": "BUND",
+    "LVMH": "MC.PA",
+    "LVMUY": "MC.PA",
+    "NOVO": "NVO",
+    "NOVO-B.CO": "NVO",
+    "TOYOTA": "TM",
+    "7203.T": "TM",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "MICRON": "MU",
+    "BROADCOM": "AVGO",
+    "PALANTIR": "PLTR",
+    "ROCKETLAB": "RKLB",
+    "RIGETTI": "RGTI",
+    "SPACE": "LUNR",
+    "CYBER": "CIBR",
+    "CYBERSECURITY": "CIBR",
 }
 
 
@@ -522,6 +871,55 @@ class LeveragedUniverse:
     def get_5x_pairs(self) -> List[LeveragedPair]:
         """Return all pairs in the universe that support 5x leverage."""
         return [p for p in self.pairs if p.has_5x]
+
+    def get_pair_for_etp(self, etp_ticker: str) -> Optional[LeveragedPair]:
+        """Lookup LeveragedPair by any of its ETP execution tickers."""
+        clean = (etp_ticker or "").strip().upper()
+        for p in self.pairs:
+            matches = [
+                (p.long_3x_ticker or "").upper(),
+                (p.short_3x_ticker or "").upper(),
+                (p.long_5x_ticker or "").upper(),
+                (p.short_5x_ticker or "").upper(),
+            ]
+            if clean in matches:
+                return p
+        return None
+
+    def get_category_for_symbol(self, symbol: str) -> str:
+        """Return the market category/sector cluster for an underlying asset or ETP ticker.
+
+        Returns:
+            str: Category such as 'Index', 'Tech Equity', 'Commodity', 'Fixed Income',
+                 'Global Tech', 'Global Index', 'Thematic', or fallback 'General Equity'.
+        """
+        # 1. Direct underlying lookup
+        pair = self.get_pair_for_underlying(symbol)
+        if pair:
+            return pair.category
+
+        # 2. ETP ticker lookup
+        pair_etp = self.get_pair_for_etp(symbol)
+        if pair_etp:
+            return pair_etp.category
+
+        # 3. Heuristic matching
+        clean = (symbol or "").upper()
+        if any(c in clean for c in ("BTC", "ETH", "SOL", "XRP", "ADA")):
+            return "Crypto"
+        if any(curr in clean for curr in ("EURUSD", "GBPUSD", "USEU", "EUUS", "GBUS", "USGB")):
+            return "Currency"
+        if any(s in clean for s in ("XLF", "XLE", "XLV", "XLI", "SMH", "3LFL", "3LEN", "3LHL", "3SMH")):
+            return "Sector ETF"
+        if any(comm in clean for comm in ("GLD", "SLV", "USO", "WTI", "GOLD", "UNG", "URNM", "COFF", "WEAT", "WHEAT", "CPR")):
+            return "Commodity"
+        if any(fi in clean for fi in ("TLT", "BOND", "TYL", "TREASURY", "GILT", "BUND", "HYG", "3GIL", "3BUN")):
+            return "Fixed Income"
+        if any(tech in clean for tech in ("NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOG", "AMD", "TSM", "MAGS", "QQQ")):
+            return "Tech Equity"
+        if any(idx in clean for idx in ("SPY", "DAX", "FTSE", "HSI", "CAC", "MIB", "KOR", "JPN")):
+            return "Index"
+        return "General Equity"
 
     def get_all_execution_tickers(self) -> List[str]:
         """Return list of all active Trading 212 execution tickers (3x only per policy)."""

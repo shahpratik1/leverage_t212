@@ -108,7 +108,7 @@ class Settings:
     # Screener parameters
     SCREENER_MIN_SETUP_SCORE: str = "favorable"
     SCREENER_MAX_CATALYST_RISK: float = 0.25
-    SCREENER_TOP_N: int = 5
+    SCREENER_TOP_N: int = 10
     MIN_ADX_TREND: float = 20.0  # Trend strength gate for 3x leverage
 
     # 3-RSI Mean Reversion Strategy (High Win-Rate Institutional Dip Buying)
@@ -134,6 +134,23 @@ class Settings:
     ENFORCE_LONG_BREAKEVEN_OVERNIGHT: bool = True
     EARNINGS_BLACKOUT_HOURS: int = 24
     RATE_LIMIT_INTER_CALL_DELAY: float = 1.25  # seconds between Trading 212 API calls (strictly obeys 1 req/sec quota)
+
+    # Advanced Risk & Safety Gates
+    ENFORCE_SPREAD_GATE: bool = True
+    MAX_BID_ASK_SPREAD_PCT: float = 0.0035    # 0.35% max relative spread
+    ENFORCE_CORRELATION_LIMITS: bool = True
+    MAX_SECTOR_POSITIONS: int = 2             # Max concurrent positions per sector cluster
+    MAX_PORTFOLIO_BETA_HEAT: float = 3.0      # Max aggregate portfolio beta exposure
+    ENFORCE_DAILY_CIRCUIT_BREAKER: bool = True
+    DAILY_MAX_DRAWDOWN_PCT: float = 0.02      # 2.0% max daily portfolio drawdown
+
+    # Speed & Cache Optimizations
+    ENABLE_CANDLE_CACHE: bool = True
+    CANDLE_CACHE_TTL_SECONDS: int = 300       # 5 minutes cache TTL
+
+    # Broker Reconciliation & Safety Kill Switch
+    RECONCILIATION_INTERVAL_SECONDS: int = 60
+    PANIC_FLATTEN_TOKEN: str = ""
 
     # Notifications
     TELEGRAM_BOT_TOKEN: str = ""
@@ -242,6 +259,68 @@ class Settings:
             env_watchlist = os.environ.get("WATCHLIST")
             if env_watchlist:
                 self.WATCHLIST = [s.strip() for s in env_watchlist.split(",") if s.strip()]
+
+        # Advanced Risk & Safety Gates env loading
+        env_spread_gate = os.environ.get("ENFORCE_SPREAD_GATE")
+        if env_spread_gate is not None:
+            self.ENFORCE_SPREAD_GATE = env_spread_gate.strip().lower() in ("1", "true", "yes", "t")
+
+        env_max_spread = os.environ.get("MAX_BID_ASK_SPREAD_PCT")
+        if env_max_spread:
+            try:
+                self.MAX_BID_ASK_SPREAD_PCT = float(env_max_spread.strip())
+            except ValueError:
+                pass
+
+        env_corr_limits = os.environ.get("ENFORCE_CORRELATION_LIMITS")
+        if env_corr_limits is not None:
+            self.ENFORCE_CORRELATION_LIMITS = env_corr_limits.strip().lower() in ("1", "true", "yes", "t")
+
+        env_max_sector = os.environ.get("MAX_SECTOR_POSITIONS")
+        if env_max_sector:
+            try:
+                self.MAX_SECTOR_POSITIONS = int(env_max_sector.strip())
+            except ValueError:
+                pass
+
+        env_max_beta = os.environ.get("MAX_PORTFOLIO_BETA_HEAT")
+        if env_max_beta:
+            try:
+                self.MAX_PORTFOLIO_BETA_HEAT = float(env_max_beta.strip())
+            except ValueError:
+                pass
+
+        env_cb = os.environ.get("ENFORCE_DAILY_CIRCUIT_BREAKER")
+        if env_cb is not None:
+            self.ENFORCE_DAILY_CIRCUIT_BREAKER = env_cb.strip().lower() in ("1", "true", "yes", "t")
+
+        env_cb_drawdown = os.environ.get("DAILY_MAX_DRAWDOWN_PCT")
+        if env_cb_drawdown:
+            try:
+                self.DAILY_MAX_DRAWDOWN_PCT = float(env_cb_drawdown.strip())
+            except ValueError:
+                pass
+
+        env_candle_cache = os.environ.get("ENABLE_CANDLE_CACHE")
+        if env_candle_cache is not None:
+            self.ENABLE_CANDLE_CACHE = env_candle_cache.strip().lower() in ("1", "true", "yes", "t")
+
+        env_cache_ttl = os.environ.get("CANDLE_CACHE_TTL_SECONDS")
+        if env_cache_ttl:
+            try:
+                self.CANDLE_CACHE_TTL_SECONDS = int(env_cache_ttl.strip())
+            except ValueError:
+                pass
+
+        env_reconcile = os.environ.get("RECONCILIATION_INTERVAL_SECONDS")
+        if env_reconcile:
+            try:
+                self.RECONCILIATION_INTERVAL_SECONDS = int(env_reconcile.strip())
+            except ValueError:
+                pass
+
+        if not self.PANIC_FLATTEN_TOKEN:
+            self.PANIC_FLATTEN_TOKEN = os.environ.get("PANIC_FLATTEN_TOKEN", "")
 
     @property
     def api_base_url(self) -> str:

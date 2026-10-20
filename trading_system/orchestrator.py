@@ -147,10 +147,14 @@ class Orchestrator:
             state_file=settings.ACTIVE_TRADES_PATH,
             dry_run=self.dry_run,
         )
+        self.session_start_equity: Optional[float] = None
+        self._last_reconciliation_time: float = 0.0
         # Synchronize broker-native GTC Stop Loss / TSL orders for active positions
         if not self.dry_run:
             try:
+                self.position_monitor.reconcile_with_broker(adopt_untracked=True)
                 self.position_monitor.sync_broker_stops()
+                self.position_monitor.apply_daily_rollover_stops()
             except Exception as exc:
                 logger.warning("Initial broker stop sync deferred: %s", exc)
 
@@ -410,7 +414,17 @@ class Orchestrator:
             self._log_trade(card, executed=False, reason=card.decision)
             return False
 
+        # ── System Halt Check (from Panic Flatten) ───────────────
+        if self.position_monitor and (
+            getattr(self.position_monitor, "is_system_halted", lambda: False)()
+            or getattr(self.position_monitor, "is_halted", False)
+        ):
+            logger.warning("Execution rejected for %s — system is currently HALTED following panic flatten", card.ticker)
+            self._log_trade(card, executed=False, reason="System is HALTED")
+            return False
+
         # ── Pre-trade validation ─────────────────────────────────
+        account_total = getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)
         if available_cash is not None and positions is not None:
             account_free = available_cash
             current_positions = positions
@@ -418,18 +432,42 @@ class Orchestrator:
             try:
                 account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
                 account_free = account.free
+                account_total = account.total or account_total
                 current_positions = self.t212.get_portfolio()
             except Trading212Error as exc:
                 if self.dry_run:
                     logger.warning("Pre-trade broker check unavailable (%s) — using dry-run simulation context", exc)
                     account_free = 10000.0
+                    account_total = 10000.0
                     current_positions = []
                 else:
                     logger.error("Pre-trade check failed: %s", exc)
                     self._log_trade(card, executed=False, reason=str(exc))
                     return False
 
-        valid, reason = self.risk_manager.validate_trade(card, account_free, current_positions)
+        if self.session_start_equity is None or self.session_start_equity <= 0:
+            self.session_start_equity = account_total
+
+        # Daily Drawdown Circuit Breaker Gate
+        if getattr(settings, "ENFORCE_DAILY_CIRCUIT_BREAKER", True):
+            tripped, cb_reason = self.risk_manager.check_circuit_breaker(
+                current_equity=account_total,
+                session_start_equity=self.session_start_equity,
+            )
+            if tripped:
+                logger.critical("Trade rejected: %s", cb_reason)
+                self._log_trade(card, executed=False, reason=cb_reason)
+                return False
+
+        # Real-time Bid-Ask Spread Gate
+        spread_pct = None
+        if getattr(settings, "ENFORCE_SPREAD_GATE", True):
+            spread_info = MarketDataProvider.get_bid_ask_spread(card.trading212_ticker)
+            spread_pct = spread_info.get("spread_pct")
+
+        valid, reason = self.risk_manager.validate_trade(
+            card, account_free, current_positions, spread_pct=spread_pct, account_equity=account_total
+        )
         if not valid:
             logger.warning("Trade validation FAILED for %s: %s", card.ticker, reason)
             self._log_trade(card, executed=False, reason=reason)
@@ -602,16 +640,34 @@ class Orchestrator:
             try:
                 account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
                 running_free_cash = account.free
+            except Exception:
+                running_free_cash = 10000.0
+
+            running_positions = []
+            try:
                 running_positions = list(self.t212.get_portfolio())
-            except Trading212Error as exc:
-                if self.dry_run:
-                    running_free_cash = 10000.0
-                    running_positions = []
-                else:
+            except Exception as exc:
+                if not self.dry_run:
                     logger.error("Batch pre-trade broker check failed: %s", exc)
                     for _, card in actionable:
                         self._log_trade(card, executed=False, reason=f"Broker pre-check failed: {exc}")
                     return []
+                logger.debug("Broker portfolio query notice in batch execution: %s", exc)
+
+            # Ensure all local active positions from position_monitor are included in risk checks
+            held_tickers = {getattr(p, "ticker", "") for p in running_positions}
+            for p in self.position_monitor.positions.values():
+                if not p.is_closed and p.remaining_quantity > 0 and p.ticker not in held_tickers:
+                    running_positions.append(Position(
+                        ticker=p.ticker,
+                        quantity=p.remaining_quantity,
+                        average_price=p.entry_price,
+                        current_price=getattr(p, "highest_price", p.entry_price),
+                        ppl=0.0,
+                        max_buy=0.0,
+                        max_sell=0.0,
+                    ))
+                    held_tickers.add(p.ticker)
 
             executed_cards: List[DecisionCard] = []
             is_test_mode = getattr(self.t212, "rate_limit_delay", 1.25) < 0.5
@@ -666,6 +722,30 @@ class Orchestrator:
         """Execute one complete Scan → Filter → Debate → Execute cycle."""
         logger.info("━━━ Starting 3x Quantitative Cycle at %s ━━━",
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+        # Emergency System Halt Check
+        if self.position_monitor and getattr(self.position_monitor, "is_system_halted", lambda: False)():
+            logger.warning("Cycle aborted: System is currently HALTED following emergency panic flatten.")
+            return []
+
+        # Step 0: Broker Portfolio Reconciliation & Position Adoption
+        try:
+            recon = self.position_monitor.reconcile_with_broker(adopt_untracked=True)
+            if recon.get("adopted_from_broker"):
+                logger.info(
+                    "Synchronized with Trading 212 account: Adopted %d active broker positions: %s",
+                    len(recon["adopted_from_broker"]), recon["adopted_from_broker"],
+                )
+            if recon.get("closed_externally"):
+                logger.info(
+                    "Reconciliation closed %d positions not found on broker: %s",
+                    len(recon["closed_externally"]), recon["closed_externally"],
+                )
+            # Apply daily rollover profit-locks on active positions
+            if not self.dry_run:
+                self.position_monitor.apply_daily_rollover_stops()
+        except Exception as recon_exc:
+            logger.debug("Initial broker reconciliation notice: %s", recon_exc)
 
         # Step 1: Ingestion
         metrics_dict = self.ingest_universe_data()
@@ -734,6 +814,21 @@ class Orchestrator:
             try:
                 now = time.time()
                 now_utc = datetime.now(timezone.utc)
+
+                # Daily Circuit Breaker Calendar Date Rollover Reset
+                today_date = now_utc.strftime("%Y-%m-%d")
+                if getattr(self, "_last_session_cb_date", "") != today_date:
+                    try:
+                        acc = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+                        new_eq = acc.total or settings.DEFAULT_ACCOUNT_EQUITY
+                        self.session_start_equity = new_eq
+                        if self.risk_manager:
+                            self.risk_manager.reset_circuit_breaker(new_session_equity=new_eq)
+                        self._last_session_cb_date = today_date
+                        logger.info("🌅 New trading session (%s): Reset daily circuit breaker. Baseline equity: $%.2f", today_date, new_eq)
+                    except Exception as cb_reset_exc:
+                        logger.warning("Could not reset session circuit breaker on rollover: %s", cb_reset_exc)
+
                 active_tickers = list(self.position_monitor.positions.keys()) if self.position_monitor.positions else ["QQQ3l_EQ", "SPY_US_EQ"]
                 market_open = self.t212.is_any_market_open(active_tickers, current_time=now_utc)
 
@@ -780,6 +875,14 @@ class Orchestrator:
 
                     self.position_monitor.monitor_tick(current_prices)
                     self._update_dashboard()
+
+                # 3. Periodic Broker Portfolio Reconciliation Loop
+                if now - getattr(self, "_last_reconciliation_time", 0.0) >= getattr(settings, "RECONCILIATION_INTERVAL_SECONDS", 60):
+                    rec = self.position_monitor.reconcile_with_broker()
+                    if rec.get("closed_externally") or rec.get("quantity_synced"):
+                        logger.info("Broker reconciliation sync: %s", rec)
+                        self._update_dashboard()
+                    self._last_reconciliation_time = now
 
                 time.sleep(monitor_interval_seconds)
 

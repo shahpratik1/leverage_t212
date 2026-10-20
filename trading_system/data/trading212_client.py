@@ -883,6 +883,22 @@ class Trading212Client:
                 return i
         return None
 
+    def get_quote(self, ticker: str) -> Dict[str, float]:
+        """Get latest bid, ask, mid price and relative spread for an instrument.
+
+        Queries portfolio if held, then delegates to MarketDataProvider.
+        """
+        for p in self.get_portfolio():
+            if p.ticker == ticker and p.current_price > 0:
+                approx_spread = 0.0018
+                return {
+                    "bid": round(p.current_price * (1.0 - approx_spread / 2.0), 4),
+                    "ask": round(p.current_price * (1.0 + approx_spread / 2.0), 4),
+                    "mid": p.current_price,
+                    "spread_pct": approx_spread,
+                }
+        return MarketDataProvider.get_bid_ask_spread(ticker)
+
     def place_market_order(self, ticker: str, quantity: float) -> OrderResult:
         """Place a market order (positive quantity = BUY, negative = SELL)."""
         data = self._request(
@@ -913,16 +929,17 @@ class Trading212Client:
         ticker: str,
         quantity: float,
         limit_price: float,
-        time_validity: str = "GTC",
+        time_validity: str = "GOOD_TILL_CANCEL",
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
     ) -> OrderResult:
         """Place a limit order."""
+        validity = "GOOD_TILL_CANCEL" if time_validity in ("GTC", "GOOD_TILL_CANCEL") else time_validity
         payload: Dict[str, Any] = {
             "ticker": ticker,
             "quantity": quantity,
             "limitPrice": limit_price,
-            "timeValidity": time_validity,
+            "timeValidity": validity,
         }
         if stop_loss is not None:
             payload["stopLoss"] = stop_loss
@@ -938,14 +955,15 @@ class Trading212Client:
         ticker: str,
         quantity: float,
         stop_price: float,
-        time_validity: str = "GTC",
+        time_validity: str = "GOOD_TILL_CANCEL",
     ) -> OrderResult:
         """Place a stop order."""
+        validity = "GOOD_TILL_CANCEL" if time_validity in ("GTC", "GOOD_TILL_CANCEL") else time_validity
         payload = {
             "ticker": ticker,
             "quantity": quantity,
             "stopPrice": stop_price,
-            "timeValidity": time_validity,
+            "timeValidity": validity,
         }
         data = self._request("POST", "/equity/orders/stop", json_data=payload)
         self._orders_cache = None
@@ -984,7 +1002,7 @@ class Trading212Client:
         upper_ticker = ticker.upper()
 
         # 1. Crypto (24/7)
-        if "BTC" in upper_ticker or "ETH" in upper_ticker:
+        if any(c in upper_ticker for c in ("BTC", "ETH", "SOL", "XRP", "ADA", "DOGE")):
             exchange = "CRYPTO"
             open_time = dt_time(0, 0)
             close_time = dt_time(23, 59, 59)
@@ -1199,6 +1217,103 @@ class MarketDataProvider:
 
     LAST_FETCH_WAS_SYNTHETIC: bool = False
     SYNTHETIC_TICKERS: set = set()
+    _CANDLE_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+    @classmethod
+    def clear_candle_cache(cls) -> None:
+        """Clear cached candles in memory."""
+        cls._CANDLE_CACHE.clear()
+
+    @classmethod
+    def get_bid_ask_spread(cls, symbol: str) -> Dict[str, float]:
+        """Estimate or fetch current bid, ask, and relative percentage spread.
+
+        Returns:
+            Dict containing 'bid', 'ask', 'mid', and 'spread_pct' (as a decimal, e.g. 0.002 = 0.20%).
+        """
+        raw_sym = (symbol or "").strip()
+        clean = raw_sym.upper()
+        # Normalize Trading 212 execution tickers to Yahoo Finance format
+        if clean.endswith("L_EQ"):
+            clean = clean[:-4] + ".L"
+        elif clean.endswith("_US_EQ"):
+            clean = clean[:-6]
+        elif clean.endswith("D_EQ") or clean.endswith("_DE_EQ"):
+            clean = clean.split("_")[0] + ".DE"
+
+        # 1. Try Yahoo Finance chart meta quote
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{clean}?range=1d&interval=1m"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            regular_price = float(meta.get("regularMarketPrice", 0.0) or 0.0)
+            ask = float(meta.get("ask", 0.0) or 0.0)
+            bid = float(meta.get("bid", 0.0) or 0.0)
+            if ask > 0 and bid > 0 and ask >= bid:
+                mid = (ask + bid) / 2.0
+                spread_pct = (ask - bid) / mid if mid > 0 else 0.0
+                return {"bid": bid, "ask": ask, "mid": mid, "spread_pct": spread_pct}
+            elif regular_price > 0:
+                approx_spread = 0.0018
+                return {
+                    "bid": round(regular_price * (1.0 - approx_spread / 2.0), 4),
+                    "ask": round(regular_price * (1.0 + approx_spread / 2.0), 4),
+                    "mid": regular_price,
+                    "spread_pct": approx_spread,
+                }
+        except Exception:
+            pass
+
+        # 2. Fallback to latest daily close
+        try:
+            candles = cls.get_daily_candles(clean, period="5d")
+            price = 0.0
+            if hasattr(candles, "empty") and not candles.empty:
+                price = float(candles["close"].iloc[-1])
+            elif isinstance(candles, list) and candles:
+                price = float(candles[-1]["close"])
+            if price > 0:
+                approx_spread = 0.0020
+                return {
+                    "bid": round(price * (1.0 - approx_spread / 2.0), 4),
+                    "ask": round(price * (1.0 + approx_spread / 2.0), 4),
+                    "mid": price,
+                    "spread_pct": approx_spread,
+                }
+        except Exception:
+            pass
+
+        # 3. Fallback to underlying proxy spread if ETP quote was not found directly
+        try:
+            from trading_system.data.leveraged_universe import LeveragedUniverse
+            univ = LeveragedUniverse()
+            pair = univ.get_pair_for_underlying(raw_sym)
+            if not pair:
+                for p in univ.pairs:
+                    if raw_sym.upper() in (
+                        p.long_3x_ticker.upper(),
+                        p.short_3x_ticker.upper(),
+                        (p.long_5x_ticker or "").upper(),
+                        (p.short_5x_ticker or "").upper(),
+                    ):
+                        pair = p
+                        break
+            if pair and pair.underlying_symbol and pair.underlying_symbol.upper() != raw_sym.upper():
+                und_spread = cls.get_bid_ask_spread(pair.underlying_symbol)
+                if und_spread.get("spread_pct", 0.0) > 0:
+                    proxy_pct = round(und_spread["spread_pct"] * 1.5, 4)
+                    return {
+                        "bid": round(und_spread["bid"], 4),
+                        "ask": round(und_spread["ask"], 4),
+                        "mid": und_spread["mid"],
+                        "spread_pct": proxy_pct,
+                    }
+        except Exception:
+            pass
+
+        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread_pct": 0.0}
 
     @classmethod
     def is_ticker_synthetic(cls, symbol: str) -> bool:
@@ -1224,6 +1339,16 @@ class MarketDataProvider:
             "USO": "uso.us",
             "TSM": "tsm.us",
             "TLT": "tlt.us",
+            "IONQ": "ionq.us",
+            "RGTI": "rgti.us",
+            "RKLB": "rklb.us",
+            "MU": "mu.us",
+            "WDC": "wdc.us",
+            "AVGO": "avgo.us",
+            "PLTR": "pltr.us",
+            "ARM": "arm.us",
+            "CIBR": "cibr.us",
+            "IBM": "ibm.us",
             "FTSE": "^ukx",
             "GDAXI": "^dax",
             "HSI": "^hsi",
@@ -1337,8 +1462,24 @@ class MarketDataProvider:
         return []
 
     @staticmethod
-    def get_daily_candles(symbol: str, period: str = "1y") -> Any:
+    def get_daily_candles(symbol: str, period: str = "1y", force_refresh: bool = False) -> Any:
         """Get daily OHLCV candles across yfinance, Yahoo Chart, Stooq, Polygon, Finnhub, or synthetic fallback."""
+        try:
+            from trading_system.config import settings
+            use_cache = getattr(settings, "ENABLE_CANDLE_CACHE", True)
+            ttl = getattr(settings, "CANDLE_CACHE_TTL_SECONDS", 300)
+        except Exception:
+            use_cache = True
+            ttl = 300
+
+        cache_key = f"daily_{symbol.upper()}_{period}"
+        if use_cache and not force_refresh and cache_key in MarketDataProvider._CANDLE_CACHE:
+            ts, val = MarketDataProvider._CANDLE_CACHE[cache_key]
+            if time.time() - ts < ttl:
+                return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
+
+        result = None
+
         # 1. Try yfinance if installed
         if HAS_DATA_LIBS and yf is not None:
             try:
@@ -1352,58 +1493,86 @@ class MarketDataProvider:
                     )
                     MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
                     MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                    return df[["open", "high", "low", "close", "volume"]]
+                    result = df[["open", "high", "low", "close", "volume"]]
             except Exception as yf_exc:
                 logger.debug("yfinance history failed for %s (%s)", symbol, yf_exc)
 
         # 2. Try raw Yahoo Finance Chart API
-        candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1y", interval="1d")
-        if candles:
-            MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
-            MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-            return candles
+        if result is None:
+            candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1y", interval="1d")
+            if candles:
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                result = candles
 
         # 3. Try free institutional Stooq CSV endpoint
-        candles = MarketDataProvider._fetch_stooq_data(symbol)
-        if candles:
-            MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
-            MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-            return candles
+        if result is None:
+            candles = MarketDataProvider._fetch_stooq_data(symbol)
+            if candles:
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                result = candles
 
         # 4. Try Polygon.io if key configured
-        try:
-            from trading_system.config import settings
-            poly_key = getattr(settings, "POLYGON_API_KEY", "")
-            if poly_key:
-                candles = MarketDataProvider._fetch_polygon_data(symbol, poly_key)
-                if candles:
-                    MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
-                    MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                    return candles
-        except Exception:
-            pass
+        if result is None:
+            try:
+                from trading_system.config import settings
+                poly_key = getattr(settings, "POLYGON_API_KEY", "")
+                if poly_key:
+                    candles = MarketDataProvider._fetch_polygon_data(symbol, poly_key)
+                    if candles:
+                        MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                        MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                        result = candles
+            except Exception:
+                pass
 
         # 5. Try Finnhub if key configured
-        try:
-            from trading_system.config import settings
-            finnhub_key = getattr(settings, "FINNHUB_API_KEY", "")
-            if finnhub_key:
-                candles = MarketDataProvider._fetch_finnhub_data(symbol, finnhub_key)
-                if candles:
-                    MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
-                    MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                    return candles
-        except Exception:
-            pass
+        if result is None:
+            try:
+                from trading_system.config import settings
+                finnhub_key = getattr(settings, "FINNHUB_API_KEY", "")
+                if finnhub_key:
+                    candles = MarketDataProvider._fetch_finnhub_data(symbol, finnhub_key)
+                    if candles:
+                        MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                        MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                        result = candles
+            except Exception:
+                pass
 
         # 6. Fallback to synthetic candles (tagged as synthetic for safety)
-        MarketDataProvider.SYNTHETIC_TICKERS.add(symbol.upper())
-        MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = True
-        return MarketDataProvider._generate_synthetic_candles(symbol, range_str="1y", interval="1d")
+        if result is None:
+            MarketDataProvider.SYNTHETIC_TICKERS.add(symbol.upper())
+            MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = True
+            result = MarketDataProvider._generate_synthetic_candles(symbol, range_str="1y", interval="1d")
+
+        if use_cache and result is not None:
+            MarketDataProvider._CANDLE_CACHE[cache_key] = (
+                time.time(),
+                result.copy() if hasattr(result, "copy") else [dict(x) for x in result],
+            )
+        return result
 
     @staticmethod
-    def get_hourly_candles(symbol: str, period: str = "1mo") -> Any:
+    def get_hourly_candles(symbol: str, period: str = "1mo", force_refresh: bool = False) -> Any:
         """Get 1H OHLCV candles."""
+        try:
+            from trading_system.config import settings
+            use_cache = getattr(settings, "ENABLE_CANDLE_CACHE", True)
+            ttl = getattr(settings, "CANDLE_CACHE_TTL_SECONDS", 300)
+        except Exception:
+            use_cache = True
+            ttl = 300
+
+        cache_key = f"hourly_{symbol.upper()}_{period}"
+        if use_cache and not force_refresh and cache_key in MarketDataProvider._CANDLE_CACHE:
+            ts, val = MarketDataProvider._CANDLE_CACHE[cache_key]
+            if time.time() - ts < ttl:
+                return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
+
+        result = None
+
         if HAS_DATA_LIBS and yf is not None:
             try:
                 ticker = yf.Ticker(symbol)
@@ -1414,14 +1583,24 @@ class MarketDataProvider:
                         columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
                         inplace=True,
                     )
-                    return df[["open", "high", "low", "close", "volume"]]
+                    result = df[["open", "high", "low", "close", "volume"]]
             except Exception:
                 pass
 
-        candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1mo", interval="1h")
-        if candles:
-            return candles
-        return MarketDataProvider._generate_synthetic_candles(symbol, range_str="1mo", interval="1h")
+        if result is None:
+            candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1mo", interval="1h")
+            if candles:
+                result = candles
+
+        if result is None:
+            result = MarketDataProvider._generate_synthetic_candles(symbol, range_str="1mo", interval="1h")
+
+        if use_cache and result is not None:
+            MarketDataProvider._CANDLE_CACHE[cache_key] = (
+                time.time(),
+                result.copy() if hasattr(result, "copy") else [dict(x) for x in result],
+            )
+        return result
 
     @staticmethod
     def _generate_synthetic_candles(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Dict[str, float]]:
@@ -1431,6 +1610,12 @@ class MarketDataProvider:
             "MSFT": 422.0, "AMZN": 192.0, "GOOGL": 166.0, "SOXX": 235.0, "GLD": 246.0,
             "SLV": 29.5, "USO": 74.0, "TSM": 192.0, "^HSI": 20600.0, "^GDAXI": 19450.0,
             "^FTSE": 8260.0, "SAP": 222.0, "META": 580.0, "BRK-B": 460.0,
+            "UNG": 15.0, "URNM": 45.0, "COFF": 240.0, "WEAT": 5.50,
+            "3GIL": 12.0, "BUND": 132.0, "HYG": 78.0,
+            "SOL-USD": 165.0, "XRP-USD": 0.55, "ADA-USD": 0.35,
+            "XLF": 47.0, "XLE": 92.0, "XLV": 150.0, "XLI": 130.0, "SMH": 260.0,
+            "NVO": 120.0, "MC.PA": 640.0, "TM": 180.0,
+            "EURUSD=X": 1.085, "GBPUSD=X": 1.300,
         }
         clean_sym = symbol.upper().replace("^", "")
         base = base_prices.get(symbol, base_prices.get(clean_sym, 150.0))

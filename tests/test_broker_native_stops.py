@@ -83,7 +83,7 @@ class TestBrokerNativeStops(unittest.TestCase):
             ticker="QQQ3l_EQ",
             quantity=-10.0,
             stop_price=402.0,
-            time_validity="GTC",
+            time_validity="GOOD_TILL_CANCEL",
         )
 
     def test_sync_broker_stops_for_existing_positions(self):
@@ -104,7 +104,7 @@ class TestBrokerNativeStops(unittest.TestCase):
             ticker="3TSMl_EQ",
             quantity=-5.0,
             stop_price=1120.0,
-            time_validity="GTC",
+            time_validity="GOOD_TILL_CANCEL",
         )
 
     def test_tsl_ratchet_replaces_broker_stop(self):

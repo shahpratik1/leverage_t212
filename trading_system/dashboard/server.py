@@ -84,7 +84,7 @@ class SSEBroadcaster:
     publish = broadcast
 
 
-def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str, Any]]:
+def load_active_signals(state_file: str = "active_trades.json", live_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
     """Load active tracked positions and enrich them with trade metrics."""
     if not os.path.exists(state_file):
         return []
@@ -119,7 +119,12 @@ def load_active_signals(state_file: str = "active_trades.json") -> List[Dict[str
             # Estimate or extract current price and live P&L
             highest_price = float(pos.get("highest_price") or entry)
             lowest_price = float(pos.get("lowest_price") or entry)
-            current_price = highest_price if direction == "LONG" else lowest_price
+            if live_prices and ticker in live_prices and live_prices[ticker] > 0:
+                current_price = float(live_prices[ticker])
+            elif pos.get("current_price") and float(pos.get("current_price")) > 0:
+                current_price = float(pos.get("current_price"))
+            else:
+                current_price = highest_price if direction == "LONG" else lowest_price
 
             if entry > 0 and current_price > 0:
                 if direction == "LONG":
@@ -301,7 +306,22 @@ def build_dashboard_data() -> Dict[str, Any]:
         for p in CURATED_3X_PAIRS
     ]
 
-    active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH)
+    portfolio_prices: Dict[str, float] = {}
+    try:
+        if settings.TRADING212_API_KEY:
+            client = Trading212Client(
+                api_key=settings.TRADING212_API_KEY,
+                api_secret=settings.TRADING212_API_SECRET,
+                base_url=settings.api_base_url,
+            )
+            portfolio = client.get_portfolio()
+            for p in portfolio:
+                if getattr(p, "current_price", 0.0) > 0:
+                    portfolio_prices[p.ticker] = p.current_price
+    except Exception as exc:
+        logger.debug("Failed to fetch live portfolio prices for dashboard: %s", exc)
+
+    active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH, live_prices=portfolio_prices)
     history = load_recent_history(settings.TRADES_LOG_PATH)
     recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH)
     active_stops = sum(1 for s in active_signals if s.get("broker_stop_order_id"))
@@ -379,6 +399,9 @@ def generate_html_dashboard(output_path: str) -> str:
       <button onclick="refreshData()" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition shadow-sm">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
         Refresh Signals
+      </button>
+      <button onclick="panicFlatten()" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold transition shadow-sm border border-rose-400/30">
+        🚨 Emergency Panic Flatten
       </button>
       <div class="text-right text-xs text-slate-500 hidden sm:block">
         <div>Last Updated:</div>
@@ -542,6 +565,28 @@ def generate_html_dashboard(output_path: str) -> str:
 
   <script>
     const INITIAL_DATA = {data_json};
+
+    async function panicFlatten() {{
+      if (!confirm("⚠️ EMERGENCY ACTION: Are you sure you want to CANCEL ALL ACTIVE STOPS and LIQUIDATE all open positions immediately?")) {{
+        return;
+      }}
+      try {{
+        const resp = await fetch('/api/panic', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{confirm: true}})
+        }});
+        const res = await resp.json();
+        if (resp.ok) {{
+          alert("🚨 Panic flatten completed! All open positions liquidated and stops cancelled.");
+          location.reload();
+        }} else {{
+          alert("Error executing panic flatten: " + (res.error || "Unknown error"));
+        }}
+      }} catch (err) {{
+        alert("Failed to reach server: " + err);
+      }}
+    }}
 
     function renderSignals(filter = 'ALL') {{
       const grid = document.getElementById('signals-grid');
@@ -1166,6 +1211,65 @@ def make_dashboard_handler(web_dir: Path, html_name: str):
             if clean_path in ("/", ""):
                 self.path = f"/{html_name}"
             return super().do_GET()
+
+        def do_POST(self):
+            clean_path = self.path.split("?")[0]
+            if clean_path in ("/api/panic", "/panic"):
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                try:
+                    payload = json.loads(body) if body else {}
+                except Exception:
+                    payload = {}
+
+                expected_token = getattr(settings, "PANIC_FLATTEN_TOKEN", "")
+                if expected_token and payload.get("token") != expected_token:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Unauthorized: Invalid panic token"}).encode("utf-8"))
+                    return
+
+                try:
+                    t212 = Trading212Client(
+                        api_key=settings.TRADING212_API_KEY,
+                        api_secret=settings.TRADING212_API_SECRET,
+                        base_url=settings.api_base_url,
+                    )
+                    notifier = Notifier(
+                        telegram_bot_token=settings.TELEGRAM_BOT_TOKEN,
+                        telegram_chat_id=settings.TELEGRAM_CHAT_ID,
+                        discord_webhook_url=settings.DISCORD_WEBHOOK_URL,
+                    )
+                    risk_mgr = RiskManager()
+                    monitor = PositionMonitor(
+                        t212_client=t212,
+                        notifier=notifier,
+                        risk_manager=risk_mgr,
+                        state_file=settings.ACTIVE_TRADES_PATH,
+                        dry_run=not settings.USE_LIVE,
+                    )
+                    res = monitor.panic_flatten_all()
+                    SSEBroadcaster.get_instance().broadcast("panic_flatten", res)
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "success", "result": res}).encode("utf-8"))
+                except Exception as exc:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                return
+
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Not Found"}')
 
     return CustomDashboardHandler
 
