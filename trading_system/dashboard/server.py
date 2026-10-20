@@ -94,6 +94,17 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
 
         signals = []
         for ticker, pos in data.items():
+            if bool(pos.get("is_closed", False)):
+                continue
+            original_quantity = float(pos.get("original_quantity") or 0.0)
+            remaining_quantity = float(
+                pos.get("remaining_quantity")
+                if pos.get("remaining_quantity") is not None
+                else original_quantity
+            )
+            if remaining_quantity <= 0.0:
+                continue
+
             entry = float(pos.get("entry_price") or 0.0)
             sl = float(pos.get("stop_loss") or 0.0)
             tsl = float(pos.get("trailing_stop_loss") or sl)
@@ -102,8 +113,6 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
             tp3 = float(pos.get("tp3") or 0.0)
             direction = pos.get("direction", "LONG").upper()
             underlying = pos.get("underlying", "")
-            original_quantity = float(pos.get("original_quantity") or 0.0)
-            remaining_quantity = float(pos.get("remaining_quantity") or original_quantity)
             broker_stop_order_id = pos.get("broker_stop_order_id")
 
             # Determine currency formatting (LSE stocks like 3TSM trade in GBX pence)
@@ -307,24 +316,98 @@ def build_dashboard_data() -> Dict[str, Any]:
     ]
 
     portfolio_prices: Dict[str, float] = {}
-    try:
-        if settings.TRADING212_API_KEY:
+    broker_positions_map: Optional[Dict[str, Any]] = None
+    live_server_stops_count: Optional[int] = None
+    client: Optional[Trading212Client] = None
+
+    if settings.TRADING212_API_KEY:
+        try:
             client = Trading212Client(
                 api_key=settings.TRADING212_API_KEY,
                 api_secret=settings.TRADING212_API_SECRET,
                 base_url=settings.api_base_url,
             )
-            portfolio = client.get_portfolio()
+            portfolio = client.get_portfolio(force_refresh=True)
+            broker_positions_map = {p.ticker: p for p in portfolio if getattr(p, "quantity", 0.0) > 0}
             for p in portfolio:
                 if getattr(p, "current_price", 0.0) > 0:
                     portfolio_prices[p.ticker] = p.current_price
-    except Exception as exc:
-        logger.debug("Failed to fetch live portfolio prices for dashboard: %s", exc)
 
+            try:
+                open_orders = client.get_orders(force_refresh=True)
+                live_server_stops_count = sum(
+                    1 for o in open_orders
+                    if "STOP" in str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
+                )
+            except Exception as ord_exc:
+                logger.debug("Failed to fetch live open orders count: %s", ord_exc)
+        except Exception as exc:
+            logger.debug("Failed to fetch live portfolio prices for dashboard: %s", exc)
+
+    # 1. Load active signals, strictly ignoring closed or zero-quantity positions
     active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH, live_prices=portfolio_prices)
+
+    # 2. Reconcile with live broker portfolio as absolute ground truth
+    if broker_positions_map is not None:
+        live_broker_tickers = set(broker_positions_map.keys())
+        # Filter out phantom/closed local signals that no longer exist on broker
+        active_signals = [s for s in active_signals if s.get("ticker") in live_broker_tickers]
+
+        # Adopt any broker positions not yet tracked in active_signals
+        known_tickers = {s.get("ticker") for s in active_signals}
+        for b_ticker, bp in broker_positions_map.items():
+            if b_ticker not in known_tickers:
+                pair = universe.get_pair_for_etp(b_ticker)
+                underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
+                direction = "LONG"
+                if pair and (b_ticker == pair.short_3x_ticker or b_ticker == pair.short_5x_ticker):
+                    direction = "SHORT"
+                avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
+                cur_px = bp.current_price if bp.current_price > 0 else avg_px
+                sl_dist = round(avg_px * 0.05, 2)
+                sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
+                pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 and direction == "LONG" else ((avg_px - cur_px) / avg_px * 100.0 if avg_px > 0 else 0.0)
+                active_signals.append({
+                    "ticker": b_ticker,
+                    "underlying": underlying,
+                    "direction": direction,
+                    "strategy_type": "broker_placed",
+                    "rsi3": None, "rsi7": None, "rsi14": None, "sma5": None,
+                    "win_rate_exp": "85%",
+                    "overnight_status": "REQUIRES TP1 OR FLATTENS 16:20 UTC" if direction == "LONG" else "INTRADAY SHORT (Flattens 16:20 UTC)",
+                    "overnight_badge_class": "bg-sky-500/10 text-sky-300 border-sky-500/30" if direction == "LONG" else "bg-rose-500/10 text-rose-300 border-rose-500/30",
+                    "earnings_in_days": None,
+                    "entry_price": avg_px,
+                    "current_price": cur_px,
+                    "pnl_pct": round(pnl_pct, 2),
+                    "pnl_amount": round((cur_px - avg_px) * bp.quantity if direction == "LONG" else (avg_px - cur_px) * bp.quantity, 2),
+                    "currency_code": "GBX" if b_ticker.startswith("3TSM") or avg_px > 600 else "USD",
+                    "currency_prefix": "" if b_ticker.startswith("3TSM") or avg_px > 600 else "$",
+                    "currency_suffix": " GBX" if b_ticker.startswith("3TSM") or avg_px > 600 else "",
+                    "stop_loss": sl,
+                    "trailing_stop_loss": sl,
+                    "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2) if avg_px > 0 else 5.0,
+                    "broker_stop_order_id": None,
+                    "tp1": round(avg_px + sl_dist, 2) if direction == "LONG" else round(avg_px - sl_dist, 2),
+                    "tp1_pct": round(abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 5.0,
+                    "tp2": round(avg_px + 2 * sl_dist, 2) if direction == "LONG" else round(avg_px - 2 * sl_dist, 2),
+                    "tp2_pct": round(2 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 10.0,
+                    "tp3": round(avg_px + 3 * sl_dist, 2) if direction == "LONG" else round(avg_px - 3 * sl_dist, 2),
+                    "tp3_pct": round(3 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 15.0,
+                    "quantity": bp.quantity,
+                    "remaining_quantity": bp.quantity,
+                    "status": "ACTIVE (Broker Placed)",
+                    "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
+                    "tp1_armed_hysteresis": False, "tp1_stop_elevated": False,
+                    "tp1_escape_threshold": 0.0,
+                    "entry_time": datetime.now(timezone.utc).isoformat(),
+                    "atr": round(avg_px * 0.025, 2),
+                    "copy_text": f"ADOPTED: {b_ticker} ({underlying}) Qty: {bp.quantity}",
+                })
+
     history = load_recent_history(settings.TRADES_LOG_PATH)
     recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH)
-    active_stops = sum(1 for s in active_signals if s.get("broker_stop_order_id"))
+    active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
 
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -419,7 +502,7 @@ def generate_html_dashboard(output_path: str) -> str:
     </div>
     <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
       <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Native Broker Stops</div>
-      <div class="text-2xl font-bold text-emerald-400 mt-1">{data['broker_status']['active_server_stops']} Active</div>
+      <div id="metric-stops" class="text-2xl font-bold text-emerald-400 mt-1">{data['broker_status']['active_server_stops']} Active</div>
       <div class="text-xs text-slate-400 mt-1">T212 Server-Side GTC</div>
     </div>
     <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
@@ -588,11 +671,15 @@ def generate_html_dashboard(output_path: str) -> str:
       }}
     }}
 
+    let rawSignals = INITIAL_DATA.active_signals || [];
+    let currentFilter = 'ALL';
+
     function renderSignals(filter = 'ALL') {{
+      currentFilter = filter;
       const grid = document.getElementById('signals-grid');
       grid.innerHTML = '';
 
-      let signals = INITIAL_DATA.active_signals || [];
+      let signals = rawSignals || [];
       if (filter === '3RSI') {{
         signals = signals.filter(s => (s.strategy_type && s.strategy_type.includes('3rsi')) || (s.rsi3 && s.rsi3 <= 25));
       }} else if (filter !== 'ALL') {{
@@ -965,26 +1052,42 @@ def generate_html_dashboard(output_path: str) -> str:
         try {{
           const streamUrl = window.location.origin + "/stream";
           const es = new EventSource(streamUrl);
+          function handlePayload(payload) {{
+            if (!payload) return;
+            if (payload.active_signals !== undefined) {{
+              rawSignals = payload.active_signals;
+              INITIAL_DATA.active_signals = payload.active_signals;
+              const activeEl = document.getElementById('metric-active');
+              if (activeEl) activeEl.innerText = `${{rawSignals.length}} Triggered`;
+              const badgeEl = document.getElementById('signals-badge');
+              if (badgeEl) badgeEl.innerText = rawSignals.length;
+            }}
+            if (payload.broker_status) {{
+              INITIAL_DATA.broker_status = payload.broker_status;
+              const stopsEl = document.getElementById('metric-stops');
+              if (stopsEl && payload.broker_status.active_server_stops !== undefined) {{
+                stopsEl.innerText = `${{payload.broker_status.active_server_stops}} Active`;
+              }}
+            }}
+            renderSignals(currentFilter);
+            if (payload.pairs_watchlist) {{
+              INITIAL_DATA.pairs_watchlist = payload.pairs_watchlist;
+              renderPairsTable();
+            }}
+            if (payload.recent_notifications) {{
+              INITIAL_DATA.recent_notifications = payload.recent_notifications;
+              renderAlertsTable();
+            }}
+          }}
+
           es.addEventListener("snapshot", function(e) {{
             try {{
-              const payload = JSON.parse(e.data);
-              if (payload && payload.active_signals) {{
-                rawSignals = payload.active_signals;
-                renderSignals(currentFilter);
-                renderPairsTable();
-                renderAlertsTable();
-              }}
+              handlePayload(JSON.parse(e.data));
             }} catch (err) {{}}
           }});
           es.addEventListener("dashboard_update", function(e) {{
             try {{
-              const payload = JSON.parse(e.data);
-              if (payload && payload.active_signals) {{
-                rawSignals = payload.active_signals;
-                renderSignals(currentFilter);
-                renderPairsTable();
-                renderAlertsTable();
-              }}
+              handlePayload(JSON.parse(e.data));
             }} catch (err) {{}}
           }});
           es.onerror = function() {{
@@ -1067,6 +1170,25 @@ def start_background_position_monitor(
             try:
                 # Reload active positions in case state changed
                 monitor.positions = monitor._load_state()
+
+                # Continuous Broker Portfolio Reconciliation (runs every 30s)
+                # Guarantees local dashboard & state stay 100% in lockstep with Trading 212
+                now = time.time()
+                if not is_dry_run and settings.TRADING212_API_KEY and now - getattr(_monitor_loop, "_last_recon_time", 0.0) >= 30.0:
+                    try:
+                        recon = monitor.reconcile_with_broker(adopt_untracked=True)
+                        _monitor_loop._last_recon_time = now
+                        if (
+                            recon.get("closed_externally")
+                            or recon.get("adopted_from_broker")
+                            or recon.get("quantity_synced")
+                            or recon.get("expired_stops_restored")
+                        ):
+                            logger.info("🔄 Background monitor synchronized with Trading 212: %s", recon)
+                            generate_html_dashboard(html_file)
+                            last_dashboard_render = now
+                    except Exception as recon_err:
+                        logger.debug("Background monitor reconciliation notice: %s", recon_err)
 
                 # Check market open status to prevent unnecessary API calls
                 now_utc = datetime.now(timezone.utc)

@@ -7,7 +7,9 @@
 6. Emergency Panic Flatten & Remote Kill-Switch
 """
 
+import json
 import os
+import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
@@ -528,6 +530,120 @@ class TestEmergencyPanicFlatten(unittest.TestCase):
         # Monitor tick should be blocked when halted
         tick_events = self.monitor.monitor_tick({"QQQ3l_EQ": 105.0})
         self.assertEqual(tick_events, [])
+
+
+class TestPositionMonitorPermanentSync(unittest.TestCase):
+    """Test state persistence and dashboard sync strictly exclude closed and phantom positions."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.temp_dir.name, "test_active_trades.json")
+        self.mock_t212 = MagicMock(spec=Trading212Client)
+        self.mock_notifier = MagicMock(spec=Notifier)
+        self.mock_rm = MagicMock(spec=RiskManager)
+        self.monitor = PositionMonitor(
+            t212_client=self.mock_t212,
+            notifier=self.mock_notifier,
+            risk_manager=self.mock_rm,
+            state_file=self.state_file,
+            dry_run=False,
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_closed_positions_excluded_from_state_save(self):
+        """_save_state never writes closed or zero-quantity positions to active_trades.json."""
+        pos = TrackedPosition(
+            ticker="QQQ3l_EQ",
+            underlying="QQQ",
+            direction="LONG",
+            entry_price=100.0,
+            original_quantity=10.0,
+            remaining_quantity=0.0,
+            stop_loss=95.0,
+            trailing_stop_loss=95.0,
+            highest_price=105.0,
+            lowest_price=100.0,
+            tp1=105.0,
+            tp2=110.0,
+            tp3=115.0,
+            atr=2.5,
+            is_closed=True,
+        )
+        self.monitor.positions["QQQ3l_EQ"] = pos
+        self.monitor._save_state()
+
+        with open(self.state_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved, {}, "Closed position must not be persisted in active_trades.json")
+
+    def test_load_state_auto_heals_disk_when_closed_positions_exist(self):
+        """_load_state auto-heals state file by stripping closed records from disk."""
+        legacy_data = {
+            "CLOSED_TICKER": {
+                "ticker": "CLOSED_TICKER",
+                "underlying": "SPY",
+                "direction": "LONG",
+                "entry_price": 100.0,
+                "original_quantity": 5.0,
+                "remaining_quantity": 0.0,
+                "stop_loss": 95.0,
+                "trailing_stop_loss": 95.0,
+                "highest_price": 100.0,
+                "lowest_price": 100.0,
+                "tp1": 105.0,
+                "tp2": 110.0,
+                "tp3": 115.0,
+                "atr=2.0": 2.0,
+                "is_closed": True,
+            },
+            "ACTIVE_TICKER": {
+                "ticker": "ACTIVE_TICKER",
+                "underlying": "QQQ",
+                "direction": "LONG",
+                "entry_price": 200.0,
+                "original_quantity": 5.0,
+                "remaining_quantity": 5.0,
+                "stop_loss": 190.0,
+                "trailing_stop_loss": 190.0,
+                "highest_price": 200.0,
+                "lowest_price": 200.0,
+                "tp1": 210.0,
+                "tp2": 220.0,
+                "tp3": 230.0,
+                "atr": 3.0,
+                "is_closed": False,
+            },
+        }
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(legacy_data, f)
+
+        loaded = self.monitor._load_state()
+        self.assertIn("ACTIVE_TICKER", loaded)
+        self.assertNotIn("CLOSED_TICKER", loaded)
+
+        # Verify auto-heal wrote cleaned dictionary back to disk
+        with open(self.state_file, "r", encoding="utf-8") as f:
+            healed = json.load(f)
+        self.assertIn("ACTIVE_TICKER", healed)
+        self.assertNotIn("CLOSED_TICKER", healed)
+
+    def test_load_active_signals_filters_closed_and_zero_quantity(self):
+        """load_active_signals strictly returns only live open positions."""
+        from trading_system.dashboard.server import load_active_signals
+
+        dirty_data = {
+            "DEAD_1": {"entry_price": 100.0, "is_closed": True, "remaining_quantity": 0.0},
+            "DEAD_2": {"entry_price": 100.0, "is_closed": False, "remaining_quantity": 0.0},
+            "LIVE_1": {"entry_price": 100.0, "is_closed": False, "remaining_quantity": 5.0, "direction": "LONG"},
+        }
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(dirty_data, f)
+
+        signals = load_active_signals(self.state_file)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["ticker"], "LIVE_1")
 
 
 if __name__ == "__main__":

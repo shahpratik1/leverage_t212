@@ -839,6 +839,18 @@ class Orchestrator:
                             "Suspending universe scan and position polling to conserve API quota."
                         )
                         self._last_closed_loop_log = now
+
+                    # Run periodic reconciliation even during off-hours to catch manual app trades or external closes
+                    if now - getattr(self, "_last_reconciliation_time", 0.0) >= 300.0:
+                        try:
+                            rec = self.position_monitor.reconcile_with_broker()
+                            if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
+                                logger.info("Off-hours broker reconciliation sync: %s", rec)
+                                self._update_dashboard()
+                        except Exception as e:
+                            logger.debug("Off-hours reconciliation notice: %s", e)
+                        self._last_reconciliation_time = now
+
                     time.sleep(min(300, monitor_interval_seconds * 10))
                     continue
 

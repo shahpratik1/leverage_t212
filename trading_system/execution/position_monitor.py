@@ -1112,6 +1112,9 @@ class PositionMonitor:
         for t in tickers_to_remove:
             if t in self.positions:
                 del self.positions[t]
+        for t, p in list(self.positions.items()):
+            if getattr(p, "is_closed", False) or (getattr(p, "remaining_quantity", 0.0) or 0.0) <= 0.0:
+                del self.positions[t]
 
         if events:
             self._save_state()
@@ -1324,9 +1327,16 @@ class PositionMonitor:
     # State Persistence
     # ─────────────────────────────────────────────────────────────
     def _save_state(self) -> None:
-        """Persist current active positions to state file atomically."""
+        """Persist current active positions to state file atomically.
+        Strictly excludes closed or zero-quantity positions so state file only reflects active exposure.
+        """
         try:
-            raw = {t: asdict(pos) for t, pos in self.positions.items()}
+            raw = {
+                t: asdict(pos)
+                for t, pos in self.positions.items()
+                if not getattr(pos, "is_closed", False)
+                and (getattr(pos, "remaining_quantity", 0.0) or 0.0) > 0.0
+            }
             tmp_file = f"{self.state_file}.tmp.{os.getpid()}"
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(raw, f, indent=2)
@@ -1335,7 +1345,7 @@ class PositionMonitor:
             logger.warning("Failed to save position monitor state to %s: %s", self.state_file, exc)
 
     def _load_state(self) -> Dict[str, TrackedPosition]:
-        """Load active positions from state file."""
+        """Load active positions from state file. Auto-heals state file if legacy closed trades exist."""
         if not os.path.exists(self.state_file):
             return {}
         try:
@@ -1343,11 +1353,30 @@ class PositionMonitor:
                 raw = json.load(f)
             known_fields = {f.name for f in fields(TrackedPosition)}
             positions = {}
+            had_closed = False
             for t, data in raw.items():
-                if not data.get("is_closed", False):
+                is_closed = bool(data.get("is_closed", False))
+                rem_qty = float(
+                    data.get("remaining_quantity")
+                    if data.get("remaining_quantity") is not None
+                    else (data.get("original_quantity") or 0.0)
+                )
+                if not is_closed and rem_qty > 0.0:
                     filtered_data = {k: v for k, v in data.items() if k in known_fields}
                     positions[t] = TrackedPosition(**filtered_data)
+                else:
+                    had_closed = True
+
             logger.info("Loaded %d active tracked positions from %s", len(positions), self.state_file)
+
+            # Auto-heal state file on disk if closed positions were present
+            if had_closed:
+                tmp_file = f"{self.state_file}.tmp.{os.getpid()}"
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump({t: asdict(pos) for t, pos in positions.items()}, f, indent=2)
+                os.replace(tmp_file, self.state_file)
+                logger.info("Auto-healed %s: purged legacy closed positions from disk.", self.state_file)
+
             return positions
         except Exception as exc:
             logger.warning("Could not read state file %s: %s", self.state_file, exc)
