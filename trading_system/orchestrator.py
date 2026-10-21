@@ -250,9 +250,11 @@ class Orchestrator:
             try:
                 daily = MarketDataProvider.get_daily_candles(symbol, period="1y")
                 hourly = MarketDataProvider.get_hourly_candles(symbol, period="1mo")
-                metrics = MarketDataProvider.compute_indicators(daily, hourly)
+                metrics = MarketDataProvider.compute_indicators(daily, hourly, symbol=symbol)
                 if metrics:
                     metrics["is_synthetic"] = MarketDataProvider.is_ticker_synthetic(symbol)
+                    if metrics.get("earnings_in_days") is None:
+                        metrics["earnings_in_days"] = MarketDataProvider.get_days_to_earnings(symbol)
                 return symbol, metrics
             except Exception as exc:
                 logger.error("Failed to ingest %s: %s", symbol, exc)

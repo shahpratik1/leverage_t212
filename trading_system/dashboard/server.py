@@ -191,8 +191,12 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
                 overnight_status = f"EARNINGS BLACKOUT ({earnings_days:.1f}d — Flattens 16:20 UTC)"
                 overnight_badge_class = "bg-amber-500/10 text-amber-300 border-amber-500/30"
             elif pos.get("tp1_hit"):
-                overnight_status = "OVERNIGHT ELIGIBLE (TP1 Breakeven Active)"
+                radar_tag = f" • Pre-Earnings Radar ({earnings_days:.0f}d)" if (earnings_days and earnings_days <= 21.0) else ""
+                overnight_status = f"OVERNIGHT ELIGIBLE (TP1 Breakeven Active{radar_tag})"
                 overnight_badge_class = "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+            elif earnings_days is not None and 1.0 < earnings_days <= 21.0:
+                overnight_status = f"PRE-EARNINGS RUN-UP RADAR ({earnings_days:.0f}d away • Flattens 16:20 UTC if < TP1)"
+                overnight_badge_class = "bg-purple-500/10 text-purple-300 border-purple-500/30"
             else:
                 overnight_status = "REQUIRES TP1 OR FLATTENS 16:20 UTC"
                 overnight_badge_class = "bg-sky-500/10 text-sky-300 border-sky-500/30"

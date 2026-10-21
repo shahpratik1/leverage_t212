@@ -70,8 +70,10 @@ class TechnicalSignal(pydantic.BaseModel):
 class MacroSignal(pydantic.BaseModel):
     """Structured assessment from the Macro & Catalyst Analyst subagent."""
     macro_environment: str = pydantic.Field(description="'favorable', 'neutral', or 'headwind'")
-    earnings_blackout_risk: bool = pydantic.Field(description="True if earnings release scheduled within 24 hours")
+    earnings_blackout_risk: bool = pydantic.Field(description="True if earnings release scheduled within 48 hours")
     earnings_date: Optional[str] = pydantic.Field(default=None, description="Next earnings announcement date if known")
+    earnings_in_days: Optional[float] = pydantic.Field(default=None, description="Days until next earnings report")
+    pre_earnings_run_eligible: bool = pydantic.Field(default=False, description="True if in the 3-21 day pre-earnings momentum window")
     thesis: str = pydantic.Field(description="Macro, sector, and catalyst reasoning")
 
 
@@ -180,14 +182,17 @@ def tool_get_asset_intelligence(ticker: str) -> str:
     last_close = 0.0
     atr = 0.0
     rsi3 = None
+    earnings_in_days = MarketDataProvider.get_days_to_earnings(clean)
     try:
         daily = MarketDataProvider.get_daily_candles(clean, period="30d")
         hourly = MarketDataProvider.get_hourly_candles(clean, period="1mo")
-        metrics = MarketDataProvider.compute_indicators(daily, hourly)
+        metrics = MarketDataProvider.compute_indicators(daily, hourly, symbol=clean)
         if metrics:
             last_close = float(metrics.get("close", 0.0))
             atr = float(metrics.get("atr", 0.0))
             rsi3 = metrics.get("rsi3")
+            if earnings_in_days is None:
+                earnings_in_days = metrics.get("earnings_in_days")
     except Exception as exc:
         logger.warning("Could not fetch live market data for %s: %s", clean, exc)
 
@@ -197,11 +202,17 @@ def tool_get_asset_intelligence(ticker: str) -> str:
         atr = 2.5
         rsi3 = 45.0
 
+    pre_earnings_radar = bool(earnings_in_days is not None and 2.0 < earnings_in_days <= 21.0)
+    earnings_blackout = bool(earnings_in_days is not None and 0.0 <= earnings_in_days <= 2.0)
+
     summary = {
         "ticker": clean,
         "last_close": last_close,
         "atr_20d": round(atr, 2),
         "rsi3": round(rsi3, 2) if rsi3 is not None else "N/A",
+        "earnings_in_days": earnings_in_days,
+        "pre_earnings_radar": pre_earnings_radar,
+        "earnings_blackout_risk": earnings_blackout,
         "leveraged_pairs": {
             "long_3x": pair.long_3x_ticker if pair else None,
             "short_3x": pair.short_3x_ticker if pair else None,

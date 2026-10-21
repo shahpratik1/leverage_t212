@@ -25,6 +25,7 @@ from trading_system.agents.antigravity_agent import (
 from trading_system.agents.debate_engine import DebateEngine, DebateOutcome
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.config import Settings
+from trading_system.data.leveraged_universe import LeveragedUniverse
 from trading_system.data.trading212_client import AccountCash, Position, Trading212Client
 from trading_system.notifications.notifier import Notifier
 
@@ -236,6 +237,69 @@ class TestAntigravityAgenticSystem(unittest.TestCase):
         self.assertIsInstance(outcome, DebateOutcome)
         self.assertEqual(outcome.ticker, "NVDA")
         self.assertEqual(outcome.consensus_decision, "BUY_ENTRY")
+
+    def test_new_bluechip_and_thematic_pairs(self):
+        """Verify SPCX, SMCI, and bluechip pairs exist and resolve to valid leveraged ETPs."""
+        u = LeveragedUniverse()
+        expected = {
+            "SPCX": "ELONl_EQ",
+            "SMCI": "SMCIl_EQ",
+            "META": "3LFEl_EQ",
+            "NFLX": "NFL3l_EQ",
+            "COIN": "3LCOOl_EQ",
+            "ORCL": "ORC3l_EQ",
+            "INTC": "3INTl_EQ",
+            "QCOM": "QCO3l_EQ",
+            "BA": "BA3l_EQ",
+            "UBER": "3LUBl_EQ",
+            "BABA": "3BABl_EQ",
+            "CRM": "CRM3l_EQ",
+            "DFNS": "3EDFl_EQ",
+        }
+        for sym, exp_long in expected.items():
+            pair = u.get_pair_for_underlying(sym)
+            self.assertIsNotNone(pair, f"Missing pair for {sym}")
+            self.assertEqual(pair.long_3x_ticker, exp_long)
+
+    def test_pre_earnings_radar_and_blackout_logic(self):
+        """Verify pre-earnings radar window (3-21d) and blackout shield (<=48h)."""
+        intel_pre = json.loads(self.agent.tool_get_asset_intelligence("NVDA"))
+        self.assertIn("pre_earnings_radar", intel_pre)
+        self.assertIn("earnings_blackout_risk", intel_pre)
+
+        # Test blackout filter in Screener
+        from trading_system.screener.laya_screener import LayaScreener
+        screener = LayaScreener()
+
+        # Asset within 24h blackout
+        blackout_metrics = {
+            "close": 150.0,
+            "sma200": 130.0,
+            "ema20": 152.0,
+            "ema50": 145.0,
+            "rsi3": 18.0,
+            "rsi7": 35.0,
+            "adx": 25.0,
+            "earnings_in_days": 1.0,
+        }
+        res_blackout = screener.evaluate_single("TSLA", blackout_metrics)
+        self.assertGreater(res_blackout.catalyst_risk, 0.25)
+        self.assertFalse(screener.passes_filter(res_blackout))
+
+        # Asset in safe 12-day pre-earnings run-up window
+        runup_metrics = {
+            "close": 150.0,
+            "sma200": 130.0,
+            "ema20": 152.0,
+            "ema50": 145.0,
+            "rsi3": 18.0,
+            "rsi7": 35.0,
+            "adx": 25.0,
+            "earnings_in_days": 12.0,
+        }
+        res_runup = screener.evaluate_single("AAPL", runup_metrics)
+        self.assertLessEqual(res_runup.catalyst_risk, 0.25)
+        self.assertTrue(screener.passes_filter(res_runup))
 
 
 if __name__ == "__main__":

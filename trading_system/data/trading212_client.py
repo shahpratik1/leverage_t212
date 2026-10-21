@@ -1218,11 +1218,58 @@ class MarketDataProvider:
     LAST_FETCH_WAS_SYNTHETIC: bool = False
     SYNTHETIC_TICKERS: set = set()
     _CANDLE_CACHE: Dict[str, Tuple[float, Any]] = {}
+    _EARNINGS_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
 
     @classmethod
     def clear_candle_cache(cls) -> None:
-        """Clear cached candles in memory."""
+        """Clear cached candles and earnings data in memory."""
         cls._CANDLE_CACHE.clear()
+        cls._EARNINGS_CACHE.clear()
+
+    @classmethod
+    def get_days_to_earnings(cls, symbol: str) -> Optional[float]:
+        """Fetch days until next earnings announcement for an asset.
+
+        Returns float days remaining (e.g. 7.0), or None if non-equity or unknown.
+        Results are cached in memory for 6 hours (21600s) to conserve API calls.
+        """
+        clean = (symbol or "").strip().upper()
+        if not clean:
+            return None
+
+        # Fast exit for indices, commodities, currencies, cryptos
+        if any(clean.startswith(p) for p in [
+            "^", "EUR", "GBP", "BTC", "ETH", "SOL", "XRP", "ADA",
+            "GLD", "SLV", "USO", "UNG", "BUND", "TLT", "COFF", "WEAT",
+            "XLF", "XLE", "XLV", "XLI", "SMH", "SOXX", "QQQ", "SPY"
+        ]):
+            return None
+
+        now = time.time()
+        if clean in cls._EARNINGS_CACHE:
+            ts, val = cls._EARNINGS_CACHE[clean]
+            if now - ts < 21600:
+                return val
+
+        days: Optional[float] = None
+        if HAS_DATA_LIBS and yf is not None:
+            try:
+                t = yf.Ticker(clean)
+                cal = getattr(t, "calendar", None)
+                ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
+                if ed and len(ed) > 0:
+                    earn_date = ed[0]
+                    if hasattr(earn_date, "date"):
+                        earn_date = earn_date.date()
+                    today = datetime.now(timezone.utc).date()
+                    delta = (earn_date - today).days
+                    if delta >= 0:
+                        days = float(delta)
+            except Exception as exc:
+                logger.debug("Earnings calendar fetch failed for %s: %s", clean, exc)
+
+        cls._EARNINGS_CACHE[clean] = (now, days)
+        return days
 
     @classmethod
     def get_bid_ask_spread(cls, symbol: str) -> Dict[str, float]:
@@ -1616,6 +1663,9 @@ class MarketDataProvider:
             "XLF": 47.0, "XLE": 92.0, "XLV": 150.0, "XLI": 130.0, "SMH": 260.0,
             "NVO": 120.0, "MC.PA": 640.0, "TM": 180.0,
             "EURUSD=X": 1.085, "GBPUSD=X": 1.300,
+            "SPCX": 45.0, "SMCI": 48.0, "NFLX": 710.0, "COIN": 215.0,
+            "ORCL": 175.0, "INTC": 23.5, "QCOM": 172.0, "BA": 158.0,
+            "UBER": 78.0, "BABA": 102.0, "CRM": 290.0, "DFNS": 140.0,
         }
         clean_sym = symbol.upper().replace("^", "")
         base = base_prices.get(symbol, base_prices.get(clean_sym, 150.0))
@@ -1675,8 +1725,10 @@ class MarketDataProvider:
         return candles
 
     @staticmethod
-    def compute_indicators(daily_data: Any, hourly_data: Any) -> Dict[str, Any]:
-        """Compute all required indicators: SMA200, EMA20/50, RSI, ATR, ADX, High20d."""
+    def compute_indicators(daily_data: Any, hourly_data: Any, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Compute all required indicators: SMA200, EMA20/50, RSI, ATR, ADX, High20d, and days to earnings."""
+        earnings_days = MarketDataProvider.get_days_to_earnings(symbol) if symbol else None
+
         # 1. Pandas path if available
         if HAS_DATA_LIBS and hasattr(daily_data, "empty") and not daily_data.empty:
             if len(daily_data) < 50:
@@ -1752,7 +1804,7 @@ class MarketDataProvider:
                 "atr": round(atr, 2),
                 "realized_vol": round(realized_vol, 4),
                 "high_20d": round(high_20d, 2),
-                "earnings_in_days": None,
+                "earnings_in_days": earnings_days,
             }
 
         # 2. Pure Python list-of-dicts calculation fallback
@@ -1846,5 +1898,5 @@ class MarketDataProvider:
             "atr": round(atr, 2),
             "realized_vol": round(realized_vol, 4),
             "high_20d": round(high_20d, 2),
-            "earnings_in_days": None,
+            "earnings_in_days": earnings_days,
         }

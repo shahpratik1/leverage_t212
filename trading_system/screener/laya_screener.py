@@ -209,6 +209,14 @@ class LayaScreener:
         adx = float(metrics.get("adx", 20.0))
 
         # ── 1. Priority High Win-Rate Check: 3-RSI Multi-Timeframe Mean Reversion ──
+        earnings_val = metrics.get("earnings_in_days")
+        is_earnings_blackout = (
+            earnings_val is not None
+            and isinstance(earnings_val, (int, float))
+            and 0.0 <= earnings_val <= 2.0
+        )
+        base_catalyst_risk = 0.90 if is_earnings_blackout else 0.05
+
         # Bullish Dip: Macro bull (close > sma200), extreme short-term liquidation (rsi3 <= 22, rsi7 <= 42)
         if close > sma200 and rsi3 <= 22.0 and rsi7 <= 42.0:
             return ScreenerResult(
@@ -217,7 +225,7 @@ class LayaScreener:
                 bias_confidence=0.95,
                 setup_score="exceptional",
                 setup_confidence=0.95,
-                catalyst_risk=0.05,
+                catalyst_risk=base_catalyst_risk,
                 overall_confidence=0.95,
                 strategy_type="3rsi_mean_reversion",
                 metrics=metrics,
@@ -231,7 +239,7 @@ class LayaScreener:
                 bias_confidence=0.92,
                 setup_score="exceptional",
                 setup_confidence=0.92,
-                catalyst_risk=0.05,
+                catalyst_risk=base_catalyst_risk,
                 overall_confidence=0.92,
                 strategy_type="3rsi_mean_reversion",
                 metrics=metrics,
@@ -256,7 +264,7 @@ class LayaScreener:
                 bias_confidence=0.85,
                 setup_score=setup_score,
                 setup_confidence=0.85,
-                catalyst_risk=0.05,
+                catalyst_risk=base_catalyst_risk,
                 overall_confidence=0.85,
                 strategy_type="momentum",
                 metrics=metrics,
