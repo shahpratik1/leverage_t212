@@ -158,11 +158,13 @@ class Orchestrator:
         )
         self.session_start_equity: Optional[float] = None
         self._last_reconciliation_time: float = 0.0
-        # Synchronize broker-native GTC Stop Loss / TSL orders for active positions
+        self._scan_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="universe_scan")
+        self._scan_future: Optional[concurrent.futures.Future] = None
+        # Synchronize broker-native GTC Stop Loss / Limit orders for active positions
         if not self.dry_run:
             try:
                 self.position_monitor.reconcile_with_broker(adopt_untracked=True)
-                self.position_monitor.sync_broker_stops()
+                self.position_monitor.sync_broker_orders()
                 self.position_monitor.apply_daily_rollover_stops()
             except Exception as exc:
                 logger.warning("Initial broker stop sync deferred: %s", exc)
@@ -213,6 +215,44 @@ class Orchestrator:
                 self._generate_html_dashboard("signals_dashboard.html")
             except Exception as exc:
                 logger.debug("Dashboard regeneration skipped: %s", exc)
+
+    def fetch_active_trades_metrics(self) -> Dict[str, Dict[str, Any]]:
+        """Fetch targeted OHLCV & technical indicators for currently active trade underlyings.
+
+        Runs in fractions of a second because it only fetches for active assets (typically 2-6)
+        rather than scanning the full 120-asset universe.
+        """
+        if not self.position_monitor or not self.position_monitor.positions:
+            return {}
+
+        underlyings = list({
+            pos.underlying for pos in self.position_monitor.positions.values()
+            if not pos.is_closed and pos.underlying
+        })
+        if not underlyings:
+            return {}
+
+        active_metrics: Dict[str, Dict[str, Any]] = {}
+
+        def _fetch_one(symbol: str) -> tuple[str, Optional[Dict[str, Any]]]:
+            try:
+                daily = MarketDataProvider.get_daily_candles(symbol, period="1y")
+                hourly = MarketDataProvider.get_hourly_candles(symbol, period="1mo")
+                metrics = MarketDataProvider.compute_indicators(daily, hourly, symbol=symbol)
+                return symbol, metrics
+            except Exception as exc:
+                logger.debug("Active trade metric fetch notice for %s: %s", symbol, exc)
+                return symbol, None
+
+        workers = min(len(underlyings), 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_sym = {executor.submit(_fetch_one, sym): sym for sym in underlyings}
+            for future in concurrent.futures.as_completed(future_to_sym):
+                sym, met = future.result()
+                if met:
+                    active_metrics[sym] = met
+
+        return active_metrics
 
     # ─────────────────────────────────────────────────────────────
     # Phase 1 — Data Ingestion (Parallel Subagents)
@@ -766,41 +806,21 @@ class Orchestrator:
             Trading212Client.set_trade_active(False)
 
     # ─────────────────────────────────────────────────────────────
-    # Complete Single Cycle
+    # Complete Single Cycle & Deliberation Pipeline
     # ─────────────────────────────────────────────────────────────
-    def run_cycle(self) -> List[DecisionCard]:
-        """Execute one complete Scan → Filter → Debate → Execute cycle."""
-        logger.info("━━━ Starting 3x Quantitative Cycle at %s ━━━",
-                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+    def _scan_and_deliberate(self) -> List[tuple[ScreenerResult, DecisionCard]]:
+        """Ingest universe data, screen candidates, and deliberate via multi-agent stack.
 
-        # Emergency System Halt Check
+        Returns candidate cards ready for batch execution. Can run safely in background.
+        """
         if self.position_monitor and getattr(self.position_monitor, "is_system_halted", lambda: False)():
-            logger.warning("Cycle aborted: System is currently HALTED following emergency panic flatten.")
+            logger.warning("Scan aborted: System is currently HALTED following emergency panic flatten.")
             return []
-
-        # Step 0: Broker Portfolio Reconciliation & Position Adoption
-        try:
-            recon = self.position_monitor.reconcile_with_broker(adopt_untracked=True)
-            if recon.get("adopted_from_broker"):
-                logger.info(
-                    "Synchronized with Trading 212 account: Adopted %d active broker positions: %s",
-                    len(recon["adopted_from_broker"]), recon["adopted_from_broker"],
-                )
-            if recon.get("closed_externally"):
-                logger.info(
-                    "Reconciliation closed %d positions not found on broker: %s",
-                    len(recon["closed_externally"]), recon["closed_externally"],
-                )
-            # Apply daily rollover profit-locks on active positions
-            if not self.dry_run:
-                self.position_monitor.apply_daily_rollover_stops()
-        except Exception as recon_exc:
-            logger.debug("Initial broker reconciliation notice: %s", recon_exc)
 
         # Step 1: Ingestion
         metrics_dict = self.ingest_universe_data()
         if not metrics_dict:
-            logger.warning("No market data ingested — cycle aborted")
+            logger.warning("No market data ingested — scan aborted")
             return []
 
         # Step 2: Screening
@@ -817,7 +837,6 @@ class Orchestrator:
         logger.info("Deliberating on %d candidate(s) in parallel across %d subagent workers…",
                     len(candidates_to_process), n_delib_workers)
 
-        # Baseline equity query once before parallel deliberation to avoid concurrent /account/cash hits
         try:
             account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
             baseline_equity = account.total or settings.DEFAULT_ACCOUNT_EQUITY
@@ -839,6 +858,36 @@ class Orchestrator:
                 except Exception as exc:
                     logger.error("Parallel deliberation failed for %s: %s", cand.ticker, exc)
 
+        return candidate_cards
+
+    def run_cycle(self) -> List[DecisionCard]:
+        """Execute one complete Scan → Filter → Debate → Execute cycle."""
+        logger.info("━━━ Starting 3x Quantitative Cycle at %s ━━━",
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+        # Step 0: Broker Portfolio Reconciliation & Position Adoption
+        try:
+            recon = self.position_monitor.reconcile_with_broker(adopt_untracked=True)
+            if recon.get("adopted_from_broker"):
+                logger.info(
+                    "Synchronized with Trading 212 account: Adopted %d active broker positions: %s",
+                    len(recon["adopted_from_broker"]), recon["adopted_from_broker"],
+                )
+            if recon.get("closed_externally"):
+                logger.info(
+                    "Reconciliation closed %d positions not found on broker: %s",
+                    len(recon["closed_externally"]), recon["closed_externally"],
+                )
+            if not self.dry_run:
+                self.position_monitor.apply_daily_rollover_stops()
+                self.position_monitor.sync_broker_orders()
+        except Exception as recon_exc:
+            logger.debug("Initial broker reconciliation notice: %s", recon_exc)
+
+        candidate_cards = self._scan_and_deliberate()
+        if not candidate_cards:
+            return []
+
         # Step 4: Execution & Logging via Synchronized Batch Coordinator
         executed_cards = self.execute_trades_batch(candidate_cards)
         self._update_dashboard()
@@ -846,16 +895,19 @@ class Orchestrator:
         return executed_cards
 
     # ─────────────────────────────────────────────────────────────
-    # Continuous Loop with Active Position Monitoring
+    # Continuous Loop with Active-Trade Driven Architecture
     # ─────────────────────────────────────────────────────────────
     def run_loop(self, scan_interval_minutes: int = 60, monitor_interval_seconds: int = 30) -> None:
         """Run continuous engine loop.
 
-        Performs position monitoring every ``monitor_interval_seconds`` (checking TP1/TP2/TP3/SL/TSL),
-        and runs a full universe scan every ``scan_interval_minutes``.
+        Prioritizes Active Trade Management on high-frequency intervals:
+        - Reads Trading 212 active trades directly as primary ground truth.
+        - Calculates ATR/SL/TP1/TP2/TP3 and sets native broker orders (stops & limits).
+        - Fetches targeted market metrics for active trades (<0.5s) and executes if signals trigger.
+        - Decouples 120-asset universe scan into background worker so active trades are never starved.
         """
         logger.info(
-            "Starting continuous engine (Scan Interval: %dm, Monitor Interval: %ds). Press Ctrl+C to stop.",
+            "Starting continuous Active-Trade engine (Scan Interval: %dm, Monitor Interval: %ds). Press Ctrl+C to stop.",
             scan_interval_minutes, monitor_interval_seconds
         )
         last_scan_time = 0.0
@@ -904,15 +956,22 @@ class Orchestrator:
                     time.sleep(min(300, monitor_interval_seconds * 10))
                     continue
 
-                # 1. Check if it's time for a full scan cycle
-                if now - last_scan_time >= scan_interval_minutes * 60:
-                    logger.info("Triggering scheduled 3x universe scan…")
-                    self.run_cycle()
-                    last_scan_time = time.time()
+                # ── PRIORITY 1: High-Frequency Active Position Management ──
+                # 1. Reconcile with Trading 212 & adopt untracked positions
+                if now - getattr(self, "_last_reconciliation_time", 0.0) >= getattr(settings, "RECONCILIATION_INTERVAL_SECONDS", 30):
+                    rec = self.position_monitor.reconcile_with_broker(adopt_untracked=True)
+                    if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
+                        logger.info("Active trade reconciliation: %s", rec)
+                        self._update_dashboard()
+                    self._last_reconciliation_time = now
 
-                # 2. Run active position monitoring tick (TP1, TP2, TP3, SL, TSL)
+                # 2. Sync native broker orders ("set the price" on broker server)
+                if not self.dry_run:
+                    self.position_monitor.sync_broker_orders()
+
+                # 3. Active Position Price & Technical Signal Monitoring
                 if self.position_monitor.positions:
-                    logger.debug("Checking %d active positions…", len(self.position_monitor.positions))
+                    logger.debug("Active management for %d positions…", len(self.position_monitor.positions))
                     current_prices = {}
                     try:
                         t212_positions = self.t212.get_portfolio()
@@ -921,34 +980,54 @@ class Orchestrator:
                             if p_price > 0:
                                 current_prices[p.ticker] = p_price
                     except Exception as e:
-                        logger.debug("T212 portfolio price fetch: %s", e)
+                        logger.debug("T212 portfolio price fetch notice: %s", e)
+
+                    # Targeted indicators for active trade underlyings (<0.5s)
+                    active_metrics = self.fetch_active_trades_metrics()
+                    for und, met in active_metrics.items():
+                        if met.get("close"):
+                            current_prices[und] = met["close"]
 
                     for ticker, pos in self.position_monitor.positions.items():
                         if ticker not in current_prices:
-                            # Keep last known valid price from broker/position to avoid cross-asset price contamination
                             pos_price = getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0
                             if pos_price > 0:
                                 current_prices[ticker] = pos_price
-                            # Fetch underlying price ONLY for underlying symbol, never assign to ETP ticker
-                            try:
-                                daily = MarketDataProvider.get_daily_candles(pos.underlying, period="5d")
-                                if hasattr(daily, "empty") and not daily.empty:
-                                    current_prices[pos.underlying] = float(daily["close"].iloc[-1])
-                                elif isinstance(daily, list) and daily:
-                                    current_prices[pos.underlying] = float(daily[-1]["close"])
-                            except Exception:
-                                pass
 
-                    self.position_monitor.monitor_tick(current_prices)
-                    self._update_dashboard()
+                    # Price-target tick (TP1/TP2/TP3/SL/TSL)
+                    events = self.position_monitor.monitor_tick(current_prices, current_time=now_utc)
 
-                # 3. Periodic Broker Portfolio Reconciliation Loop
-                if now - getattr(self, "_last_reconciliation_time", 0.0) >= getattr(settings, "RECONCILIATION_INTERVAL_SECONDS", 60):
-                    rec = self.position_monitor.reconcile_with_broker()
-                    if rec.get("closed_externally") or rec.get("quantity_synced"):
-                        logger.info("Broker reconciliation sync: %s", rec)
+                    # Signal-driven execution on active trades
+                    signal_events = self.position_monitor.evaluate_active_trade_signals(active_metrics)
+                    if signal_events:
+                        events.extend(signal_events)
+
+                    if events:
                         self._update_dashboard()
-                    self._last_reconciliation_time = now
+
+                # ── PRIORITY 2: Decoupled Non-Blocking Universe Scan ──
+                # Harvest completed background scan
+                if self._scan_future is not None:
+                    if self._scan_future.done():
+                        try:
+                            candidate_cards = self._scan_future.result()
+                            if candidate_cards:
+                                executed = self.execute_trades_batch(candidate_cards)
+                                if executed:
+                                    logger.info("Background universe scan batch finished: %d trades executed.", len(executed))
+                                    self._update_dashboard()
+                        except Exception as scan_err:
+                            logger.error("Background universe scan error: %s", scan_err)
+                        finally:
+                            self._scan_future = None
+                            last_scan_time = time.time()
+                else:
+                    # Launch background scan if interval elapsed or at startup
+                    if now - last_scan_time >= scan_interval_minutes * 60 or last_scan_time == 0.0:
+                        logger.info("Triggering non-blocking background 3x universe scan…")
+                        self._scan_future = self._scan_executor.submit(self._scan_and_deliberate)
+                        if last_scan_time == 0.0:
+                            last_scan_time = time.time()
 
                 time.sleep(monitor_interval_seconds)
 
@@ -969,6 +1048,11 @@ class Orchestrator:
                 self.dashboard_server.server_close()
             except Exception as exc:
                 logger.debug("Dashboard server shutdown notice: %s", exc)
+        if getattr(self, "_scan_executor", None):
+            try:
+                self._scan_executor.shutdown(wait=False)
+            except Exception as exc:
+                logger.debug("Scan executor shutdown notice: %s", exc)
         self.t212.close()
         logger.info("Shutdown complete.")
 

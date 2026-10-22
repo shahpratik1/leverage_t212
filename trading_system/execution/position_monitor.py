@@ -97,6 +97,11 @@ class PositionMonitor:
             self.is_halted = True
 
     @property
+    def _rate_limit_delay(self) -> float:
+        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        return float(delay) if isinstance(delay, (int, float)) else 0.0
+
+    @property
     def halt_marker_file(self) -> str:
         return f"{self.state_file}.halted"
 
@@ -117,6 +122,63 @@ class PositionMonitor:
                 os.remove(self.halt_marker_file)
             except Exception as exc:
                 logger.warning("Could not remove halt marker file: %s", exc)
+
+    # ─────────────────────────────────────────────────────────────
+    # Exit Levels & Target Calculations
+    # ─────────────────────────────────────────────────────────────
+    def calculate_exit_levels(
+        self,
+        entry_price: float,
+        direction: str = "LONG",
+        atr: Optional[float] = None,
+        existing_stop_price: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Calculate dynamic ATR/volatility-based SL, TP1, TP2, TP3.
+
+        For 3x Leveraged ETPs:
+        - Uses existing stop price if one was already set on broker, aligning R-multiples.
+        - Otherwise, calculates stop distance from ATR (or 2.5% default), clamped between 3% and 8%.
+        - Derives multi-stage targets:
+            TP1 = Entry +/- 1.0R (+1x SL distance)
+            TP2 = Entry +/- 2.0R (+2x SL distance)
+            TP3 = Entry +/- 3.0R (+3x SL distance)
+        """
+        is_short = (direction.upper() == "SHORT" and not direction.upper().endswith("_ETP"))
+        entry = max(0.01, entry_price)
+
+        if existing_stop_price and existing_stop_price > 0:
+            sl = round(existing_stop_price, 4)
+            sl_dist = abs(entry - sl)
+            # Ensure distance is at least 1% of entry to prevent zero-width targets
+            sl_dist = max(sl_dist, round(entry * 0.02, 4))
+        else:
+            calc_atr = atr if (atr and atr > 0) else round(entry * 0.025, 4)
+            # 2.2x ATR stop distance, bounded between 3% and 8% of price
+            raw_dist = calc_atr * 2.2
+            min_dist = entry * 0.03
+            max_dist = entry * 0.08
+            sl_dist = round(min(max_dist, max(min_dist, raw_dist)), 4)
+            sl = round((entry + sl_dist) if is_short else (entry - sl_dist), 4)
+
+        effective_atr = atr if (atr and atr > 0) else round(entry * 0.025, 4)
+
+        if is_short:
+            tp1 = round(max(0.01, entry - sl_dist), 4)
+            tp2 = round(max(0.01, entry - 2.0 * sl_dist), 4)
+            tp3 = round(max(0.01, entry - 3.0 * sl_dist), 4)
+        else:
+            tp1 = round(entry + sl_dist, 4)
+            tp2 = round(entry + 2.0 * sl_dist, 4)
+            tp3 = round(entry + 3.0 * sl_dist, 4)
+
+        return {
+            "stop_loss": sl,
+            "trailing_stop_loss": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "atr": effective_atr,
+        }
 
     # ─────────────────────────────────────────────────────────────
     # Trade Registration
@@ -247,19 +309,21 @@ class PositionMonitor:
             except Exception as first_exc:
                 logger.debug("Stop order with validity GOOD_TILL_CANCEL failed (%s), attempting DAY...", first_exc)
                 # Respect rate limit spacing before fallback order submission
-                delay = getattr(self.t212, "rate_limit_delay", 1.25)
-                time.sleep(delay)
+                delay = self._rate_limit_delay
+                if delay > 0:
+                    time.sleep(delay)
                 res = self.t212.place_stop_order(
                     ticker=pos.ticker,
                     quantity=order_qty,
                     stop_price=round(price, 2),
                     time_validity="DAY",
                 )
-            pos.broker_stop_order_id = res.id
+            order_id = str(res.id) if hasattr(res, "id") and res.id is not None else str(res)
+            pos.broker_stop_order_id = order_id
             setattr(pos, "_last_stop_fail_time", 0.0)
             self._save_state()
-            logger.info("Successfully placed broker Stop Order on Trading 212: %s (id=%s)", pos.ticker, res.id)
-            return res.id
+            logger.info("Successfully placed broker Stop Order on Trading 212: %s (id=%s)", pos.ticker, order_id)
+            return order_id
         except Exception as exc:
             setattr(pos, "_last_stop_fail_time", time.time())
             logger.error("Failed to place native broker Stop Order for %s on Trading 212: %s", pos.ticker, exc)
@@ -375,18 +439,20 @@ class PositionMonitor:
                 )
             except Exception as first_exc:
                 logger.debug("Limit order with validity GOOD_TILL_CANCEL failed (%s), attempting DAY...", first_exc)
-                delay = getattr(self.t212, "rate_limit_delay", 1.25)
-                time.sleep(delay)
+                delay = self._rate_limit_delay
+                if delay > 0:
+                    time.sleep(delay)
                 res = self.t212.place_limit_order(
                     ticker=pos.ticker,
                     quantity=order_qty,
                     limit_price=round(price, 2),
                     time_validity="DAY",
                 )
-            pos.broker_tp_order_id = res.id
+            order_id = str(res.id) if hasattr(res, "id") and res.id is not None else str(res)
+            pos.broker_tp_order_id = order_id
             self._save_state()
-            logger.info("Successfully placed broker Limit Order on Trading 212: %s (id=%s)", pos.ticker, res.id)
-            return res.id
+            logger.info("Successfully placed broker Limit Order on Trading 212: %s (id=%s)", pos.ticker, order_id)
+            return order_id
         except Exception as exc:
             logger.debug("Placing native broker Limit Order for %s deferred: %s", pos.ticker, exc)
             return None
@@ -436,12 +502,44 @@ class PositionMonitor:
                 order_id = self.place_broker_stop(pos)
                 if order_id:
                     synced.append(ticker)
-                delay = getattr(self.t212, "rate_limit_delay", 1.25)
-                time.sleep(delay)
+                delay = self._rate_limit_delay
+                if delay > 0:
+                    time.sleep(delay)
         if synced:
             self._save_state()
             logger.info("Synced native broker stops for %d positions: %s", len(synced), synced)
         return synced
+
+    def sync_broker_tp_limits(self) -> List[str]:
+        """Ensure all active positions have an active native GTC Take Profit Limit Order on Trading 212."""
+        synced = []
+        now = time.time()
+        for ticker, pos in list(self.positions.items()):
+            if not pos.is_closed and pos.remaining_quantity > 0 and not pos.tp1_hit and not pos.broker_tp_order_id:
+                last_fail = getattr(pos, "_last_tp_fail_time", 0.0)
+                if now - last_fail < 180.0:
+                    logger.debug("Cooldown active for %s TP limit sync (failed %.1fs ago)", ticker, now - last_fail)
+                    continue
+
+                logger.info("Syncing missing broker Take Profit Limit Order for %s @ $%.2f...", ticker, pos.tp1)
+                order_id = self.place_broker_tp_limit(pos)
+                if order_id:
+                    synced.append(ticker)
+                else:
+                    setattr(pos, "_last_tp_fail_time", now)
+                delay = self._rate_limit_delay
+                if delay > 0:
+                    time.sleep(delay)
+        if synced:
+            self._save_state()
+            logger.info("Synced native broker TP limits for %d positions: %s", len(synced), synced)
+        return synced
+
+    def sync_broker_orders(self) -> Dict[str, List[str]]:
+        """Ensure all active positions have native GTC Stop and TP Limit orders placed on Trading 212."""
+        synced_stops = self.sync_broker_stops()
+        synced_tps = self.sync_broker_tp_limits()
+        return {"stops": synced_stops, "tps": synced_tps}
 
     def apply_daily_rollover_stops(self) -> List[Dict[str, Any]]:
         """Apply new-day session stop loss elevation to permanently lock in prior-day gains.
@@ -679,16 +777,11 @@ class PositionMonitor:
                     so_id = str(so.get("id") if isinstance(so, dict) else getattr(so, "id", "")) if so else None
                     so_price = float(so.get("stopPrice", 0.0) if isinstance(so, dict) else getattr(so, "stop_price", 0.0)) if so else 0.0
 
-                    if so_price > 0:
-                        sl = round(so_price, 2)
-                        sl_dist = abs(avg_px - sl)
-                    else:
-                        sl_dist = round(avg_px * 0.05, 2)
-                        sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
-
-                    tp1 = round(avg_px + sl_dist, 2) if direction == "LONG" else round(avg_px - sl_dist, 2)
-                    tp2 = round(avg_px + 2 * sl_dist, 2) if direction == "LONG" else round(avg_px - 2 * sl_dist, 2)
-                    tp3 = round(avg_px + 3 * sl_dist, 2) if direction == "LONG" else round(avg_px - 3 * sl_dist, 2)
+                    levels = self.calculate_exit_levels(
+                        entry_price=avg_px,
+                        direction=direction,
+                        existing_stop_price=so_price if so_price > 0 else None,
+                    )
 
                     broker_stop_id = so_id if so_id else (f"DRY_STOP_{b_ticker}_{int(time.time())}" if self.dry_run else None)
 
@@ -703,14 +796,14 @@ class PositionMonitor:
                         entry_price=avg_px,
                         original_quantity=bp.quantity,
                         remaining_quantity=bp.quantity,
-                        stop_loss=sl,
-                        trailing_stop_loss=sl,
+                        stop_loss=levels["stop_loss"],
+                        trailing_stop_loss=levels["trailing_stop_loss"],
                         highest_price=max(avg_px, cur_px),
                         lowest_price=min(avg_px, cur_px),
-                        tp1=tp1,
-                        tp2=tp2,
-                        tp3=tp3,
-                        atr=round(avg_px * 0.025, 2),
+                        tp1=levels["tp1"],
+                        tp2=levels["tp2"],
+                        tp3=levels["tp3"],
+                        atr=levels["atr"],
                         strategy_type="broker_placed",
                         broker_stop_order_id=broker_stop_id,
                         broker_tp_order_id=broker_tp_id,
@@ -720,9 +813,28 @@ class PositionMonitor:
                     self.positions[b_ticker] = adopted_pos
                     summary["adopted_from_broker"].append(b_ticker)
                     logger.info(
-                        "Reconciliation: Adopted broker-placed position %s (%s, %.3f shares @ $%.2f, SL: $%.2f, StopID: %s)",
-                        b_ticker, underlying, bp.quantity, avg_px, sl, broker_stop_id,
+                        "Reconciliation: Adopted broker-placed position %s (%s, %.3f shares @ $%.2f, SL: $%.2f, TP1: $%.2f, StopID: %s)",
+                        b_ticker, underlying, bp.quantity, avg_px, levels["stop_loss"], levels["tp1"], broker_stop_id,
                     )
+
+                    # Automatically set native broker orders on Trading 212 if missing
+                    if not adopted_pos.broker_stop_order_id:
+                        try:
+                            logger.info("Setting missing native Stop Order for adopted position %s...", b_ticker)
+                            stop_id = self.place_broker_stop(adopted_pos)
+                            if stop_id:
+                                adopted_pos.broker_stop_order_id = stop_id
+                        except Exception as stop_exc:
+                            logger.debug("Auto-place broker stop on adoption notice: %s", stop_exc)
+
+                    if not adopted_pos.broker_tp_order_id and not adopted_pos.tp1_hit:
+                        try:
+                            logger.info("Setting missing native TP Limit Order for adopted position %s...", b_ticker)
+                            tp_id = self.place_broker_tp_limit(adopted_pos)
+                            if tp_id:
+                                adopted_pos.broker_tp_order_id = tp_id
+                        except Exception as tp_exc:
+                            logger.debug("Auto-place broker TP limit on adoption notice: %s", tp_exc)
 
         if (
             summary["closed_externally"]
@@ -1183,6 +1295,119 @@ class PositionMonitor:
         return events
 
     # ─────────────────────────────────────────────────────────────
+    # Active Trade Technical Signal Evaluation
+    # ─────────────────────────────────────────────────────────────
+    def evaluate_active_trade_signals(
+        self,
+        active_metrics: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Evaluate technical exit/trim signals specifically for active positions.
+
+        If active technical conditions (e.g. Connors 3-RSI overbought peak for Longs,
+        or oversold exhaustion for Shorts, or SMA5 reversion) are achieved, executes
+        trim or exit orders directly on Trading 212.
+        """
+        if getattr(self, "is_halted", False) or not self.positions:
+            return []
+
+        events = []
+        tickers_to_remove = []
+
+        for ticker, pos in list(self.positions.items()):
+            if pos.is_closed or (pos.remaining_quantity or 0.0) <= 0:
+                tickers_to_remove.append(ticker)
+                continue
+
+            metrics = active_metrics.get(pos.underlying) or active_metrics.get(pos.ticker)
+            if not metrics:
+                continue
+
+            # Update indicators on position
+            if metrics.get("rsi3") is not None:
+                pos.rsi3 = float(metrics["rsi3"])
+            if metrics.get("rsi7") is not None:
+                pos.rsi7 = float(metrics["rsi7"])
+            if metrics.get("rsi14") is not None:
+                pos.rsi14 = float(metrics["rsi14"])
+            if metrics.get("sma5") is not None:
+                pos.sma5 = float(metrics["sma5"])
+
+            cur_px = pos.current_price or pos.entry_price
+            if cur_px <= 0 or pos.entry_price <= 0:
+                continue
+
+            is_short = (pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"))
+            pnl_pct = ((pos.entry_price - cur_px) / pos.entry_price * 100.0) if is_short else ((cur_px - pos.entry_price) / pos.entry_price * 100.0)
+
+            # 1. Connors 3-RSI Mean Reversion Overbought Profit-Taking (LONG)
+            if not is_short:
+                # Overbought peak: RSI3 >= 75 with at least +1% profit
+                if pos.rsi3 is not None and pos.rsi3 >= 75.0 and pnl_pct > 1.0:
+                    if not pos.tp1_hit:
+                        logger.info(
+                            "🎯 Signal Achieved for %s: Connors 3-RSI Overbought (%.1f >= 75.0, PnL +%.2f%%). Executing TP1 trim.",
+                            ticker, pos.rsi3, pnl_pct,
+                        )
+                        event = self._handle_tp1_hit(pos, cur_px)
+                        event["signal_reason"] = f"3RSI_OVERBOUGHT_{pos.rsi3:.1f}"
+                        events.append(event)
+                    elif not pos.tp2_hit and pos.rsi3 >= 82.0 and pnl_pct > 3.0:
+                        logger.info(
+                            "🎯 Signal Achieved for %s: Connors 3-RSI Extreme Overbought (%.1f >= 82.0, PnL +%.2f%%). Executing TP2 trim.",
+                            ticker, pos.rsi3, pnl_pct,
+                        )
+                        event = self._handle_tp2_hit(pos, cur_px)
+                        event["signal_reason"] = f"3RSI_EXTREME_OVERBOUGHT_{pos.rsi3:.1f}"
+                        events.append(event)
+
+                # SMA5 Mean-Reversion Target: Price crossed above 5-day SMA with RSI3 >= 68 and +2% profit
+                elif (
+                    pos.sma5 is not None
+                    and cur_px > pos.sma5
+                    and pos.rsi3 is not None
+                    and pos.rsi3 >= 68.0
+                    and pnl_pct >= 2.0
+                    and not pos.tp1_hit
+                ):
+                    logger.info(
+                        "🎯 Signal Achieved for %s: Price (%.2f) > SMA5 (%.2f) with RSI3=%.1f (PnL +%.2f%%). Executing TP1 trim.",
+                        ticker, cur_px, pos.sma5, pos.rsi3, pnl_pct,
+                    )
+                    event = self._handle_tp1_hit(pos, cur_px)
+                    event["signal_reason"] = "SMA5_REVERSION_EXIT"
+                    events.append(event)
+
+            # 2. Connors 3-RSI Mean Reversion Oversold Cover (SHORT)
+            else:
+                # Oversold trough: RSI3 <= 25 with at least +1% profit
+                if pos.rsi3 is not None and pos.rsi3 <= 25.0 and pnl_pct > 1.0:
+                    if not pos.tp1_hit:
+                        logger.info(
+                            "🎯 Signal Achieved for %s: Connors 3-RSI Oversold Cover (%.1f <= 25.0, PnL +%.2f%%). Executing TP1 trim.",
+                            ticker, pos.rsi3, pnl_pct,
+                        )
+                        event = self._handle_tp1_hit(pos, cur_px)
+                        event["signal_reason"] = f"3RSI_OVERSOLD_COVER_{pos.rsi3:.1f}"
+                        events.append(event)
+                    elif not pos.tp2_hit and pos.rsi3 <= 18.0 and pnl_pct > 3.0:
+                        logger.info(
+                            "🎯 Signal Achieved for %s: Connors 3-RSI Extreme Oversold Cover (%.1f <= 18.0, PnL +%.2f%%). Executing TP2 trim.",
+                            ticker, pos.rsi3, pnl_pct,
+                        )
+                        event = self._handle_tp2_hit(pos, cur_px)
+                        event["signal_reason"] = f"3RSI_EXTREME_OVERSOLD_COVER_{pos.rsi3:.1f}"
+                        events.append(event)
+
+        for t in tickers_to_remove:
+            if t in self.positions:
+                del self.positions[t]
+
+        if events:
+            self._save_state()
+
+        return events
+
+    # ─────────────────────────────────────────────────────────────
     # Internal Target Handlers
     # ─────────────────────────────────────────────────────────────
     @staticmethod
@@ -1212,6 +1437,8 @@ class PositionMonitor:
             direction=pos.direction,
         )
         trim_pct = getattr(self.risk_manager, "tp1_trim_pct", settings.TP1_TRIM_PCT)
+        if not isinstance(trim_pct, (int, float)):
+            trim_pct = settings.TP1_TRIM_PCT
         trim_shares = round(pos.original_quantity * trim_pct, 3)
         actual_trim = min(trim_shares, pos.remaining_quantity)
         pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
@@ -1224,7 +1451,7 @@ class PositionMonitor:
 
         # Cancel pending broker stop and limit orders to unblock shares for sell execution
         self.cancel_all_broker_orders(pos)
-        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        delay = self._rate_limit_delay
         if not self.dry_run and delay > 0:
             time.sleep(delay)
 
@@ -1235,6 +1462,14 @@ class PositionMonitor:
 
         # Update native broker stop order on Trading 212 for remaining shares
         self.place_broker_stop(pos, stop_price=pos.entry_price)
+        if pos.remaining_quantity > 0 and pos.tp2 > 0:
+            tp2_trim_pct = getattr(self.risk_manager, "tp2_trim_pct", settings.TP2_TRIM_PCT)
+            if not isinstance(tp2_trim_pct, (int, float)):
+                tp2_trim_pct = settings.TP2_TRIM_PCT
+            tp2_shares = round(pos.original_quantity * tp2_trim_pct, 3)
+            actual_tp2_shares = min(tp2_shares, pos.remaining_quantity)
+            if actual_tp2_shares > 0:
+                self.place_broker_tp_limit(pos, limit_price=pos.tp2, quantity=actual_tp2_shares)
 
         # Notify
         self.notifier.notify_tp1(
@@ -1256,6 +1491,8 @@ class PositionMonitor:
         pos.tp1_armed_hysteresis = False
         pos.tp1_stop_elevated = True
         trim_pct = getattr(self.risk_manager, "tp2_trim_pct", settings.TP2_TRIM_PCT)
+        if not isinstance(trim_pct, (int, float)):
+            trim_pct = settings.TP2_TRIM_PCT
         trim_shares = round(pos.original_quantity * trim_pct, 3)
         actual_trim = min(trim_shares, pos.remaining_quantity)
         pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
@@ -1272,7 +1509,7 @@ class PositionMonitor:
 
         # Cancel pending broker orders to unblock shares for sell execution
         self.cancel_all_broker_orders(pos)
-        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        delay = self._rate_limit_delay
         if not self.dry_run and delay > 0:
             time.sleep(delay)
 
@@ -1283,6 +1520,8 @@ class PositionMonitor:
 
         # Update native broker stop order on Trading 212 for remaining shares
         self.place_broker_stop(pos, stop_price=pos.trailing_stop_loss)
+        if pos.remaining_quantity > 0 and pos.tp3 > 0:
+            self.place_broker_tp_limit(pos, limit_price=pos.tp3, quantity=pos.remaining_quantity)
 
         # Notify
         self.notifier.notify_tp2(
@@ -1308,7 +1547,7 @@ class PositionMonitor:
 
         # Cancel all pending broker orders on Trading 212
         self.cancel_all_broker_orders(pos)
-        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        delay = self._rate_limit_delay
         if not self.dry_run and delay > 0:
             time.sleep(delay)
 
@@ -1337,7 +1576,7 @@ class PositionMonitor:
 
         # Cancel all pending broker orders on Trading 212
         self.cancel_all_broker_orders(pos)
-        delay = getattr(self.t212, "rate_limit_delay", 1.25)
+        delay = self._rate_limit_delay
         if not self.dry_run and delay > 0:
             time.sleep(delay)
 
@@ -1400,7 +1639,7 @@ class PositionMonitor:
             }
             tmp_file = f"{self.state_file}.tmp.{os.getpid()}"
             with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(raw, f, indent=2)
+                json.dump(raw, f, indent=2, default=str)
             os.replace(tmp_file, self.state_file)
         except Exception as exc:
             logger.warning("Failed to save position monitor state to %s: %s", self.state_file, exc)
