@@ -454,6 +454,7 @@ class PositionMonitor:
             logger.info("Successfully placed broker Limit Order on Trading 212: %s (id=%s)", pos.ticker, order_id)
             return order_id
         except Exception as exc:
+            setattr(pos, "_last_tp_fail_time", time.time())
             logger.debug("Placing native broker Limit Order for %s deferred: %s", pos.ticker, exc)
             return None
 
@@ -517,8 +518,7 @@ class PositionMonitor:
         for ticker, pos in list(self.positions.items()):
             if not pos.is_closed and pos.remaining_quantity > 0 and not pos.tp1_hit and not pos.broker_tp_order_id:
                 last_fail = getattr(pos, "_last_tp_fail_time", 0.0)
-                if now - last_fail < 180.0:
-                    logger.debug("Cooldown active for %s TP limit sync (failed %.1fs ago)", ticker, now - last_fail)
+                if now - last_fail < 900.0:
                     continue
 
                 logger.info("Syncing missing broker Take Profit Limit Order for %s @ $%.2f...", ticker, pos.tp1)
@@ -833,7 +833,10 @@ class PositionMonitor:
                             tp_id = self.place_broker_tp_limit(adopted_pos)
                             if tp_id:
                                 adopted_pos.broker_tp_order_id = tp_id
+                            else:
+                                setattr(adopted_pos, "_last_tp_fail_time", time.time())
                         except Exception as tp_exc:
+                            setattr(adopted_pos, "_last_tp_fail_time", time.time())
                             logger.debug("Auto-place broker TP limit on adoption notice: %s", tp_exc)
 
         if (
