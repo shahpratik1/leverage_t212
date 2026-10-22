@@ -241,19 +241,20 @@ class TestAntigravityAgenticSystem(unittest.TestCase):
     def test_new_bluechip_and_thematic_pairs(self):
         """Verify SPCX, SMCI, and bluechip pairs exist and resolve to valid leveraged ETPs."""
         u = LeveragedUniverse()
+        # EUR preferred primary tickers
         expected = {
-            "SPCX": "ELONl_EQ",
-            "SMCI": "SMCIl_EQ",
+            "SPCX": "ELONm_EQ",
+            "SMCI": "SMCIm_EQ",
             "META": "3LFEl_EQ",
-            "NFLX": "NFL3l_EQ",
-            "COIN": "3LCOOl_EQ",
-            "ORCL": "ORC3l_EQ",
-            "INTC": "3INTl_EQ",
-            "QCOM": "QCO3l_EQ",
-            "BA": "BA3l_EQ",
-            "UBER": "3LUBl_EQ",
-            "BABA": "3BABl_EQ",
-            "CRM": "CRM3l_EQ",
+            "NFLX": "3NFEl_EQ",
+            "COIN": "3LCOm_EQ",
+            "ORCL": "ORC3a_EQ",
+            "INTC": "3INTl_EQ",  # GBX fallback
+            "QCOM": "QCO3a_EQ",
+            "BA": "3BAEl_EQ",
+            "UBER": "3LUEl_EQ",
+            "BABA": "3BBEl_EQ",
+            "CRM": "3CREl_EQ",
             "DFNS": "3EDFl_EQ",
         }
         for sym, exp_long in expected.items():

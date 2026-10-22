@@ -19,34 +19,34 @@ class TestCryptoCommodityVolSizing(unittest.TestCase):
         btc_pair = self.universe.get_pair_for_underlying("BTC-USD")
         self.assertIsNotNone(btc_pair)
         self.assertEqual(btc_pair.category, "Crypto")
-        self.assertEqual(btc_pair.long_3x_ticker, "3BTCl_EQ")
-        self.assertEqual(btc_pair.short_3x_ticker, "3BTSl_EQ")
+        self.assertEqual(btc_pair.long_3x_ticker, "BTC3EURs_EQ")
+        self.assertEqual(btc_pair.short_3x_ticker, "BTC3SEURs_EQ")
 
         eth_pair = self.universe.get_pair_for_underlying("ETH-USD")
         self.assertIsNotNone(eth_pair)
         self.assertEqual(eth_pair.category, "Crypto")
-        self.assertEqual(eth_pair.long_3x_ticker, "3ETHl_EQ")
-        self.assertEqual(eth_pair.short_3x_ticker, "3ETSl_EQ")
+        self.assertEqual(eth_pair.long_3x_ticker, "ETH3EURs_EQ")
+        self.assertEqual(eth_pair.short_3x_ticker, "ETH3SEURs_EQ")
 
         # Execution ticker lookup
         long_btc = self.universe.get_execution_ticker("BTC-USD", "LONG")
         short_btc = self.universe.get_execution_ticker("BTC-USD", "SHORT")
-        self.assertEqual(long_btc, "3BTCl_EQ")
-        self.assertEqual(short_btc, "3BTSl_EQ")
+        self.assertEqual(long_btc, "BTC3EURs_EQ")
+        self.assertEqual(short_btc, "BTC3SEURs_EQ")
 
     def test_commodity_universe_pairs_exist(self):
         """Verify Copper and Brent Crude 3x pairs resolve correctly."""
         copper_pair = self.universe.get_pair_for_underlying("HG=F")
         self.assertIsNotNone(copper_pair)
         self.assertEqual(copper_pair.category, "Commodity")
-        self.assertEqual(copper_pair.long_3x_ticker, "3CPRl_EQ")
-        self.assertEqual(copper_pair.short_3x_ticker, "3CPSl_EQ")
+        self.assertEqual(copper_pair.long_3x_ticker, "3HCLm_EQ")
+        self.assertEqual(copper_pair.short_3x_ticker, "3HCSm_EQ")
 
         brent_pair = self.universe.get_pair_for_underlying("BNO")
         self.assertIsNotNone(brent_pair)
         self.assertEqual(brent_pair.category, "Commodity")
-        self.assertEqual(brent_pair.long_3x_ticker, "3BCOl_EQ")
-        self.assertEqual(brent_pair.short_3x_ticker, "3BCSl_EQ")
+        self.assertEqual(brent_pair.long_3x_ticker, "3BRLm_EQ")
+        self.assertEqual(brent_pair.short_3x_ticker, "3BRSm_EQ")
 
     def test_volatility_targeted_budget_formula(self):
         """Test the mathematical behavior of calculate_volatility_targeted_size."""
@@ -127,7 +127,7 @@ class TestCryptoCommodityVolSizing(unittest.TestCase):
 
         self.assertEqual(card.realized_vol, 0.65)
         self.assertEqual(card.ticker, "BTC-USD")
-        self.assertEqual(card.trading212_ticker, "3BTCl_EQ")
+        self.assertEqual(card.trading212_ticker, "BTC3EURs_EQ")
         self.assertEqual(card.decision, "BUY_ENTRY")
         # Volatility budget for 0.65 vol: 10000 * (0.20 / 1.95) = ~102.56
         self.assertLess(card.position_notional, 500.0)

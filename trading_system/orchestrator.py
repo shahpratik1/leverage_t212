@@ -489,7 +489,7 @@ class Orchestrator:
         is_synthetic = (
             getattr(card, "is_synthetic", False)
             or MarketDataProvider.is_ticker_synthetic(card.ticker)
-            or getattr(MarketDataProvider, "LAST_FETCH_WAS_SYNTHETIC", False)
+            or (bool(card.trading212_ticker) and MarketDataProvider.is_ticker_synthetic(card.trading212_ticker))
         )
         if not self.dry_run and is_synthetic:
             logger.critical(
@@ -514,13 +514,28 @@ class Orchestrator:
         fill_price: Optional[float] = None
         if not self.dry_run:
             try:
+                order_qty = card.position_size_shares
+                try:
+                    inst = self.t212.get_instrument_by_symbol(card.trading212_ticker)
+                    if inst and inst.min_trade_quantity and order_qty < inst.min_trade_quantity:
+                        est_notional = inst.min_trade_quantity * (card.entry_price or 1.0)
+                        if est_notional <= (account_total * 0.25):
+                            logger.info(
+                                "Adjusting %s order quantity from %.3f to broker minimum %.3f",
+                                card.trading212_ticker, order_qty, inst.min_trade_quantity,
+                            )
+                            order_qty = inst.min_trade_quantity
+                            card.position_size_shares = order_qty
+                except Exception as inst_exc:
+                    logger.debug("Could not verify instrument min quantity for %s: %s", card.trading212_ticker, inst_exc)
+
                 logger.info(
                     "Placing Trading 212 order: %s (%s) — %.3f shares @ ≈$%.2f",
-                    card.trading212_ticker, card.direction, card.position_size_shares, card.entry_price
+                    card.trading212_ticker, card.direction, order_qty, card.entry_price
                 )
                 entry_order = self.t212.place_market_order(
                     ticker=card.trading212_ticker,
-                    quantity=card.position_size_shares,
+                    quantity=order_qty,
                 )
                 order_id = entry_order.id
                 logger.info("Order executed successfully: id=%s", order_id)

@@ -35,14 +35,14 @@ class TestWorldwideThematicExpansion(unittest.TestCase):
     def test_all_8_worldwide_and_thematic_pairs_exist(self):
         """Verify all 8 worldwide sovereign and thematic pairs are present in LeveragedUniverse."""
         expected_pairs = {
-            "EWY": ("3KORl_EQ", "SKORl_EQ"),
-            "EWJ": ("JPN3l_EQ", "JPNSl_EQ"),
-            "^FCHI": ("3CACl_EQ", "3CSAl_EQ"),
-            "FTSEMIB.MI": ("3ITLl_EQ", "3ITSl_EQ"),
-            "INDA": ("3INDl_EQ", "INDSl_EQ"),
-            "BOTZ": ("GPT3l_EQ", "GPTSl_EQ"),
-            "AMD": ("AMD3l_EQ", "3SAMl_EQ"),
-            "ASML": ("3ASMl_EQ", "None"),
+            "EWY": ("3SKEl_EQ", "SKORl_EQ"),
+            "EWJ": ("3JPEl_EQ", "JPNSl_EQ"),
+            "^FCHI": ("3LVd_EQ", "3DECd_EQ"),
+            "FTSEMIB.MI": ("5ITLm_EQ", "5ITSm_EQ"),
+            "INDA": ("3INDd_EQ", "SIN3d_EQ"),
+            "BOTZ": ("GPT3m_EQ", "GPTSl_EQ"),
+            "AMD": ("3ADEl_EQ", "3SAMl_EQ"),
+            "ASML": ("3ASMl1_EQ", "SASLl_EQ"),
         }
 
         all_underlyings = self.universe.get_all_underlyings()
@@ -56,62 +56,62 @@ class TestWorldwideThematicExpansion(unittest.TestCase):
                 self.assertEqual(pair.short_3x_ticker, expected_short)
 
     def test_execution_tickers_resolution(self):
-        """Verify get_execution_ticker returns the right ETP for LONG and SHORT."""
-        self.assertEqual(self.universe.get_execution_ticker("EWY", "LONG"), "3KORl_EQ")
+        """Verify get_execution_ticker returns the right ETP for LONG and SHORT (EUR first preference)."""
+        self.assertEqual(self.universe.get_execution_ticker("EWY", "LONG"), "3SKEl_EQ")
         self.assertEqual(self.universe.get_execution_ticker("EWY", "SHORT"), "SKORl_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("EWJ", "LONG"), "JPN3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("EWJ", "LONG"), "3JPEl_EQ")
         self.assertEqual(self.universe.get_execution_ticker("EWJ", "SHORT"), "JPNSl_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("^FCHI", "LONG"), "3CACl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("^FCHI", "SHORT"), "3CSAl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("^FCHI", "LONG"), "3LVd_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("^FCHI", "SHORT"), "3DECd_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("FTSEMIB.MI", "LONG"), "3ITLl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("FTSEMIB.MI", "SHORT"), "3ITSl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("FTSEMIB.MI", "LONG"), "5ITLm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("FTSEMIB.MI", "SHORT"), "5ITSm_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("INDA", "LONG"), "3INDl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("INDA", "SHORT"), "INDSl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("INDA", "LONG"), "3INDd_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("INDA", "SHORT"), "SIN3d_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("BOTZ", "LONG"), "GPT3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("BOTZ", "LONG"), "GPT3m_EQ")
         self.assertEqual(self.universe.get_execution_ticker("BOTZ", "SHORT"), "GPTSl_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("AMD", "LONG"), "AMD3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("AMD", "LONG"), "3ADEl_EQ")
         self.assertEqual(self.universe.get_execution_ticker("AMD", "SHORT"), "3SAMl_EQ")
 
-        self.assertEqual(self.universe.get_execution_ticker("ASML", "LONG"), "3ASMl_EQ")
-        self.assertIsNone(self.universe.get_execution_ticker("ASML", "SHORT"))
+        self.assertEqual(self.universe.get_execution_ticker("ASML", "LONG"), "3ASMl1_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("ASML", "SHORT"), "SASLl_EQ")
 
     def test_index_aliases_resolution(self):
-        """Verify index aliases resolve correctly to underlyings and execution tickers."""
+        """Verify index aliases resolve correctly to underlyings and execution tickers (EUR first preference)."""
         # Japan Nikkei
         pair_nikkei = self.universe.get_pair_for_underlying("^N225")
         self.assertIsNotNone(pair_nikkei)
         self.assertEqual(pair_nikkei.underlying_symbol, "EWJ")
-        self.assertEqual(self.universe.get_execution_ticker("NIKKEI", "LONG"), "JPN3l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("NIKKEI", "LONG"), "3JPEl_EQ")
 
         # South Korea KOSPI
         pair_kospi = self.universe.get_pair_for_underlying("^KS11")
         self.assertIsNotNone(pair_kospi)
         self.assertEqual(pair_kospi.underlying_symbol, "EWY")
-        self.assertEqual(self.universe.get_execution_ticker("KOSPI", "LONG"), "3KORl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("KOSPI", "LONG"), "3SKEl_EQ")
 
         # France CAC 40
         pair_cac = self.universe.get_pair_for_underlying("CAC40")
         self.assertIsNotNone(pair_cac)
         self.assertEqual(pair_cac.underlying_symbol, "^FCHI")
-        self.assertEqual(self.universe.get_execution_ticker("CAC40", "LONG"), "3CACl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("CAC40", "LONG"), "3LVd_EQ")
 
         # Italy FTSE MIB
         pair_mib = self.universe.get_pair_for_underlying("FTSEMIB")
         self.assertIsNotNone(pair_mib)
         self.assertEqual(pair_mib.underlying_symbol, "FTSEMIB.MI")
-        self.assertEqual(self.universe.get_execution_ticker("MIB", "LONG"), "3ITLl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("MIB", "LONG"), "5ITLm_EQ")
 
         # India Nifty
         pair_nifty = self.universe.get_pair_for_underlying("NIFTY")
         self.assertIsNotNone(pair_nifty)
         self.assertEqual(pair_nifty.underlying_symbol, "INDA")
-        self.assertEqual(self.universe.get_execution_ticker("^NSEI", "LONG"), "3INDl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("^NSEI", "LONG"), "3INDd_EQ")
 
         # ASML Amsterdam alias
         pair_asml = self.universe.get_pair_for_underlying("ASML.AS")
@@ -215,44 +215,48 @@ class TestWorldwideThematicExpansion(unittest.TestCase):
 
 
     def test_multi_asset_worldwide_curated_expansion(self):
-        """Verify all 63 multi-asset pairs, aliases, crypto sessions, and categories."""
+        """Verify all multi-asset pairs, aliases, crypto sessions, and categories."""
         # 1. Total pairs count
-        self.assertEqual(len(self.universe.pairs), 63)
+        self.assertEqual(len(self.universe.pairs), 105)
 
-        # 2. Key newly added assets lookup
+        # 2. Key newly added assets lookup (EUR first preference)
         expanded_checks = {
-            "UNG": ("Commodity", "3NGLl_EQ", "3NGSl_EQ"),
-            "URNM": ("Commodity", "URNMl_EQ", None),
-            "COFF": ("Commodity", "3COFl_EQ", "3COSVl_EQ"),
-            "WEAT": ("Commodity", "3WHLl_EQ", "3WETl_EQ"),
+            "UNG": ("Commodity", "3NGLm_EQ", "3NGSm_EQ"),
+            "URNM": ("Commodity", "U3O8d_EQ", None),
+            "COFF": ("Commodity", "3CFLm_EQ", None),
+            "WEAT": ("Commodity", "3WHLm_EQ", None),
             "3GIL": ("Fixed Income", "3GILl_EQ", "3GISl_EQ"),
-            "BUND": ("Fixed Income", "3BUNl_EQ", "3BUSl_EQ"),
-            "HYG": ("Fixed Income", "HYGl_EQ", None),
-            "SOL-USD": ("Crypto", "3SOLl_EQ", "3SOSl_EQ"),
-            "XRP-USD": ("Crypto", "XRPl_EQ", None),
-            "ADA-USD": ("Crypto", "ADAl_EQ", None),
-            "XLF": ("Sector ETF", "3LFLl_EQ", "3SFLl_EQ"),
-            "XLE": ("Sector ETF", "3LENl_EQ", "3SENl_EQ"),
-            "XLV": ("Sector ETF", "3LHLl_EQ", None),
-            "XLI": ("Sector ETF", "XLIl_EQ", None),
-            "SMH": ("Sector ETF", "3SMHl_EQ", "3SMSl_EQ"),
-            "NVO": ("Global Equity", "3NONl_EQ", None),
-            "MC.PA": ("Global Equity", "3LVHl_EQ", None),
-            "TM": ("Global Equity", "3TYTl_EQ", None),
-            "EURUSD=X": ("Currency", "USEUl_EQ", "EUUSl_EQ"),
+            "BUND": ("Fixed Income", "3BULm_EQ", "3BUSm_EQ"),
+            "MSTR": ("Crypto", "3LMIm_EQ", "3SMIm_EQ"),
+            "SPOT": ("Mega-Cap Tech", "3LPOm_EQ", None),
+            "PYPL": ("Crypto & Fintech", "3LPPm_EQ", None),
+            "MRNA": ("Healthcare", "3LMOp_EQ", "3SMOp_EQ"),
+            "XLF": ("Sector ETF", "3XFEl_EQ", "SXFEl_EQ"),
+            "BP": ("Commodity", "3BPEl_EQ", "3SBPl_EQ"),
+            "ARKK": ("Thematic", "3AREl_EQ", "SAKEl_EQ"),
+            "MARA": ("Crypto & Blockchain", "MAR3a_EQ", None),
+            "OKLO": ("Nuclear & Clean Tech", "OKL3a_EQ", None),
+            "BTP": ("Fixed Income", "3BTLm_EQ", "3BTSm_EQ"),
+            "DIS": ("Media & Entertainment", "3DIEl_EQ", "SDIEl_EQ"),
+            "UNH": ("Healthcare", "3UNHl_EQ", None),
+            "BAE": ("Space & Aerospace", "3LBA1l_EQ", "3SBAl_EQ"),
+            "SMH": ("Sector ETF", "SM3El_EQ", "3SMSl_EQ"),
+            "AZN": ("Healthcare", "3LAZl_EQ", "3SAZl_EQ"),
+            "SHEL": ("Commodity", "3LRDl_EQ", None),
+            "RR": ("Space & Aerospace", "3LRRl_EQ", None),
             "GBPUSD=X": ("Currency", "GBUSl_EQ", "USGBl_EQ"),
             # Frontier themes: Quantum, Space, Memory, AI Infrastructure, Cybersecurity
-            "IONQ": ("Quantum Computing", "IONQl1_EQ", None),
-            "RGTI": ("Quantum Computing", "RGT3l_EQ", None),
-            "IBM": ("Quantum Computing", "IBM_US_EQ", None),
-            "RKLB": ("Space & Aerospace", "RKL3l_EQ", None),
-            "LUNR": ("Space & Aerospace", "LUNRl_EQ", None),
-            "MU": ("Memory & Storage", "MU2l_EQ", None),
-            "WDC": ("Memory & Storage", "WDC_US_EQ", None),
+            "IONQ": ("Quantum Computing", "ION3a_EQ", None),
+            "RGTI": ("Quantum Computing", "RGT3a_EQ", None),
+            "IBM": ("Quantum Computing", "IBMd_EQ", None),
+            "RKLB": ("Space & Aerospace", "RKL3a_EQ", None),
+            "LUNR": ("Space & Aerospace", "LUNAd_EQ", None),
+            "MU": ("Memory & Storage", "2MUEl_EQ", None),
+            "WDC": ("Memory & Storage", "WDCd_EQ", None),
             "AVGO": ("AI Infrastructure", "AVG3l_EQ", "SAVGl_EQ"),
-            "PLTR": ("AI Infrastructure", "3LPAl_EQ", "3SPAl_EQ"),
+            "PLTR": ("AI Infrastructure", "3LPAp_EQ", "3SPAp_EQ"),
             "ARM": ("AI Infrastructure", "ARM3l_EQ", None),
-            "CIBR": ("Cybersecurity", "CIBRl_EQ", None),
+            "CIBR": ("Cybersecurity", "CBRSd_EQ", None),
         }
 
         for underlying, (category, expected_long, expected_short) in expanded_checks.items():
@@ -266,43 +270,42 @@ class TestWorldwideThematicExpansion(unittest.TestCase):
             if expected_short is not None:
                 self.assertEqual(self.universe.get_execution_ticker(underlying, "SHORT"), expected_short)
 
-        # 3. Aliases resolution
-        self.assertEqual(self.universe.get_execution_ticker("NATGAS", "LONG"), "3NGLl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("COFFEE", "LONG"), "3COFl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("WHEAT", "LONG"), "3WHLl_EQ")
+        # 3. Aliases resolution (EUR first preference)
+        self.assertEqual(self.universe.get_execution_ticker("NATGAS", "LONG"), "3NGLm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("COFFEE", "LONG"), "3CFLm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("WHEAT", "LONG"), "3WHLm_EQ")
         self.assertEqual(self.universe.get_execution_ticker("GILTS", "LONG"), "3GILl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("GERMAN_BUND", "LONG"), "3BUNl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("LVMH", "LONG"), "3LVHl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("NOVO", "LONG"), "3NONl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("TOYOTA", "LONG"), "3TYTl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("EURUSD", "LONG"), "USEUl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("GERMAN_BUND", "LONG"), "3BULm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SHELL", "LONG"), "3LRDl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("ASTRA", "LONG"), "3LAZl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("ROLLS", "LONG"), "3LRRl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPOTIFY", "LONG"), "3LPOm_EQ")
         self.assertEqual(self.universe.get_execution_ticker("GBPUSD", "LONG"), "GBUSl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("SOL", "LONG"), "3SOLl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("XRP", "LONG"), "XRPl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("ADA", "LONG"), "ADAl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("MICROSTRATEGY", "LONG"), "3LMIm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("PAYPAL", "LONG"), "3LPPm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("MODERNA", "LONG"), "3LMOp_EQ")
         # Frontier thematic aliases
-        self.assertEqual(self.universe.get_execution_ticker("MICRON", "LONG"), "MU2l_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("MICRON", "LONG"), "2MUEl_EQ")
         self.assertEqual(self.universe.get_execution_ticker("BROADCOM", "LONG"), "AVG3l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("PALANTIR", "LONG"), "3LPAl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("ROCKETLAB", "LONG"), "RKL3l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("RIGETTI", "LONG"), "RGT3l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("SPACE", "LONG"), "LUNRl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("CYBER", "LONG"), "CIBRl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("CYBERSECURITY", "LONG"), "CIBRl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("PALANTIR", "LONG"), "3LPAp_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("ROCKETLAB", "LONG"), "RKL3a_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("RIGETTI", "LONG"), "RGT3a_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPACE", "LONG"), "ELONm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("CYBER", "LONG"), "CBRSd_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("CYBERSECURITY", "LONG"), "CBRSd_EQ")
 
-        # 4. Weekend 24/7 crypto availability for new tokens
+        # 4. Weekend 24/7 crypto availability for crypto tokens
         sat_date = datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc)
-        self.assertTrue(Trading212Client.is_asset_session_active("SOL-USD", now_utc=sat_date))
-        self.assertTrue(Trading212Client.is_asset_session_active("XRP-USD", now_utc=sat_date))
-        self.assertTrue(Trading212Client.is_asset_session_active("ADA-USD", now_utc=sat_date))
+        self.assertTrue(Trading212Client.is_asset_session_active("BTC-USD", now_utc=sat_date))
+        self.assertTrue(Trading212Client.is_asset_session_active("ETH-USD", now_utc=sat_date))
 
         # 5. Category resolution via get_category_for_symbol
-        self.assertEqual(self.universe.get_category_for_symbol("SOL-USD"), "Crypto")
-        self.assertEqual(self.universe.get_category_for_symbol("3SOLl_EQ"), "Crypto")
-        self.assertEqual(self.universe.get_category_for_symbol("EURUSD=X"), "Currency")
-        self.assertEqual(self.universe.get_category_for_symbol("USEUl_EQ"), "Currency")
+        self.assertEqual(self.universe.get_category_for_symbol("BTC-USD"), "Crypto")
+        self.assertEqual(self.universe.get_category_for_symbol("BTC3s_EQ"), "Crypto")
+        self.assertEqual(self.universe.get_category_for_symbol("GBPUSD=X"), "Currency")
+        self.assertEqual(self.universe.get_category_for_symbol("GBUSl_EQ"), "Currency")
         self.assertEqual(self.universe.get_category_for_symbol("XLF"), "Sector ETF")
-        self.assertEqual(self.universe.get_category_for_symbol("3LFLl_EQ"), "Sector ETF")
+        self.assertEqual(self.universe.get_category_for_symbol("3XLFl_EQ"), "Sector ETF")
         self.assertEqual(self.universe.get_category_for_symbol("BUND"), "Fixed Income")
         self.assertEqual(self.universe.get_category_for_symbol("3GIL"), "Fixed Income")
         self.assertEqual(self.universe.get_category_for_symbol("UNG"), "Commodity")

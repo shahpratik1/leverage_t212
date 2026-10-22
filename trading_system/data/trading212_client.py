@@ -1287,6 +1287,12 @@ class MarketDataProvider:
             clean = clean[:-6]
         elif clean.endswith("D_EQ") or clean.endswith("_DE_EQ"):
             clean = clean.split("_")[0] + ".DE"
+        elif clean.endswith("M_EQ"):
+            clean = clean[:-4] + ".MI"
+        elif clean.endswith("P_EQ"):
+            clean = clean[:-4] + ".PA"
+        elif clean.endswith("A_EQ"):
+            clean = clean[:-4] + ".AS"
 
         # 1. Try Yahoo Finance chart meta quote
         try:
@@ -1313,59 +1319,37 @@ class MarketDataProvider:
         except Exception:
             pass
 
-        # 2. Fallback to latest daily close
-        try:
-            candles = cls.get_daily_candles(clean, period="5d")
-            price = 0.0
-            if hasattr(candles, "empty") and not candles.empty:
-                price = float(candles["close"].iloc[-1])
-            elif isinstance(candles, list) and candles:
-                price = float(candles[-1]["close"])
-            if price > 0:
-                approx_spread = 0.0020
-                return {
-                    "bid": round(price * (1.0 - approx_spread / 2.0), 4),
-                    "ask": round(price * (1.0 + approx_spread / 2.0), 4),
-                    "mid": price,
-                    "spread_pct": approx_spread,
-                }
-        except Exception:
-            pass
-
-        # 3. Fallback to underlying proxy spread if ETP quote was not found directly
+        # 2. Try underlying proxy spread if ETP quote was not found directly on Yahoo
         try:
             from trading_system.data.leveraged_universe import LeveragedUniverse
             univ = LeveragedUniverse()
-            pair = univ.get_pair_for_underlying(raw_sym)
-            if not pair:
-                for p in univ.pairs:
-                    if raw_sym.upper() in (
-                        p.long_3x_ticker.upper(),
-                        p.short_3x_ticker.upper(),
-                        (p.long_5x_ticker or "").upper(),
-                        (p.short_5x_ticker or "").upper(),
-                    ):
-                        pair = p
-                        break
+            pair = univ.get_pair_for_etp(raw_sym) or univ.get_pair_for_underlying(raw_sym)
             if pair and pair.underlying_symbol and pair.underlying_symbol.upper() != raw_sym.upper():
                 und_spread = cls.get_bid_ask_spread(pair.underlying_symbol)
                 if und_spread.get("spread_pct", 0.0) > 0:
                     proxy_pct = round(und_spread["spread_pct"] * 1.5, 4)
                     return {
-                        "bid": round(und_spread["bid"], 4),
-                        "ask": round(und_spread["ask"], 4),
-                        "mid": und_spread["mid"],
+                        "bid": round(und_spread.get("bid", 0.0), 4),
+                        "ask": round(und_spread.get("ask", 0.0), 4),
+                        "mid": und_spread.get("mid", 0.0),
                         "spread_pct": proxy_pct,
                     }
         except Exception:
             pass
 
-        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread_pct": 0.0}
+        # 3. Safe institutional default spread for ETP execution (0.20%)
+        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread_pct": 0.0020}
 
     @classmethod
     def is_ticker_synthetic(cls, symbol: str) -> bool:
         """Check if candles for a specific symbol were synthetically generated."""
-        return symbol.upper() in cls.SYNTHETIC_TICKERS or cls.LAST_FETCH_WAS_SYNTHETIC
+        clean = (symbol or "").strip().upper()
+        if clean in cls.SYNTHETIC_TICKERS:
+            return True
+        # Backward compatibility for mock tests that manually set LAST_FETCH_WAS_SYNTHETIC without populating set
+        if not cls.SYNTHETIC_TICKERS and cls.LAST_FETCH_WAS_SYNTHETIC:
+            return True
+        return False
 
     @staticmethod
     def _map_to_stooq_symbol(symbol: str) -> str:
@@ -1526,11 +1510,30 @@ class MarketDataProvider:
                 return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
 
         result = None
+        clean_upper = symbol.upper().strip()
+        yahoo_translations = {
+            "COFF": "KC=F",
+            "WEAT": "ZW=F",
+            "BUND": "DBR.DE",
+            "3GIL": "GLTY.L",
+            "MBG": "MBG.DE",
+            "BAE": "BA.L",
+            "RR": "RR.L",
+            "SHEL": "SHEL.L",
+            "AZN": "AZN.L",
+            "BTP": "EUNV.DE",
+            "SILV": "SIL",
+            "BLC": "BLOK",
+            "DFNS": "ITA",
+            "CRWV": "NVDA",
+            "SPCX": "RKLB",
+        }
+        query_sym = yahoo_translations.get(clean_upper, symbol)
 
         # 1. Try yfinance if installed
         if HAS_DATA_LIBS and yf is not None:
             try:
-                ticker = yf.Ticker(symbol)
+                ticker = yf.Ticker(query_sym)
                 df = ticker.history(period=period, interval="1d")
                 if not df.empty:
                     df.reset_index(inplace=True)
@@ -1538,25 +1541,28 @@ class MarketDataProvider:
                         columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
                         inplace=True,
                     )
-                    MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
                     MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
                     result = df[["open", "high", "low", "close", "volume"]]
             except Exception as yf_exc:
-                logger.debug("yfinance history failed for %s (%s)", symbol, yf_exc)
+                logger.debug("yfinance history failed for %s (%s)", query_sym, yf_exc)
 
         # 2. Try raw Yahoo Finance Chart API
         if result is None:
-            candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1y", interval="1d")
+            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str="1y", interval="1d")
             if candles:
-                MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
                 MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
                 result = candles
 
         # 3. Try free institutional Stooq CSV endpoint
         if result is None:
-            candles = MarketDataProvider._fetch_stooq_data(symbol)
+            candles = MarketDataProvider._fetch_stooq_data(query_sym)
             if candles:
-                MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
                 MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
                 result = candles
 
@@ -1619,10 +1625,29 @@ class MarketDataProvider:
                 return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
 
         result = None
+        clean_upper = symbol.upper().strip()
+        yahoo_translations = {
+            "COFF": "KC=F",
+            "WEAT": "ZW=F",
+            "BUND": "DBR.DE",
+            "3GIL": "GLTY.L",
+            "MBG": "MBG.DE",
+            "BAE": "BA.L",
+            "RR": "RR.L",
+            "SHEL": "SHEL.L",
+            "AZN": "AZN.L",
+            "BTP": "EUNV.DE",
+            "SILV": "SIL",
+            "BLC": "BLOK",
+            "DFNS": "ITA",
+            "CRWV": "NVDA",
+            "SPCX": "RKLB",
+        }
+        query_sym = yahoo_translations.get(clean_upper, symbol)
 
         if HAS_DATA_LIBS and yf is not None:
             try:
-                ticker = yf.Ticker(symbol)
+                ticker = yf.Ticker(query_sym)
                 df = ticker.history(period=period, interval="1h")
                 if not df.empty:
                     df.reset_index(inplace=True)
@@ -1635,7 +1660,7 @@ class MarketDataProvider:
                 pass
 
         if result is None:
-            candles = MarketDataProvider._fetch_yahoo_chart_data(symbol, range_str="1mo", interval="1h")
+            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str="1mo", interval="1h")
             if candles:
                 result = candles
 

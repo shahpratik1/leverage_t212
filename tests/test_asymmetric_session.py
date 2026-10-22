@@ -45,6 +45,7 @@ class TestTrading212RateLimiter(unittest.TestCase):
             api_key="mock_key",
             base_url="https://demo.trading212.com/api/v0",
         )
+        self.client.client = None  # Force urllib path for mocked unit tests
         self.client.rate_limit_delay = 0.05  # use 50ms for fast unit test execution
 
     def tearDown(self):

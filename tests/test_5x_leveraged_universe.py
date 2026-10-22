@@ -36,36 +36,36 @@ class Test5xLeveragedUniverse(unittest.TestCase):
 
     def test_5x_ticker_resolution_long_and_short(self):
         """Resolution of 5x tickers replaces 5x with 3x for both Long and Inverse Short."""
-        # QQQ (Nasdaq 100): 5x replaced with 3x (QQQ3 / QQQS)
-        self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=5), "QQQ3l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=5), "QQQSl_EQ")
+        # QQQ (Nasdaq 100): 5x replaced with 3x EUR (QQQ3m / QQQSm)
+        self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=5), "QQQ3m_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=5), "QQQSm_EQ")
 
-        # SPY (S&P 500): 5x replaced with 3x (3USL / 3USS)
-        self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=5), "3USLl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=5), "3USSl_EQ")
+        # SPY (S&P 500): 5x replaced with 3x EUR (3USLm / 3USSm)
+        self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=5), "3USLm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=5), "3USSm_EQ")
 
-        # TLT (20+ Year Treasury Bond): 5x replaced with 3x (3TYL / 3TYS)
-        self.assertEqual(self.universe.get_execution_ticker("TLT", "LONG", leverage=5), "3TYLl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("TLT", "SHORT", leverage=5), "3TYSl_EQ")
+        # TLT (20+ Year Treasury Bond): 5x replaced with 3x EUR (3TYLm)
+        self.assertEqual(self.universe.get_execution_ticker("TLT", "LONG", leverage=5), "3TYLm_EQ")
+        self.assertIsNone(self.universe.get_execution_ticker("TLT", "SHORT", leverage=5))
 
-        # MAGS (Magnificent 7): 5x replaced with 3x (MAG7l_EQ)
-        self.assertEqual(self.universe.get_execution_ticker("MAGS", "LONG", leverage=5), "MAG7l_EQ")
+        # MAGS (Magnificent 7): 5x replaced with 3x EUR (MAG7m_EQ)
+        self.assertEqual(self.universe.get_execution_ticker("MAGS", "LONG", leverage=5), "MAG7m_EQ")
 
     def test_5x_fallback_to_3x_when_unavailable(self):
         """Requesting 5x on a single stock gracefully falls back to 3x."""
-        # NVDA has 3x Long (3LNV) and 3x Short (3SNV)
-        self.assertEqual(self.universe.get_execution_ticker("NVDA", "LONG", leverage=5), "3LNVl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("NVDA", "SHORT", leverage=5), "3SNVl_EQ")
+        # NVDA has 3x Long (3LVEl_EQ) and 3x Short (3SVEl_EQ) in EUR
+        self.assertEqual(self.universe.get_execution_ticker("NVDA", "LONG", leverage=5), "3LVEl_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("NVDA", "SHORT", leverage=5), "3SVEl_EQ")
 
-        # TSM has 3x Long (3TSM)
-        self.assertEqual(self.universe.get_execution_ticker("TSM", "LONG", leverage=5), "3TSMl_EQ")
+        # TSM has 3x Long EUR (TS3El_EQ)
+        self.assertEqual(self.universe.get_execution_ticker("TSM", "LONG", leverage=5), "TS3El_EQ")
 
     def test_standard_3x_resolution_preserved(self):
-        """Default leverage=3 resolution remains standard."""
-        self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=3), "QQQ3l_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=3), "QQQSl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=3), "3USLl_EQ")
-        self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=3), "3USSl_EQ")
+        """Default leverage=3 resolution remains standard (EUR first preference)."""
+        self.assertEqual(self.universe.get_execution_ticker("QQQ", "LONG", leverage=3), "QQQ3m_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("QQQ", "SHORT", leverage=3), "QQQSm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPY", "LONG", leverage=3), "3USLm_EQ")
+        self.assertEqual(self.universe.get_execution_ticker("SPY", "SHORT", leverage=3), "3USSm_EQ")
 
     def test_decision_card_leverage_tagging(self):
         """DecisionCard replaces leverage=5 and 5x tickers with 3x per policy."""
@@ -74,23 +74,23 @@ class Test5xLeveragedUniverse(unittest.TestCase):
         debate_mock.conviction_score = 0.90
         debate_mock.synthesis = "High conviction tech breakout."
 
-        # Pass 5x ticker ("QQQ5l_EQ") and leverage=5
+        # Pass 5x ticker ("5QQEl_EQ") and leverage=5
         card_5x = self.risk_manager.calculate_decision_card(
             ticker="QQQ",
-            trading212_ticker="QQQ5l_EQ",
+            trading212_ticker="5QQEl_EQ",
             direction="LONG",
             metrics={"close": 120.0, "atr": 2.5},
             debate_outcome=debate_mock,
             account_equity=10000.0,
             leverage=5,
         )
-        # Both leverage and ticker must be replaced with 3x
+        # Both leverage and ticker must be replaced with 3x EUR
         self.assertEqual(card_5x.leverage, 3)
-        self.assertEqual(card_5x.trading212_ticker, "QQQ3l_EQ")
+        self.assertEqual(card_5x.trading212_ticker, "QQQ3m_EQ")
 
         card_3x = self.risk_manager.calculate_decision_card(
             ticker="QQQ",
-            trading212_ticker="QQQ3l_EQ",
+            trading212_ticker="QQQ3m_EQ",
             direction="LONG",
             metrics={"close": 415.0, "atr": 8.5},
             debate_outcome=debate_mock,
@@ -98,7 +98,7 @@ class Test5xLeveragedUniverse(unittest.TestCase):
             leverage=3,
         )
         self.assertEqual(card_3x.leverage, 3)
-        self.assertEqual(card_3x.trading212_ticker, "QQQ3l_EQ")
+        self.assertEqual(card_3x.trading212_ticker, "QQQ3m_EQ")
 
     def test_validate_trade_rejects_excess_leverage_and_5x_tickers(self):
         """RiskManager.validate_trade strictly rejects cards with leverage > 3 or 5x tickers."""
@@ -110,7 +110,7 @@ class Test5xLeveragedUniverse(unittest.TestCase):
         # Card with 5x leverage
         card_invalid_leverage = DecisionCard(
             ticker="QQQ",
-            trading212_ticker="QQQ3l_EQ",
+            trading212_ticker="QQQ3m_EQ",
             direction="LONG",
             decision="BUY_ENTRY",
             entry_price=400.0,
