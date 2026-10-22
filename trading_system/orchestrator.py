@@ -917,16 +917,18 @@ class Orchestrator:
                     try:
                         t212_positions = self.t212.get_portfolio()
                         for p in t212_positions:
-                            if p.current_price > 0:
-                                current_prices[p.ticker] = p.current_price
+                            p_price = p.current_price or p.average_price or 0.0
+                            if p_price > 0:
+                                current_prices[p.ticker] = p_price
                     except Exception as e:
                         logger.debug("T212 portfolio price fetch: %s", e)
 
                     for ticker, pos in self.position_monitor.positions.items():
                         if ticker not in current_prices:
                             # Keep last known valid price from broker/position to avoid cross-asset price contamination
-                            if getattr(pos, "current_price", 0.0) > 0:
-                                current_prices[ticker] = pos.current_price
+                            pos_price = getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0
+                            if pos_price > 0:
+                                current_prices[ticker] = pos_price
                             # Fetch underlying price ONLY for underlying symbol, never assign to ETP ticker
                             try:
                                 daily = MarketDataProvider.get_daily_candles(pos.underlying, period="5d")

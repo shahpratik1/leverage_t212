@@ -592,11 +592,11 @@ class PositionMonitor:
                             logger.debug("Reconciliation exit notification failed: %s", notif_exc)
             else:
                 bp = broker_map[ticker]
-                cur_px = bp.current_price if bp.current_price > 0 else bp.average_price
-                if cur_px > 0:
+                cur_px = bp.current_price if (bp.current_price or 0.0) > 0 else (bp.average_price or 0.0)
+                if cur_px and cur_px > 0:
                     pos.current_price = cur_px
-                    pos.highest_price = max(pos.highest_price, cur_px)
-                    pos.lowest_price = min(pos.lowest_price, cur_px)
+                    pos.highest_price = max(pos.highest_price or cur_px, cur_px)
+                    pos.lowest_price = min(pos.lowest_price or cur_px, cur_px)
 
                 # Detect and fix entry-price currency scale mismatch (e.g. GBX pence stored vs EUR)
                 # If entry_price and broker average_price differ by more than 5× either way, trust broker.
