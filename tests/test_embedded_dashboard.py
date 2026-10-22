@@ -130,6 +130,44 @@ class TestEmbeddedDashboard(unittest.TestCase):
         h.do_GET()
         self.assertEqual(h.path, "/my_signals.html")
 
+    def test_dashboard_handler_api_data_endpoint(self):
+        """Verify CustomDashboardHandler returns live JSON data on /api/data."""
+        from trading_system.dashboard.server import make_dashboard_handler, generate_html_dashboard
+        from io import BytesIO
+        import json
+
+        test_html = Path(self.temp_dir.name) / "signals_dashboard.html"
+        generate_html_dashboard(str(test_html))
+
+        web_dir = test_html.resolve().parent
+        html_name = test_html.name
+        HandlerClass = make_dashboard_handler(web_dir, html_name)
+
+        # Mock request to /api/data
+        class MockSocket:
+            def __init__(self):
+                self.data = BytesIO()
+            def makefile(self, *args, **kwargs):
+                return BytesIO(b"GET /api/data HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            def sendall(self, data):
+                self.data.write(data)
+
+        sock = MockSocket()
+        handler = HandlerClass(sock, ("127.0.0.1", 12345), None)
+        response_bytes = sock.data.getvalue()
+        response_text = response_bytes.decode("utf-8")
+
+        self.assertIn("HTTP/1.0 200 OK", response_text)
+        self.assertIn("Content-Type: application/json", response_text)
+        self.assertIn("Cache-Control: no-cache, no-store, must-revalidate", response_text)
+        
+        # Verify JSON body parses and has required keys
+        body_part = response_text.split("\r\n\r\n", 1)[1]
+        payload = json.loads(body_part)
+        self.assertIn("active_signals", payload)
+        self.assertIn("broker_status", payload)
+        self.assertIn("pairs_watchlist", payload)
+
 
 if __name__ == "__main__":
     unittest.main()

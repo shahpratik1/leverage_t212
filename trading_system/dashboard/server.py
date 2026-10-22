@@ -89,6 +89,7 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
     if not os.path.exists(state_file):
         return []
     try:
+        universe = LeveragedUniverse()
         with open(state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -115,8 +116,28 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
             underlying = pos.get("underlying", "")
             broker_stop_order_id = pos.get("broker_stop_order_id")
 
-            # Determine currency formatting (LSE stocks like 3TSM trade in GBX pence)
-            if ticker.startswith("3TSM") or entry > 600:
+            # Determine human-readable asset name and quote currency
+            pair = universe.get_pair_for_etp(ticker) if universe else None
+            asset_name = pos.get("name") or (pair.name if pair else underlying)
+            
+            curr = (pos.get("currency") or (pair.currency if pair else "")).upper()
+            if not curr:
+                if ticker.startswith("3TSM") or entry > 500:
+                    curr = "GBX"
+                elif any(ticker.endswith(sfx) for sfx in ("p_EQ", "m_EQ", "e_EQ", "d_EQ")):
+                    curr = "EUR"
+                else:
+                    curr = "USD"
+
+            if curr == "EUR":
+                currency_code = "EUR"
+                currency_prefix = "€"
+                currency_suffix = ""
+            elif curr == "GBP":
+                currency_code = "GBP"
+                currency_prefix = "£"
+                currency_suffix = ""
+            elif curr == "GBX":
                 currency_code = "GBX"
                 currency_prefix = ""
                 currency_suffix = " GBX"
@@ -206,6 +227,7 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
             signals.append({
                 "ticker": ticker,
                 "underlying": underlying,
+                "name": asset_name,
                 "direction": direction,
                 "strategy_type": strategy_type,
                 "rsi3": rsi3,
@@ -299,136 +321,172 @@ def load_recent_notifications(log_path: str = "notifications.jsonl", limit: int 
         return []
 
 
-def build_dashboard_data() -> Dict[str, Any]:
-    """Compile comprehensive dashboard dataset."""
-    universe = LeveragedUniverse()
-    pairs = [
-        {
-            "underlying": p.underlying_symbol,
-            "name": p.name,
-            "category": p.category,
-            "long_ticker": p.long_3x_ticker,
-            "short_ticker": p.short_3x_ticker,
-            "has_5x": p.has_5x,
-            "long_5x_ticker": p.long_5x_ticker or "—",
-            "short_5x_ticker": p.short_5x_ticker or "—",
-            "long_5x_name": p.long_5x_name or "",
-            "short_5x_name": p.short_5x_name or "",
-            "currency": p.currency,
-        }
-        for p in CURATED_3X_PAIRS
-    ]
+_DASHBOARD_DATA_CACHE: Optional[Dict[str, Any]] = None
+_DASHBOARD_DATA_CACHE_TIME: float = 0.0
+_DASHBOARD_DATA_LOCK = threading.Lock()
+_DASHBOARD_SHARED_CLIENT: Optional[Trading212Client] = None
 
-    portfolio_prices: Dict[str, float] = {}
-    broker_positions_map: Optional[Dict[str, Any]] = None
-    live_server_stops_count: Optional[int] = None
-    client: Optional[Trading212Client] = None
 
-    if settings.TRADING212_API_KEY:
-        try:
-            client = Trading212Client(
-                api_key=settings.TRADING212_API_KEY,
-                api_secret=settings.TRADING212_API_SECRET,
-                base_url=settings.api_base_url,
-            )
-            portfolio = client.get_portfolio(force_refresh=True)
-            broker_positions_map = {p.ticker: p for p in portfolio if getattr(p, "quantity", 0.0) > 0}
-            for p in portfolio:
-                if getattr(p, "current_price", 0.0) > 0:
-                    portfolio_prices[p.ticker] = p.current_price
+def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
+    """Compile comprehensive dashboard dataset with fast TTL caching to avoid API rate limits."""
+    global _DASHBOARD_DATA_CACHE, _DASHBOARD_DATA_CACHE_TIME, _DASHBOARD_SHARED_CLIENT
+    now = time.time()
+    if not force and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
+        return _DASHBOARD_DATA_CACHE
 
+    with _DASHBOARD_DATA_LOCK:
+        if not force and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
+            return _DASHBOARD_DATA_CACHE
+
+        universe = LeveragedUniverse()
+        pairs = [
+            {
+                "underlying": p.underlying_symbol,
+                "name": p.name,
+                "category": p.category,
+                "long_ticker": p.long_3x_ticker,
+                "short_ticker": p.short_3x_ticker,
+                "has_5x": p.has_5x,
+                "long_5x_ticker": p.long_5x_ticker or "—",
+                "short_5x_ticker": p.short_5x_ticker or "—",
+                "long_5x_name": p.long_5x_name or "",
+                "short_5x_name": p.short_5x_name or "",
+                "currency": p.currency,
+            }
+            for p in CURATED_3X_PAIRS
+        ]
+
+        portfolio_prices: Dict[str, float] = {}
+        broker_positions_map: Optional[Dict[str, Any]] = None
+        live_server_stops_count: Optional[int] = None
+        client: Optional[Trading212Client] = None
+
+        if settings.TRADING212_API_KEY:
             try:
-                open_orders = client.get_orders(force_refresh=True)
-                live_server_stops_count = sum(
-                    1 for o in open_orders
-                    if "STOP" in str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
-                )
-            except Exception as ord_exc:
-                logger.debug("Failed to fetch live open orders count: %s", ord_exc)
-        except Exception as exc:
-            logger.debug("Failed to fetch live portfolio prices for dashboard: %s", exc)
+                if _DASHBOARD_SHARED_CLIENT is None:
+                    _DASHBOARD_SHARED_CLIENT = Trading212Client(
+                        api_key=settings.TRADING212_API_KEY,
+                        api_secret=settings.TRADING212_API_SECRET,
+                        base_url=settings.api_base_url,
+                    )
+                client = _DASHBOARD_SHARED_CLIENT
+                portfolio = client.get_portfolio(force_refresh=False)
+                broker_positions_map = {p.ticker: p for p in portfolio if getattr(p, "quantity", 0.0) > 0}
+                for p in portfolio:
+                    if getattr(p, "current_price", 0.0) > 0:
+                        portfolio_prices[p.ticker] = p.current_price
 
-    # 1. Load active signals, strictly ignoring closed or zero-quantity positions
-    active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH, live_prices=portfolio_prices)
+                try:
+                    open_orders = client.get_orders(force_refresh=False)
+                    live_server_stops_count = sum(
+                        1 for o in open_orders
+                        if "STOP" in str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
+                    )
+                except Exception as ord_exc:
+                    logger.debug("Failed to fetch live open orders count: %s", ord_exc)
+            except Exception as exc:
+                logger.debug("Failed to fetch live portfolio prices for dashboard: %s", exc)
 
-    # 2. Reconcile with live broker portfolio as absolute ground truth
-    if broker_positions_map is not None:
-        live_broker_tickers = set(broker_positions_map.keys())
-        # Filter out phantom/closed local signals that no longer exist on broker
-        active_signals = [s for s in active_signals if s.get("ticker") in live_broker_tickers]
+        # 1. Load active signals, strictly ignoring closed or zero-quantity positions
+        active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH, live_prices=portfolio_prices)
 
-        # Adopt any broker positions not yet tracked in active_signals
-        known_tickers = {s.get("ticker") for s in active_signals}
-        for b_ticker, bp in broker_positions_map.items():
-            if b_ticker not in known_tickers:
-                pair = universe.get_pair_for_etp(b_ticker)
-                underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
-                direction = "LONG"
-                if pair and (b_ticker == pair.short_3x_ticker or b_ticker == pair.short_5x_ticker):
-                    direction = "SHORT"
-                avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
-                cur_px = bp.current_price if bp.current_price > 0 else avg_px
-                sl_dist = round(avg_px * 0.05, 2)
-                sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
-                pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 and direction == "LONG" else ((avg_px - cur_px) / avg_px * 100.0 if avg_px > 0 else 0.0)
-                active_signals.append({
-                    "ticker": b_ticker,
-                    "underlying": underlying,
-                    "direction": direction,
-                    "strategy_type": "broker_placed",
-                    "rsi3": None, "rsi7": None, "rsi14": None, "sma5": None,
-                    "win_rate_exp": "85%",
-                    "overnight_status": "REQUIRES TP1 OR FLATTENS 16:20 UTC" if direction == "LONG" else "INTRADAY SHORT (Flattens 16:20 UTC)",
-                    "overnight_badge_class": "bg-sky-500/10 text-sky-300 border-sky-500/30" if direction == "LONG" else "bg-rose-500/10 text-rose-300 border-rose-500/30",
-                    "earnings_in_days": None,
-                    "entry_price": avg_px,
-                    "current_price": cur_px,
-                    "pnl_pct": round(pnl_pct, 2),
-                    "pnl_amount": round((cur_px - avg_px) * bp.quantity if direction == "LONG" else (avg_px - cur_px) * bp.quantity, 2),
-                    "currency_code": "GBX" if b_ticker.startswith("3TSM") or avg_px > 600 else "USD",
-                    "currency_prefix": "" if b_ticker.startswith("3TSM") or avg_px > 600 else "$",
-                    "currency_suffix": " GBX" if b_ticker.startswith("3TSM") or avg_px > 600 else "",
-                    "stop_loss": sl,
-                    "trailing_stop_loss": sl,
-                    "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2) if avg_px > 0 else 5.0,
-                    "broker_stop_order_id": None,
-                    "tp1": round(avg_px + sl_dist, 2) if direction == "LONG" else round(avg_px - sl_dist, 2),
-                    "tp1_pct": round(abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 5.0,
-                    "tp2": round(avg_px + 2 * sl_dist, 2) if direction == "LONG" else round(avg_px - 2 * sl_dist, 2),
-                    "tp2_pct": round(2 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 10.0,
-                    "tp3": round(avg_px + 3 * sl_dist, 2) if direction == "LONG" else round(avg_px - 3 * sl_dist, 2),
-                    "tp3_pct": round(3 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 15.0,
-                    "quantity": bp.quantity,
-                    "remaining_quantity": bp.quantity,
-                    "status": "ACTIVE (Broker Placed)",
-                    "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
-                    "tp1_armed_hysteresis": False, "tp1_stop_elevated": False,
-                    "tp1_escape_threshold": 0.0,
-                    "entry_time": datetime.now(timezone.utc).isoformat(),
-                    "atr": round(avg_px * 0.025, 2),
-                    "copy_text": f"ADOPTED: {b_ticker} ({underlying}) Qty: {bp.quantity}",
-                })
+        # 2. Reconcile with live broker portfolio as absolute ground truth
+        if broker_positions_map is not None:
+            live_broker_tickers = set(broker_positions_map.keys())
+            # Filter out phantom/closed local signals that no longer exist on broker
+            active_signals = [s for s in active_signals if s.get("ticker") in live_broker_tickers]
 
-    history = load_recent_history(settings.TRADES_LOG_PATH)
-    recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH)
-    active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
+            # Adopt any broker positions not yet tracked in active_signals
+            known_tickers = {s.get("ticker") for s in active_signals}
+            for b_ticker, bp in broker_positions_map.items():
+                if b_ticker not in known_tickers:
+                    pair = universe.get_pair_for_etp(b_ticker)
+                    underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
+                    underlying_name = pair.name if pair else underlying
+                    direction = "LONG"
+                    if pair and (b_ticker == pair.short_3x_ticker or b_ticker == pair.short_5x_ticker):
+                        direction = "SHORT"
+                    avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
+                    cur_px = bp.current_price if bp.current_price > 0 else avg_px
+                    sl_dist = round(avg_px * 0.05, 2)
+                    sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
+                    pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 and direction == "LONG" else ((avg_px - cur_px) / avg_px * 100.0 if avg_px > 0 else 0.0)
 
-    return {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "mode": "MANUAL_SIGNALS_MODE",
-        "active_signals_count": len(active_signals),
-        "active_signals": active_signals,
-        "recent_notifications": recent_notifications,
-        "pairs_watchlist": pairs,
-        "history": history,
-        "broker_status": {
-            "broker_name": "Trading 212 Demo",
-            "is_connected": True,
-            "active_server_stops": active_stops,
-            "active_positions_count": len(active_signals),
-            "execution_mode": "Hybrid (Native Server GTC Stop + Algorithmic Exits)",
-        },
-    }
+                    curr = (pair.currency if pair else ("EUR" if any(b_ticker.endswith(sfx) for sfx in ("p_EQ", "m_EQ", "e_EQ", "d_EQ")) else "USD")).upper()
+                    if curr == "EUR":
+                        currency_code, currency_prefix, currency_suffix = "EUR", "€", ""
+                    elif curr == "GBP":
+                        currency_code, currency_prefix, currency_suffix = "GBP", "£", ""
+                    elif curr == "GBX" or b_ticker.startswith("3TSM") or avg_px > 500:
+                        currency_code, currency_prefix, currency_suffix = "GBX", "", " GBX"
+                    else:
+                        currency_code, currency_prefix, currency_suffix = "USD", "$", ""
+
+                    active_signals.append({
+                        "ticker": b_ticker,
+                        "underlying": underlying,
+                        "name": underlying_name,
+                        "direction": direction,
+                        "strategy_type": "broker_placed",
+                        "rsi3": None, "rsi7": None, "rsi14": None, "sma5": None,
+                        "win_rate_exp": "85%",
+                        "overnight_status": "REQUIRES TP1 OR FLATTENS 16:20 UTC" if direction == "LONG" else "INTRADAY SHORT (Flattens 16:20 UTC)",
+                        "overnight_badge_class": "bg-sky-500/10 text-sky-300 border-sky-500/30" if direction == "LONG" else "bg-rose-500/10 text-rose-300 border-rose-500/30",
+                        "earnings_in_days": None,
+                        "entry_price": round(avg_px, 2),
+                        "current_price": round(cur_px, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "pnl_amount": round((cur_px - avg_px) * bp.quantity if direction == "LONG" else (avg_px - cur_px) * bp.quantity, 2),
+                        "currency_code": currency_code,
+                        "currency_prefix": currency_prefix,
+                        "currency_suffix": currency_suffix,
+                        "stop_loss": sl,
+                        "trailing_stop_loss": sl,
+                        "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2) if avg_px > 0 else 5.0,
+                        "broker_stop_order_id": None,
+                        "tp1": round(avg_px + sl_dist, 2) if direction == "LONG" else round(avg_px - sl_dist, 2),
+                        "tp1_pct": round(abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 5.0,
+                        "tp2": round(avg_px + 2 * sl_dist, 2) if direction == "LONG" else round(avg_px - 2 * sl_dist, 2),
+                        "tp2_pct": round(2 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 10.0,
+                        "tp3": round(avg_px + 3 * sl_dist, 2) if direction == "LONG" else round(avg_px - 3 * sl_dist, 2),
+                        "tp3_pct": round(3 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 15.0,
+                        "quantity": bp.quantity,
+                        "remaining_quantity": bp.quantity,
+                        "status": "ACTIVE (Broker Placed)",
+                        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
+                        "tp1_armed_hysteresis": False, "tp1_stop_elevated": False,
+                        "tp1_escape_threshold": 0.0,
+                        "entry_time": datetime.now(timezone.utc).isoformat(),
+                        "atr": round(avg_px * 0.025, 2),
+                        "copy_text": f"ADOPTED: {b_ticker} ({underlying}) Qty: {bp.quantity}",
+                    })
+
+        history = load_recent_history(settings.TRADES_LOG_PATH)
+        recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH)
+        active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
+
+        res = {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "mode": "MANUAL_SIGNALS_MODE",
+            "active_signals_count": len(active_signals),
+            "active_signals": active_signals,
+            "recent_notifications": recent_notifications,
+            "pairs_watchlist": pairs,
+            "history": history,
+            "broker_status": {
+                "broker_name": "Trading 212 Demo",
+                "is_connected": True,
+                "active_server_stops": active_stops,
+                "active_positions_count": len(active_signals),
+                "execution_mode": "Hybrid (Native Server GTC Stop + Algorithmic Exits)",
+                "runner_status": "ONLINE (24/7 Raspberry Pi)",
+                "monitored_assets": len(CURATED_3X_PAIRS),
+                "eur_ratio": "82%",
+            },
+        }
+        _DASHBOARD_DATA_CACHE = res
+        _DASHBOARD_DATA_CACHE_TIME = time.time()
+        return res
 
 
 def generate_html_dashboard(output_path: str) -> str:
@@ -441,7 +499,7 @@ def generate_html_dashboard(output_path: str) -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>3x Quantitative Signals Dashboard</title>
+  <title>Trading 212 3x Quantitative Engine — Live Dashboard</title>
   <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
   <style>
     @keyframes pulse-slow {{
@@ -449,7 +507,7 @@ def generate_html_dashboard(output_path: str) -> str:
       50% {{ opacity: 0.4; }}
     }}
     .animate-pulse-slow {{
-      animation: pulse-slow 2.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
     }}
   </style>
 </head>
@@ -461,48 +519,52 @@ def generate_html_dashboard(output_path: str) -> str:
       <div class="flex flex-wrap items-center gap-2 sm:gap-3">
         <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
           <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></span>
-          LIVE SIGNAL RADAR
+          🟢 24/7 RUNNER ACTIVE
         </span>
         <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
           <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
-          Trading 212 Demo: Connected
+          Trading 212 Demo Connected
         </span>
         <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-mono">
-          🛡️ {data['broker_status']['active_server_stops']} Native Stops Working
+          🛡️ <span id="header-stops-count">{data['broker_status']['active_server_stops']}</span> Native Stops Active
         </span>
         <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-sky-500/10 text-sky-300 border border-sky-500/20 font-mono">
-          ⚡ COMPLETE AUTOMATION ACTIVE (Auto-Sell TP1/TP2/TP3 Enabled)
+          105 Assets (82% EUR)
+        </span>
+        <span id="sync-pill" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          LIVE AUTO-SYNC (3s)
         </span>
       </div>
       <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-white mt-2">
-        3x Leveraged Quantitative Signals & Execution Dashboard
+        Trading 212 Leveraged Quantitative Engine
       </h1>
       <p class="text-slate-400 text-sm mt-1">
-        High-conviction Connors 3-RSI Mean Reversion & Trend Momentum setups with crash-resilient native server stops.
+        Connors 3-RSI Mean Reversion & Trend Momentum setups with crash-resilient native server stops.
       </p>
     </div>
 
-    <div class="flex items-center gap-3">
-      <button onclick="refreshData()" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition shadow-sm">
+    <div class="flex flex-wrap items-center gap-3">
+      <button id="refresh-btn" onclick="fetchLiveData(true)" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition shadow-sm">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-        Refresh Signals
+        <span id="refresh-btn-text">Refresh Now</span>
       </button>
       <button onclick="panicFlatten()" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold transition shadow-sm border border-rose-400/30">
         🚨 Emergency Panic Flatten
       </button>
       <div class="text-right text-xs text-slate-500 hidden sm:block">
-        <div>Last Updated:</div>
-        <div id="timestamp-text" class="text-slate-300 font-mono">{data['generated_at']}</div>
+        <div>Last Synced:</div>
+        <div id="timestamp-text" class="text-slate-300 font-mono font-bold">{data['generated_at']}</div>
       </div>
     </div>
   </header>
 
-  <!-- Metric Badges -->
-  <div class="max-w-7xl mx-auto grid grid-cols-2 sm:grid-cols-5 gap-4 mb-8">
+  <!-- Metric Summary Badges -->
+  <div class="max-w-7xl mx-auto grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
     <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
       <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Active Positions</div>
-      <div id="metric-active" class="text-2xl font-bold text-white mt-1">{data['active_signals_count']} Triggered</div>
-      <div class="text-xs text-emerald-400 mt-1">Live in Broker</div>
+      <div id="metric-active" class="text-2xl font-bold text-white mt-1">{data['active_signals_count']} Open Trades</div>
+      <div class="text-xs text-emerald-400 mt-1">Live in Trading 212</div>
     </div>
     <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
       <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Native Broker Stops</div>
@@ -510,14 +572,9 @@ def generate_html_dashboard(output_path: str) -> str:
       <div class="text-xs text-slate-400 mt-1">T212 Server-Side GTC</div>
     </div>
     <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Exit Strategy</div>
+      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Profit-Taking Exits</div>
       <div class="text-2xl font-bold text-white mt-1">TP1 / TP2 / TP3</div>
-      <div class="text-xs text-emerald-400 mt-1">⚡ Auto-Sell Active (+1R, +2R, +3R)</div>
-    </div>
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Beta Decay Shield</div>
-      <div class="text-2xl font-bold text-emerald-400 mt-1">ADX &ge; 20</div>
-      <div class="text-xs text-slate-400 mt-1">Rejects choppy chop</div>
+      <div class="text-xs text-emerald-400 mt-1">⚡ Auto-Scaling (+1R, +2R, +3R)</div>
     </div>
     <div class="bg-slate-900/80 border border-amber-500/30 rounded-xl p-4 relative overflow-hidden">
       <div class="text-xs text-amber-400 uppercase tracking-wider font-semibold flex items-center justify-between">
@@ -525,73 +582,43 @@ def generate_html_dashboard(output_path: str) -> str:
         <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
       </div>
       <div id="cutoff-countdown" class="text-2xl font-bold text-amber-300 font-mono mt-1">--:--:--</div>
-      <div class="text-xs text-slate-400 mt-1">Evacuates unhedged trades</div>
+      <div class="text-xs text-slate-400 mt-1">Intraday Risk Evacuation</div>
     </div>
   </div>
 
-  <!-- Main Active Signals Container -->
+  <!-- Main Container -->
   <main class="max-w-7xl mx-auto space-y-8">
 
-    <!-- Active Triggered Signals Section -->
-    <section>
+    <!-- Active Positions Section (HERO SECTION - AT THE TOP) -->
+    <section id="active-trades-section">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xl font-bold text-white flex items-center gap-2">
-          <span>🎯 Active Actionable Signals</span>
-          <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono" id="signals-badge">{data['active_signals_count']}</span>
+          <span>🎯 Active Positions / Open Trades</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-200 font-mono font-bold" id="signals-badge">{data['active_signals_count']}</span>
         </h2>
         <div class="flex flex-wrap gap-2 text-xs">
-          <button onclick="filterSignals('ALL')" class="filter-btn px-3 py-1.5 rounded-md bg-slate-800 text-white font-medium hover:bg-slate-700">All</button>
-          <button onclick="filterSignals('3RSI')" class="filter-btn px-3 py-1.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 font-semibold">⚡ 3-RSI Mean Reversion (85% WR)</button>
-          <button onclick="filterSignals('LONG')" class="filter-btn px-3 py-1.5 rounded-md bg-slate-900 text-slate-400 hover:text-white">Long Only</button>
-          <button onclick="filterSignals('SHORT')" class="filter-btn px-3 py-1.5 rounded-md bg-slate-900 text-slate-400 hover:text-white">Short Only</button>
+          <button onclick="filterSignals('ALL')" id="filter-all" class="filter-btn px-3 py-1.5 rounded-md bg-slate-800 text-white font-medium hover:bg-slate-700">All</button>
+          <button onclick="filterSignals('LONG')" id="filter-long" class="filter-btn px-3 py-1.5 rounded-md bg-slate-900 text-slate-400 hover:text-white">Long Only</button>
+          <button onclick="filterSignals('SHORT')" id="filter-short" class="filter-btn px-3 py-1.5 rounded-md bg-slate-900 text-slate-400 hover:text-white">Short Only</button>
         </div>
       </div>
 
       <div id="signals-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        <!-- Rendered by JavaScript -->
+        <!-- Rendered by JavaScript dynamically -->
       </div>
     </section>
 
-    <!-- Paired 3x & 5x Universe Watchlist -->
-    <section class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6">
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6">
-        <div>
-          <h3 class="text-lg font-bold text-white">3x & 5x Leveraged Asset Directory (Trading 212)</h3>
-          <p class="text-xs text-slate-400">Curated high-liquidity 3x and 5x Leverage Shares ETPs on Trading 212 with zero borrowing margin drag.</p>
-        </div>
-        <div class="text-xs text-slate-400 font-mono">Curated Liquid Pairs Monitored</div>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="w-full text-left text-sm text-slate-300">
-          <thead class="text-xs uppercase bg-slate-950/60 text-slate-400 border-b border-slate-800">
-            <tr>
-              <th class="py-3 px-4">Underlying</th>
-              <th class="py-3 px-4">Name / Sector</th>
-              <th class="py-3 px-4 text-emerald-400 font-semibold">3x Long ETP</th>
-              <th class="py-3 px-4 text-rose-400 font-semibold">3x Short (Inverse) ETP</th>
-              <th class="py-3 px-4 text-amber-400 font-semibold">Leverage Policy (5x &rarr; 3x Replaced)</th>
-              <th class="py-3 px-4">Currency</th>
-            </tr>
-          </thead>
-          <tbody id="pairs-table-body" class="divide-y divide-slate-800/60 font-mono text-xs">
-            <!-- Rendered by JS -->
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Recent Trade Activity & Alert History (Audit Log) -->
+    <!-- Recent Engine Activity History (AUDIT LOG - RIGHT BELOW TRADES) -->
     <section class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
         <div>
           <h3 class="text-lg font-bold text-white flex items-center gap-2">
-            <span>🔔 Recent Alert & Trade Activity History</span>
+            <span>🔔 Recent Trade & Alert History</span>
             <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono" id="alerts-badge">0</span>
           </h3>
-          <p class="text-xs text-slate-400">Desktop notifications, trade triggers, and automated profit-taking exits (TP1 / TP2 / TP3 / SL).</p>
+          <p class="text-xs text-slate-400">Real-time desktop alerts, trade entries, native stop registrations, and profit exits (TP1/TP2/TP3/SL).</p>
         </div>
-        <div class="text-xs text-slate-500 font-mono">Real-Time Event Stream</div>
+        <div class="text-xs text-slate-500 font-mono">Live Event Stream</div>
       </div>
 
       <div class="overflow-x-auto">
@@ -602,7 +629,7 @@ def generate_html_dashboard(output_path: str) -> str:
               <th class="py-3 px-4">Ticker / Asset</th>
               <th class="py-3 px-4">Price</th>
               <th class="py-3 px-4">Quantity / P&amp;L</th>
-              <th class="py-3 px-4">Rationale / Milestone</th>
+              <th class="py-3 px-4">Milestone / Rationale</th>
               <th class="py-3 px-4">Timestamp (UTC)</th>
             </tr>
           </thead>
@@ -613,45 +640,109 @@ def generate_html_dashboard(output_path: str) -> str:
       </div>
     </section>
 
-    <!-- Manual Execution SOP for User -->
-    <section class="bg-gradient-to-r from-indigo-950/40 via-slate-900 to-slate-900 border border-indigo-500/20 rounded-2xl p-6">
-      <h3 class="text-base font-bold text-white flex items-center gap-2 mb-3">
-        <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-        How to Manually Execute These Signals in Your Broker
-      </h3>
-      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs text-slate-300">
-        <div class="p-3 bg-slate-950/40 rounded-xl border border-slate-800">
-          <div class="font-bold text-indigo-300 mb-1">Step 1: Check Direction</div>
-          <p class="text-slate-400">If signal is <span class="text-emerald-400 font-bold">LONG</span>, buy the 3x Long ETP. If <span class="text-rose-400 font-bold">SHORT</span>, buy the 3x Short (Inverse) ETP.</p>
+    <!-- Monitored Asset Universe (COLLAPSIBLE TO PREVENT CLUTTER) -->
+    <details class="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden group">
+      <summary class="cursor-pointer p-5 font-bold text-white flex items-center justify-between hover:bg-slate-800/40 transition select-none">
+        <div>
+          <span class="text-base flex items-center gap-2">
+            <span>📋 Monitored Asset Directory</span>
+            <span class="text-xs font-mono font-normal px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">105 Pairs • 82% EUR</span>
+          </span>
+          <p class="text-xs text-slate-400 font-normal mt-0.5">High-liquidity 3x & 5x Leverage Shares ETPs on Trading 212 with zero borrowing drag.</p>
         </div>
-        <div class="p-3 bg-slate-950/40 rounded-xl border border-slate-800">
-          <div class="font-bold text-indigo-300 mb-1">Step 2: Place Stop Loss</div>
-          <p class="text-slate-400">Immediately place a Stop Sell order at the specified <span class="text-white font-bold">SL price</span>. Do not leave positions unprotected.</p>
-        </div>
-        <div class="p-3 bg-slate-950/40 rounded-xl border border-slate-800">
-          <div class="font-bold text-indigo-300 mb-1">Step 3: Bank 50% at TP1</div>
-          <p class="text-slate-400">When price touches <span class="text-emerald-400 font-bold">TP1 (+1.0R)</span>, sell 50% of shares and move Stop Loss to Entry Price (Break-Even). Schmitt Hysteresis arms to elevate Stop to TP1 once price clears escape threshold.</p>
-        </div>
-        <div class="p-3 bg-slate-950/40 rounded-xl border border-slate-800">
-          <div class="font-bold text-indigo-300 mb-1">Step 4: Trail the Rest (TSL)</div>
-          <p class="text-slate-400">Sell 25% at <span class="text-indigo-400 font-bold">TP2 (+2.0R)</span> and let the final 25% runner ride to <span class="text-purple-400 font-bold">TP3 (+3.0R)</span> with the Trailing Stop.</p>
-        </div>
+        <span class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 group-open:rotate-180 transition-transform">
+          Click to View Directory ▾
+        </span>
+      </summary>
+
+      <div class="p-6 pt-0 border-t border-slate-800/60 overflow-x-auto">
+        <table class="w-full text-left text-sm text-slate-300 mt-4">
+          <thead class="text-xs uppercase bg-slate-950/60 text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="py-3 px-4">Underlying</th>
+              <th class="py-3 px-4">Name / Sector</th>
+              <th class="py-3 px-4 text-emerald-400 font-semibold">3x Long ETP</th>
+              <th class="py-3 px-4 text-rose-400 font-semibold">3x Short (Inverse) ETP</th>
+              <th class="py-3 px-4 text-amber-400 font-semibold">Leverage Policy</th>
+              <th class="py-3 px-4">Currency</th>
+            </tr>
+          </thead>
+          <tbody id="pairs-table-body" class="divide-y divide-slate-800/60 font-mono text-xs">
+            <!-- Rendered by JS -->
+          </tbody>
+        </table>
       </div>
-    </section>
+    </details>
 
   </main>
 
   <footer class="max-w-7xl mx-auto mt-12 pt-6 border-t border-slate-900 text-center text-xs text-slate-600">
-    Hybrid Quantitative Trading System &bull; System 1 Laya Fast Screener &times; System 2 Deliberative Engine
+    Trading 212 Quantitative Leveraged Engine &bull; 24/7 Autonomous Raspberry Pi Runner
   </footer>
 
-  <!-- Notification Toast -->
-  <div id="toast" class="fixed bottom-5 right-5 bg-indigo-600 text-white px-4 py-2.5 rounded-xl shadow-lg text-xs font-semibold transform translate-y-20 opacity-0 transition-all duration-300 pointer-events-none">
-    Copied trade card to clipboard!
-  </div>
-
   <script>
-    const INITIAL_DATA = {data_json};
+    let INITIAL_DATA = {data_json};
+    let rawSignals = INITIAL_DATA.active_signals || [];
+    let currentFilter = 'ALL';
+    let isFetching = false;
+
+    // Direct asynchronous real-time fetch from /api/data
+    async function fetchLiveData(isManual = false) {{
+      if (isFetching) return;
+      isFetching = true;
+      const btn = document.getElementById('refresh-btn-text');
+      if (isManual && btn) btn.innerText = 'Syncing...';
+      try {{
+        const resp = await fetch('/api/data', {{ cache: 'no-store' }});
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        updateUI(data);
+      }} catch (err) {{
+        console.debug('Polling fetch notice:', err);
+      }} finally {{
+        isFetching = false;
+        if (isManual && btn) {{
+          btn.innerText = 'Refreshed!';
+          setTimeout(() => {{ btn.innerText = 'Refresh Now'; }}, 1200);
+        }}
+      }}
+    }}
+
+    function updateUI(data) {{
+      if (!data) return;
+      if (data.active_signals !== undefined) {{
+        rawSignals = data.active_signals;
+        INITIAL_DATA.active_signals = data.active_signals;
+        const activeEl = document.getElementById('metric-active');
+        if (activeEl) activeEl.innerText = `${{rawSignals.length}} Open Trades`;
+        const badgeEl = document.getElementById('signals-badge');
+        if (badgeEl) badgeEl.innerText = rawSignals.length;
+        renderSignals(currentFilter);
+      }}
+      if (data.broker_status) {{
+        INITIAL_DATA.broker_status = data.broker_status;
+        const stopsEl = document.getElementById('metric-stops');
+        if (stopsEl && data.broker_status.active_server_stops !== undefined) {{
+          stopsEl.innerText = `${{data.broker_status.active_server_stops}} Active`;
+        }}
+        const headerStopsEl = document.getElementById('header-stops-count');
+        if (headerStopsEl && data.broker_status.active_server_stops !== undefined) {{
+          headerStopsEl.innerText = data.broker_status.active_server_stops;
+        }}
+      }}
+      if (data.recent_notifications) {{
+        INITIAL_DATA.recent_notifications = data.recent_notifications;
+        renderAlertsTable();
+      }}
+      if (data.pairs_watchlist && (!INITIAL_DATA.pairs_watchlist || INITIAL_DATA.pairs_watchlist.length === 0)) {{
+        INITIAL_DATA.pairs_watchlist = data.pairs_watchlist;
+        renderPairsTable();
+      }}
+      const timeEl = document.getElementById('timestamp-text');
+      if (timeEl && data.generated_at) {{
+        timeEl.innerText = data.generated_at;
+      }}
+    }}
 
     async function panicFlatten() {{
       if (!confirm("⚠️ EMERGENCY ACTION: Are you sure you want to CANCEL ALL ACTIVE STOPS and LIQUIDATE all open positions immediately?")) {{
@@ -666,7 +757,7 @@ def generate_html_dashboard(output_path: str) -> str:
         const res = await resp.json();
         if (resp.ok) {{
           alert("🚨 Panic flatten completed! All open positions liquidated and stops cancelled.");
-          location.reload();
+          fetchLiveData(true);
         }} else {{
           alert("Error executing panic flatten: " + (res.error || "Unknown error"));
         }}
@@ -675,27 +766,29 @@ def generate_html_dashboard(output_path: str) -> str:
       }}
     }}
 
-    let rawSignals = INITIAL_DATA.active_signals || [];
-    let currentFilter = 'ALL';
-
     function renderSignals(filter = 'ALL') {{
       currentFilter = filter;
       const grid = document.getElementById('signals-grid');
+      if (!grid) return;
       grid.innerHTML = '';
 
       let signals = rawSignals || [];
-      if (filter === '3RSI') {{
-        signals = signals.filter(s => (s.strategy_type && s.strategy_type.includes('3rsi')) || (s.rsi3 && s.rsi3 <= 25));
-      }} else if (filter !== 'ALL') {{
+      if (filter !== 'ALL') {{
         signals = signals.filter(s => s.direction === filter);
       }}
 
       if (signals.length === 0) {{
         grid.innerHTML = `
-          <div class="col-span-full py-12 text-center bg-slate-900/40 border border-slate-800/80 rounded-2xl">
-            <div class="text-3xl mb-2">🔍</div>
-            <div class="text-base font-bold text-slate-300">No active signals match the current filter</div>
-            <div class="text-xs text-slate-500 mt-1">The engine is waiting for high-conviction 3-RSI pullbacks or momentum breakouts.</div>
+          <div class="col-span-full py-10 px-6 text-center bg-slate-900/40 border border-slate-800 rounded-2xl">
+            <div class="text-3xl mb-2">🟢</div>
+            <div class="text-lg font-bold text-white">Engine is Active & Scanning 105 Leveraged ETPs</div>
+            <div class="text-sm text-slate-400 mt-1 max-w-xl mx-auto">
+              No open trades right now. The engine runs 24/7 on the Raspberry Pi, screening every 15 minutes across 105 high-liquidity ETPs (82% EUR) for 3-RSI oversold pullbacks (&lt;25) and momentum triggers. Orders execute automatically on Trading 212 when criteria are met.
+            </div>
+            <div class="mt-4 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-800/80 text-emerald-400 text-xs font-mono">
+              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              24/7 Autonomous Raspberry Pi Runner
+            </div>
           </div>
         `;
         return;
@@ -704,79 +797,48 @@ def generate_html_dashboard(output_path: str) -> str:
       signals.forEach(s => {{
         const isLong = s.direction === 'LONG';
         const badgeColor = isLong ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-        const actionText = isLong ? 'BUY (3x LONG)' : 'SELL (3x SHORT)';
-        const currPrefix = s.currency_prefix || '$';
+        const actionText = isLong ? '🟢 BUY / LONG (3x)' : '🔴 SELL / SHORT (3x)';
+        const currPrefix = s.currency_prefix || '€';
         const currSuffix = s.currency_suffix || '';
 
-        const isMR = (s.strategy_type && s.strategy_type.includes('3rsi')) || (s.rsi3 && s.rsi3 <= 25);
-        const stratBadge = isMR
-          ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30">⚡ 3-RSI Mean Reversion (${{s.win_rate_exp || '85%'}} Win-Rate)</span>`
-          : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">🚀 Trend Momentum (${{s.win_rate_exp || '72%'}} Win-Rate)</span>`;
-
-        const hysteresisBadge = s.tp1_armed_hysteresis
-          ? `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-amber-950/40 text-amber-300 border-amber-500/30 mb-2.5 shadow-sm">
-               <span class="font-bold flex items-center gap-1.5">
-                 <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                 Schmitt Hysteresis:
-               </span>
-               <span class="font-mono font-bold text-[10px] text-amber-200">ARMED (Elevates @ ${{currPrefix}}${{s.tp1_escape_threshold ? s.tp1_escape_threshold.toFixed(2) : '--'}}${{currSuffix}})</span>
-             </div>`
-          : (s.tp1_stop_elevated || s.tp2_hit
-              ? `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-emerald-950/40 text-emerald-300 border-emerald-500/30 mb-2.5 shadow-sm">
-                   <span class="font-bold flex items-center gap-1.5">
-                     <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-                     Milestone Stop Floor:
-                   </span>
-                   <span class="font-mono font-bold text-[10px] text-emerald-200">LOCKED (+1.0R Floor)</span>
-                 </div>`
-              : '');
-
         const stopOrderBadge = s.broker_stop_order_id
-          ? `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-emerald-950/60 text-emerald-300 border-emerald-500/30 mb-2.5 shadow-sm">
-               <span class="font-bold flex items-center gap-1.5">
+          ? `<div class="flex items-center justify-between text-xs px-2.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-semibold mb-2.5 shadow-sm">
+               <span class="flex items-center gap-1.5">
                  <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                 Native Server Stop:
+                 🛡️ Native T212 Stop Order:
                </span>
-               <span class="font-mono font-bold text-[11px] text-emerald-200">T212 Order #${{s.broker_stop_order_id}}</span>
+               <span class="font-mono font-bold text-emerald-200">#${{s.broker_stop_order_id}}</span>
              </div>`
-          : `<div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border bg-amber-950/30 text-amber-300 border-amber-500/20 mb-2.5">
-               <span class="font-bold flex items-center gap-1.5">
-                 <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                 Stop Protection:
-               </span>
-               <span class="text-[10px] text-amber-200">Software Polled</span>
+          : `<div class="flex items-center justify-between text-xs px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 mb-2.5">
+               <span>🛡️ Stop Protection:</span>
+               <span class="text-slate-300 font-medium">Software Polled</span>
              </div>`;
 
-        const pnlPct = (s.pnl_pct !== undefined && s.pnl_pct !== null) ? s.pnl_pct : 0.0;
-        const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-400');
+        const pnlPct = (s.pnl_pct !== undefined && s.pnl_pct !== null) ? Number(s.pnl_pct) : 0.0;
+        const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-300');
         const pnlSign = pnlPct > 0 ? '+' : '';
-        const statusColor = s.tp1_armed_hysteresis ? 'text-amber-400' : (s.tp1_stop_elevated ? 'text-emerald-400' : 'text-slate-300');
-
-        const rsiStrip = (s.rsi3 !== undefined && s.rsi3 !== null)
-          ? `<div class="flex flex-wrap items-center gap-1.5 mt-2 pt-2 border-t border-slate-800/60 text-[10px] font-mono text-slate-400">
-               <span class="bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">RSI(3): <b class="${{s.rsi3 <= 25 ? 'text-amber-400 font-black' : (s.rsi3 >= 75 ? 'text-rose-400 font-black' : 'text-slate-300')}}">${{s.rsi3}}</b></span>
-               <span class="bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">RSI(7): <b class="text-slate-300">${{s.rsi7 || '--'}}</b></span>
-               <span class="bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">RSI(14): <b class="text-slate-300">${{s.rsi14 || '--'}}</b></span>
-               ${{s.sma5 ? `<span class="bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">5-SMA: <b class="text-indigo-300">${{currPrefix}}${{s.sma5}}${{currSuffix}}</b></span>` : ''}}
-             </div>`
-          : '';
+        const pnlAmount = s.pnl_amount !== undefined ? Number(s.pnl_amount) : 0.0;
+        const remQty = s.remaining_quantity !== undefined ? Number(s.remaining_quantity) : Number(s.quantity || 1.0);
+        const curPx = Number(s.current_price || s.entry_price || 0.0);
+        const entryPx = Number(s.entry_price || 0.0);
+        const posVal = (remQty * curPx).toFixed(2);
 
         const card = document.createElement('div');
         card.className = "bg-slate-900 border border-slate-800 hover:border-slate-700 transition rounded-2xl p-5 shadow-lg flex flex-col justify-between relative overflow-hidden group";
 
         card.innerHTML = `
           <!-- Top Accent line -->
-          <div class="absolute top-0 left-0 right-0 h-1 ${{isLong ? 'bg-emerald-500' : 'bg-rose-500'}}"></div>
+          <div class="absolute top-0 left-0 right-0 h-1.5 ${{isLong ? 'bg-emerald-500' : 'bg-rose-500'}}"></div>
 
           <div>
             <!-- Header -->
-            <div class="flex items-start justify-between gap-3 mb-2">
+            <div class="flex items-start justify-between gap-3 mb-3">
               <div>
                 <div class="flex items-center gap-2">
-                  <span class="text-xl font-black text-white tracking-wide">${{s.underlying}}</span>
+                  <span class="text-lg font-black text-white tracking-wide">${{s.name || s.underlying}}</span>
                   <span class="text-xs font-mono text-slate-400 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">${{s.ticker}}</span>
                 </div>
-                <div class="text-xs text-slate-400 mt-0.5">3x Leveraged ETP &bull; ${{s.currency_code || 'USD'}}</div>
+                <div class="text-xs text-slate-400 mt-0.5">3x Leveraged ETP &bull; ${{s.currency_code || 'EUR'}}</div>
               </div>
 
               <span class="px-2.5 py-1 rounded-md text-xs font-black uppercase tracking-wider border ${{badgeColor}}">
@@ -784,101 +846,83 @@ def generate_html_dashboard(output_path: str) -> str:
               </span>
             </div>
 
-            <!-- Strategy Badge -->
-            <div class="mb-2">
-              ${{stratBadge}}
+            <!-- Big P&L Box -->
+            <div class="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3.5 mb-3">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-[10px] text-slate-400 uppercase font-semibold">Live P&L</div>
+                  <div class="text-xl font-black ${{pnlColor}} font-mono">
+                    ${{pnlSign}}${{currPrefix}}${{Math.abs(pnlAmount).toFixed(2)}}${{currSuffix}} (${{pnlSign}}${{pnlPct.toFixed(2)}}%)
+                  </div>
+                </div>
+                <div class="text-right">
+                  <div class="text-[10px] text-slate-400 uppercase font-semibold">Holdings</div>
+                  <div class="text-sm font-bold text-indigo-300 font-mono">${{remQty.toFixed(1)}} shares</div>
+                  <div class="text-[10px] text-slate-400 font-mono">Val: ${{currPrefix}}${{posVal}}${{currSuffix}}</div>
+                </div>
+              </div>
+              <div class="mt-2.5 pt-2 border-t border-slate-800/60 flex items-center justify-between text-xs font-mono">
+                <span class="text-slate-400">Entry: <b class="text-white">${{currPrefix}}${{entryPx.toFixed(2)}}${{currSuffix}}</b></span>
+                <span class="text-slate-400">Live: <b class="${{pnlColor}}">${{currPrefix}}${{curPx.toFixed(2)}}${{currSuffix}}</b></span>
+              </div>
             </div>
-
-            <!-- Schmitt Hysteresis Milestone Badge -->
-            ${{hysteresisBadge}}
 
             <!-- Native Broker Stop Order Badge -->
             ${{stopOrderBadge}}
 
-            <!-- Asymmetric Session Protocol Badge -->
-            <div class="flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg border ${{s.overnight_badge_class || 'bg-slate-950 text-slate-400 border-slate-800'}} mb-3">
-              <span class="font-bold flex items-center gap-1.5">
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                Session Gate:
-              </span>
-              <span class="font-bold text-[10px] tracking-wide uppercase">${{s.overnight_status || 'STANDARD'}}</span>
-            </div>
-
-            <!-- Price & Sizing Box -->
-            <div class="bg-slate-950/80 border border-slate-800/60 rounded-xl p-3 mb-3">
-              <div class="grid grid-cols-2 gap-2">
-                <div>
-                  <div class="text-[11px] text-slate-400 uppercase font-semibold">Entry / Live Price</div>
-                  <div class="text-base font-bold text-white font-mono">${{currPrefix}}${{s.entry_price.toFixed(2)}}${{currSuffix}}</div>
-                  <div class="text-xs font-mono font-semibold ${{pnlColor}} mt-0.5">
-                    Live: ${{currPrefix}}${{s.current_price.toFixed(2)}}${{currSuffix}} (${{pnlSign}}${{pnlPct.toFixed(2)}}%)
-                  </div>
-                </div>
-                <div class="text-right">
-                  <div class="text-[11px] text-slate-400 uppercase font-semibold">Holdings / Qty</div>
-                  <div class="text-base font-bold text-indigo-300 font-mono">${{s.remaining_quantity !== undefined ? s.remaining_quantity.toFixed(1) : s.quantity.toFixed(1)}} / ${{s.quantity.toFixed(1)}} shs</div>
-                  <div class="text-[10px] text-slate-400 mt-0.5 font-mono">P&L: <span class="${{pnlColor}} font-bold">${{pnlSign}}${{currPrefix}}${{Math.abs(s.pnl_amount || 0).toFixed(2)}}${{currSuffix}}</span></div>
-                </div>
-              </div>
-              ${{rsiStrip}}
-            </div>
-
             <!-- Targets & Stop Grid -->
-            <div class="space-y-2 text-xs mb-5">
+            <div class="space-y-2 text-xs mb-4">
               <!-- Stop Loss -->
               <div class="flex items-center justify-between p-2 rounded-lg bg-rose-500/5 border border-rose-500/10">
                 <span class="text-rose-300 font-semibold flex items-center gap-1.5">
                   <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>
                   Stop Loss (SL)
                 </span>
-                <span class="font-mono font-bold text-rose-200">${{currPrefix}}${{s.stop_loss.toFixed(2)}}${{currSuffix}} (-${{s.stop_distance_pct}}%)</span>
-              </div>
-
-              <!-- Trailing Stop -->
-              <div class="flex items-center justify-between p-2 rounded-lg bg-amber-500/5 border border-amber-500/10">
-                <span class="text-amber-300 font-semibold flex items-center gap-1.5">
-                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                  Current TSL
-                </span>
-                <span class="font-mono font-bold text-amber-200">${{currPrefix}}${{s.trailing_stop_loss.toFixed(2)}}${{currSuffix}}</span>
+                <span class="font-mono font-bold text-rose-200">${{currPrefix}}${{Number(s.stop_loss || 0).toFixed(2)}}${{currSuffix}} (-${{s.stop_distance_pct || 5.0}}%)</span>
               </div>
 
               <!-- Take Profit 1 -->
               <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
                 <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
                   <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  Take Profit 1 (+1.0R)
+                  TP1 (+1.0R)
                 </span>
-                <span class="font-mono font-bold text-emerald-200">${{currPrefix}}${{s.tp1.toFixed(2)}}${{currSuffix}} (+${{s.tp1_pct}}%)</span>
+                <span class="font-mono font-bold text-emerald-200">
+                  ${{currPrefix}}${{Number(s.tp1 || 0).toFixed(2)}}${{currSuffix}}
+                  ${{s.tp1_hit ? '<span class="text-emerald-400 ml-1 font-bold">[✓ Banked 50%]</span>' : '<span class="text-slate-500 ml-1">[Target]</span>'}}
+                </span>
               </div>
 
               <!-- Take Profit 2 -->
               <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
                 <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
                   <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  Take Profit 2 (+2.0R)
+                  TP2 (+2.0R)
                 </span>
-                <span class="font-mono font-bold text-emerald-200">${{currPrefix}}${{s.tp2.toFixed(2)}}${{currSuffix}} (+${{s.tp2_pct}}%)</span>
+                <span class="font-mono font-bold text-emerald-200">
+                  ${{currPrefix}}${{Number(s.tp2 || 0).toFixed(2)}}${{currSuffix}}
+                  ${{s.tp2_hit ? '<span class="text-emerald-400 ml-1 font-bold">[✓ Banked 25%]</span>' : '<span class="text-slate-500 ml-1">[Target]</span>'}}
+                </span>
               </div>
 
               <!-- Take Profit 3 -->
               <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
                 <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
                   <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  Take Profit 3 (+3.0R)
+                  TP3 (+3.0R)
                 </span>
-                <span class="font-mono font-bold text-emerald-200">${{currPrefix}}${{s.tp3.toFixed(2)}}${{currSuffix}} (+${{s.tp3_pct}}%)</span>
+                <span class="font-mono font-bold text-purple-300">
+                  ${{currPrefix}}${{Number(s.tp3 || 0).toFixed(2)}}${{currSuffix}}
+                  <span class="text-purple-400 ml-1 font-bold">[Runner]</span>
+                </span>
               </div>
             </div>
           </div>
 
-          <!-- Actions -->
-          <div class="pt-3 border-t border-slate-800/80 flex items-center justify-between gap-2">
-            <span class="text-[11px] text-slate-400">Status: <span class="${{statusColor}} font-semibold">${{s.status}}</span></span>
-            <button onclick="copyToClipboard('${{encodeURIComponent(s.copy_text)}}')" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white text-xs font-medium transition flex items-center gap-1">
-              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-              Copy Order
-            </button>
+          <!-- Card Footer Status -->
+          <div class="pt-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
+            <span>Status: <b class="text-slate-200">${{s.status || 'ACTIVE'}}</b></span>
+            <span class="font-mono uppercase text-slate-500">${{(s.strategy_type || '').replace('_', ' ')}}</span>
           </div>
         `;
         grid.appendChild(card);
@@ -887,24 +931,22 @@ def generate_html_dashboard(output_path: str) -> str:
 
     function renderPairsTable() {{
       const tbody = document.getElementById('pairs-table-body');
+      if (!tbody) return;
       tbody.innerHTML = '';
       (INITIAL_DATA.pairs_watchlist || []).forEach(p => {{
         const row = document.createElement('tr');
         row.className = "hover:bg-slate-900/80 transition";
         const fiveXBadge = p.has_5x
-          ? `<div class="flex flex-col gap-0.5">
-               <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30">5x Exists &rarr; Replaced with 3x</span>
-               <span class="text-[10px] font-mono text-slate-400">Exec: <b>${{p.long_ticker}}</b></span>
-             </div>`
+          ? `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30">5x Exists &rarr; 3x Exec</span>`
           : `<span class="text-slate-500 text-[10px]">3x Standard</span>`;
 
         row.innerHTML = `
-          <td class="py-3 px-4 font-bold text-white">${{p.underlying}}</td>
-          <td class="py-3 px-4 font-sans text-slate-400">${{p.name}} <span class="text-slate-500">(${{p.category}})</span></td>
-          <td class="py-3 px-4 text-emerald-400 font-bold">${{p.long_ticker}}</td>
-          <td class="py-3 px-4 text-rose-400 font-bold">${{p.short_ticker}}</td>
-          <td class="py-3 px-4">${{fiveXBadge}}</td>
-          <td class="py-3 px-4 text-slate-400">${{p.currency}}</td>
+          <td class="py-2.5 px-4 font-bold text-white">${{p.underlying}}</td>
+          <td class="py-2.5 px-4 font-sans text-slate-400">${{p.name}} <span class="text-slate-500">(${{p.category}})</span></td>
+          <td class="py-2.5 px-4 text-emerald-400 font-bold">${{p.long_ticker}}</td>
+          <td class="py-2.5 px-4 text-rose-400 font-bold">${{p.short_ticker}}</td>
+          <td class="py-2.5 px-4">${{fiveXBadge}}</td>
+          <td class="py-2.5 px-4 text-slate-400">${{p.currency}}</td>
         `;
         tbody.appendChild(row);
       }});
@@ -915,36 +957,21 @@ def generate_html_dashboard(output_path: str) -> str:
         btn.classList.remove('bg-slate-800', 'text-white');
         btn.classList.add('bg-slate-900', 'text-slate-400');
       }});
-      event.target.classList.remove('bg-slate-900', 'text-slate-400');
-      event.target.classList.add('bg-slate-800', 'text-white');
+      const activeBtn = direction === 'ALL' ? document.getElementById('filter-all') : (direction === 'LONG' ? document.getElementById('filter-long') : document.getElementById('filter-short'));
+      if (activeBtn) {{
+        activeBtn.classList.remove('bg-slate-900', 'text-slate-400');
+        activeBtn.classList.add('bg-slate-800', 'text-white');
+      }}
       renderSignals(direction);
-    }}
-
-    function copyToClipboard(encoded) {{
-      const text = decodeURIComponent(encoded);
-      navigator.clipboard.writeText(text).then(() => {{
-        const toast = document.getElementById('toast');
-        toast.classList.remove('translate-y-20', 'opacity-0');
-        setTimeout(() => {{
-          toast.classList.add('translate-y-20', 'opacity-0');
-        }}, 2200);
-      }});
-    }}
-
-    function refreshData() {{
-      window.location.reload();
     }}
 
     function updateCountdown() {{
       const now = new Date();
       const nowUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
-      
       let targetUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 16, 20, 0);
       let diff = targetUtc - nowUtc;
-      
       const countdownEl = document.getElementById('cutoff-countdown');
       if (!countdownEl) return;
-      
       if (diff < 0) {{
         if (diff > -600000) {{
           countdownEl.innerHTML = '<span class="text-rose-400 animate-pulse text-lg">FLATTENING NOW</span>';
@@ -953,14 +980,13 @@ def generate_html_dashboard(output_path: str) -> str:
         targetUtc += 86400000;
         diff = targetUtc - nowUtc;
       }}
-      
       const hours = Math.floor(diff / (1000 * 60 * 60));
       const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
       const seconds = Math.floor((diff % (1000 * 60)) / 1000);
-      
       const pad = n => String(n).padStart(2, '0');
       countdownEl.innerText = `${{pad(hours)}}:${{pad(minutes)}}:${{pad(seconds)}}`;
     }}
+
     function renderAlertsTable() {{
       const tbody = document.getElementById('alerts-table-body');
       if (!tbody) return;
@@ -999,9 +1025,9 @@ def generate_html_dashboard(output_path: str) -> str:
         }} else if (ev === 'SL') {{
           badgeColor = 'bg-rose-500/10 text-rose-300 border-rose-500/30';
           badgeIcon = '🛑 STOP LOSS';
-        }} else if (ev === 'HYSTERESIS_TP1_RATCHET' || ev.includes('HYSTERESIS')) {{
+        }} else if (ev.includes('HYSTERESIS')) {{
           badgeColor = 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30';
-          badgeIcon = '🛡️ TSL ELEVATED (+1.0R)';
+          badgeIcon = '🛡️ TSL ELEVATED';
         }} else if (ev === 'TSL' || ev === 'TSL_RATCHET') {{
           badgeColor = 'bg-amber-500/10 text-amber-300 border-amber-500/30';
           badgeIcon = '📈 TSL RATCHET';
@@ -1019,94 +1045,57 @@ def generate_html_dashboard(output_path: str) -> str:
         }}
 
         const price = (n.price !== undefined && n.price !== null) ? `$${{Number(n.price).toFixed(2)}}` : '—';
-        const underlyingText = n.underlying ? `(${{n.underlying}})` : (n.direction ? `(${{n.direction}})` : '');
+        const underlyingText = n.underlying ? `(${{n.underlying}})` : '';
 
         row.innerHTML = `
-          <td class="py-3 px-4">
+          <td class="py-2.5 px-4">
             <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-black border ${{badgeColor}}">
               ${{badgeIcon}}
             </span>
           </td>
-          <td class="py-3 px-4 font-bold text-white">
+          <td class="py-2.5 px-4 font-bold text-white">
             ${{n.ticker || '—'}}
             <span class="text-[11px] font-normal text-slate-400 font-sans ml-1">${{underlyingText}}</span>
           </td>
-          <td class="py-3 px-4 font-mono text-slate-200">${{price}}</td>
-          <td class="py-3 px-4 font-mono">${{pnlText}}</td>
-          <td class="py-3 px-4 font-sans text-slate-300 text-xs max-w-md truncate" title="${{n.rationale || ''}}">
+          <td class="py-2.5 px-4 font-mono text-slate-200">${{price}}</td>
+          <td class="py-2.5 px-4 font-mono">${{pnlText}}</td>
+          <td class="py-2.5 px-4 font-sans text-slate-300 text-xs max-w-md truncate" title="${{n.rationale || ''}}">
             ${{n.rationale || '—'}}
           </td>
-          <td class="py-3 px-4 text-slate-400 text-[11px] font-mono whitespace-nowrap">${{n.timestamp || '—'}}</td>
+          <td class="py-2.5 px-4 text-slate-400 text-[11px] font-mono whitespace-nowrap">${{n.timestamp || '—'}}</td>
         `;
         tbody.appendChild(row);
       }});
     }}
 
-    setInterval(updateCountdown, 1000);
-    updateCountdown();
-
-    // Initial render
-    renderSignals('ALL');
-    renderPairsTable();
-    renderAlertsTable();
-
-    // Real-time zero-latency SSE telemetry stream
+    // Real-time zero-latency SSE telemetry stream (push updates)
     function initSSE() {{
       if (typeof EventSource !== "undefined") {{
         try {{
           const streamUrl = window.location.origin + "/stream";
           const es = new EventSource(streamUrl);
-          function handlePayload(payload) {{
-            if (!payload) return;
-            if (payload.active_signals !== undefined) {{
-              rawSignals = payload.active_signals;
-              INITIAL_DATA.active_signals = payload.active_signals;
-              const activeEl = document.getElementById('metric-active');
-              if (activeEl) activeEl.innerText = `${{rawSignals.length}} Triggered`;
-              const badgeEl = document.getElementById('signals-badge');
-              if (badgeEl) badgeEl.innerText = rawSignals.length;
-            }}
-            if (payload.broker_status) {{
-              INITIAL_DATA.broker_status = payload.broker_status;
-              const stopsEl = document.getElementById('metric-stops');
-              if (stopsEl && payload.broker_status.active_server_stops !== undefined) {{
-                stopsEl.innerText = `${{payload.broker_status.active_server_stops}} Active`;
-              }}
-            }}
-            renderSignals(currentFilter);
-            if (payload.pairs_watchlist) {{
-              INITIAL_DATA.pairs_watchlist = payload.pairs_watchlist;
-              renderPairsTable();
-            }}
-            if (payload.recent_notifications) {{
-              INITIAL_DATA.recent_notifications = payload.recent_notifications;
-              renderAlertsTable();
-            }}
-          }}
-
-          es.addEventListener("snapshot", function(e) {{
-            try {{
-              handlePayload(JSON.parse(e.data));
-            }} catch (err) {{}}
-          }});
-          es.addEventListener("dashboard_update", function(e) {{
-            try {{
-              handlePayload(JSON.parse(e.data));
-            }} catch (err) {{}}
-          }});
-          es.onerror = function() {{
-            es.close();
-            setTimeout(initSSE, 5000);
-          }};
+          es.addEventListener("snapshot", e => {{ try {{ updateUI(JSON.parse(e.data)); }} catch (err) {{}} }});
+          es.addEventListener("dashboard_update", e => {{ try {{ updateUI(JSON.parse(e.data)); }} catch (err) {{}} }});
+          es.onerror = () => {{ es.close(); setTimeout(initSSE, 5000); }};
         }} catch (e) {{}}
       }}
     }}
+
+    // Auto-polling and initialization
+    setInterval(updateCountdown, 1000);
+    updateCountdown();
+    renderSignals('ALL');
+    renderPairsTable();
+    renderAlertsTable();
     initSSE();
 
-    // Auto-refresh dashboard fallback every 45s if SSE is not supported
+    // Instant zero-click sync on page load and every 3.5s
+    document.addEventListener('DOMContentLoaded', () => {{
+      fetchLiveData(false);
+    }});
     setInterval(() => {{
-      window.location.reload();
-    }}, 45000);
+      fetchLiveData(false);
+    }}, 3500);
   </script>
 </body>
 </html>
@@ -1295,14 +1284,32 @@ def make_dashboard_handler(web_dir: Path, html_name: str):
             super().__init__(*args, directory=str(web_dir), **kwargs)
 
         def log_message(self, format: str, *args: Any) -> None:
-            # Suppress normal GET 200 log spam for continuous SSE keepalive
+            # Suppress normal GET 200 log spam for continuous SSE keepalive & polling
             clean = format % args
-            if "GET /stream" in clean or "GET /events" in clean:
+            if any(p in clean for p in ("/stream", "/api/stream", "/events", "/api/data", "/api/dashboard-data")):
                 return
             super().log_message(format, *args)
 
+        def end_headers(self) -> None:
+            # Prevent browser caching of any files or responses served by dashboard
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            super().end_headers()
+
         def do_GET(self):
             clean_path = self.path.split("?")[0]
+            if clean_path in ("/api/data", "/api/dashboard-data", "/data.json"):
+                data = build_dashboard_data()
+                body = json.dumps(data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if clean_path in ("/stream", "/api/stream", "/events"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
