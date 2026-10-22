@@ -292,11 +292,34 @@ class Orchestrator:
     def screen_candidates(
         self, universe_metrics: Dict[str, Dict[str, Any]]
     ) -> List[ScreenerResult]:
-        """Filter universe using Laya NLI router for Bullish and Bearish setups."""
+        """Filter universe using Laya NLI router for Bullish and Bearish setups.
+
+        Falls back to :class:`~trading_system.screener.laya_screener.TechnicalFallbackScreener`
+        when the Laya NLI engine is not installed or returns zero candidates, ensuring
+        the engine always has signals to act on even without the NLI model.
+        """
+        from trading_system.screener.laya_screener import HAS_LAYA, TechnicalFallbackScreener
+
         logger.info("Screening %d assets for 3x Long/Short momentum (ADX >= %.1f)…",
                     len(universe_metrics), settings.MIN_ADX_TREND)
         AntigravityTradingAgent.set_active_universe_metrics(universe_metrics)
-        candidates = self.screener.scan_universe(universe_metrics)
+
+        if not HAS_LAYA:
+            logger.warning(
+                "Laya NLI engine not installed — using TechnicalFallbackScreener for signal generation."
+            )
+            candidates = TechnicalFallbackScreener(top_n=10).scan_universe(universe_metrics)
+        else:
+            # LayaScreener.scan_universe() already falls back internally when it returns 0.
+            candidates = self.screener.scan_universe(universe_metrics)
+
+        # Final safety net: if still no candidates, run fallback directly.
+        if not candidates:
+            logger.warning(
+                "Primary screener returned 0 candidates — running TechnicalFallbackScreener as safety net."
+            )
+            candidates = TechnicalFallbackScreener(top_n=10).scan_universe(universe_metrics)
+
         logger.info(
             "System 1 passed %d high-momentum candidates: %s",
             len(candidates),

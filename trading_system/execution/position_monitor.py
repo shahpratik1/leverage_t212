@@ -263,7 +263,54 @@ class PositionMonitor:
         except Exception as exc:
             setattr(pos, "_last_stop_fail_time", time.time())
             logger.error("Failed to place native broker Stop Order for %s on Trading 212: %s", pos.ticker, exc)
+            # Detect stale stop-price rejection (HTTP 400 / "price too far") and self-heal
+            err_str = str(exc).lower()
+            if "400" in err_str or "price" in err_str or "far" in err_str or "invalid" in err_str:
+                logger.warning(
+                    "Detected possible stale stop price for %s — attempting self-heal", pos.ticker
+                )
+                self._heal_stale_stop(pos)
             return None
+
+    def _heal_stale_stop(self, pos: TrackedPosition) -> None:
+        """Re-fetch live market price from broker and recompute a fresh ATR-based stop loss.
+
+        Called automatically when a stop-order placement gets a 400 price-too-far rejection.
+        Updates `pos.stop_loss` and `pos.trailing_stop_loss` in-place and persists state.
+        A subsequent monitor cycle will re-attempt stop placement with the healed price.
+        """
+        if self.dry_run:
+            return
+        try:
+            portfolio = self.t212.get_portfolio(force_refresh=True)
+            bp = next((p for p in portfolio if p.ticker == pos.ticker), None)
+            if not bp:
+                logger.debug("_heal_stale_stop: %s not found in broker portfolio", pos.ticker)
+                return
+            live_price = bp.current_price if (bp.current_price or 0) > 0 else (bp.average_price or 0)
+            if live_price <= 0:
+                logger.debug("_heal_stale_stop: no valid live price for %s", pos.ticker)
+                return
+            # Use stored ATR percentage if available; default to 2% (conservative for 3x ETPs)
+            atr_pct = getattr(pos, "_last_atr_pct", None)
+            if not atr_pct or atr_pct <= 0:
+                atr_pct = 0.02
+            # Compute fresh stop: 2.5× ATR away from current price in the protective direction
+            if pos.direction == "LONG":
+                new_sl = round(live_price * (1.0 - atr_pct * 2.5), 4)
+            else:
+                new_sl = round(live_price * (1.0 + atr_pct * 2.5), 4)
+            logger.warning(
+                "_heal_stale_stop %s: old_sl=%.4f → new_sl=%.4f (live_price=%.4f, atr_pct=%.4f)",
+                pos.ticker, pos.stop_loss, new_sl, live_price, atr_pct,
+            )
+            pos.stop_loss = new_sl
+            pos.trailing_stop_loss = new_sl
+            # Reset fail timer so next monitor cycle retries immediately
+            setattr(pos, "_last_stop_fail_time", 0.0)
+            self._save_state()
+        except Exception as heal_exc:
+            logger.debug("_heal_stale_stop failed for %s: %s", pos.ticker, heal_exc)
 
     def cancel_broker_stop(self, pos: TrackedPosition) -> bool:
         """Cancel pending broker stop order on Trading 212."""
@@ -550,6 +597,20 @@ class PositionMonitor:
                     pos.current_price = cur_px
                     pos.highest_price = max(pos.highest_price, cur_px)
                     pos.lowest_price = min(pos.lowest_price, cur_px)
+
+                # Detect and fix entry-price currency scale mismatch (e.g. GBX pence stored vs EUR)
+                # If entry_price and broker average_price differ by more than 5× either way, trust broker.
+                broker_avg = getattr(bp, "average_price", 0.0) or 0.0
+                if broker_avg > 0 and pos.entry_price > 0:
+                    ratio = pos.entry_price / broker_avg
+                    if ratio > 5.0 or ratio < 0.20:
+                        logger.warning(
+                            "Entry price scale mismatch for %s: stored=%.4f broker_avg=%.4f (ratio=%.1f×). "
+                            "Correcting to broker average price.",
+                            ticker, pos.entry_price, broker_avg, ratio,
+                        )
+                        pos.entry_price = broker_avg
+                        self._save_state()
 
                 # Link native stop order from broker if missing or unlinked
                 if ticker in stop_orders_by_ticker:

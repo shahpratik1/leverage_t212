@@ -401,10 +401,22 @@ class LayaScreener:
                 else:
                     overflow.append(r)
 
-            return (diversified + overflow)[: self.top_n]
+            laya_results = (diversified + overflow)[: self.top_n]
         except Exception as exc:
             logger.debug("Sector-diversified selection fallback: %s", exc)
-            return passed[: self.top_n]
+            laya_results = passed[: self.top_n]
+
+        # If Laya returned 0 candidates (degenerate: all neutral, model not loaded, etc.)
+        # fall back to the pure-technical screener so the engine always has signals to act on.
+        if not laya_results:
+            logger.warning(
+                "LayaScreener returned 0 candidates — falling back to TechnicalFallbackScreener "
+                "for pure-indicator signal generation."
+            )
+            fallback = TechnicalFallbackScreener(top_n=self.top_n)
+            laya_results = fallback.scan_universe(universe_metrics)
+
+        return laya_results
 
     # ------------------------------------------------------------------
     # Filter predicate
@@ -447,3 +459,103 @@ class LayaScreener:
             return False
 
         return True
+
+
+# ---------------------------------------------------------------------------
+# Technical Fallback Screener
+# ---------------------------------------------------------------------------
+
+
+class TechnicalFallbackScreener:
+    """Pure-indicator screener used when Laya NLI is unavailable or returns 0 candidates.
+
+    Produces directional signals from pre-computed technical metrics without
+    requiring a natural language inference engine.  Signal criteria:
+
+    * **Bullish**: RSI < 65, ADX ≥ 20, close > EMA20, MACD line > MACD signal.
+    * **Bearish**: RSI > 35, ADX ≥ 20, close < EMA20, MACD line < MACD signal.
+
+    Setup quality is scored from ADX strength:
+    * ADX > 30 → ``"exceptional"``
+    * ADX > 25 → ``"favorable"``
+    * Otherwise → ``"mediocre"``
+
+    Parameters:
+        top_n: Maximum number of ranked candidates to return.  Default ``10``.
+        min_adx: Minimum ADX for a signal to be emitted.  Default ``20``.
+    """
+
+    def __init__(self, top_n: int = 10, min_adx: float = 20.0) -> None:
+        self.top_n = top_n
+        self.min_adx = min_adx
+
+    def scan_universe(
+        self, universe_metrics: Dict[str, Dict[str, Any]]
+    ) -> List[ScreenerResult]:
+        """Evaluate all assets in *universe_metrics* using pure technical indicators.
+
+        Args:
+            universe_metrics: Mapping of ``{ticker: metrics_dict}``.
+
+        Returns:
+            List of up to :attr:`top_n` qualifying :class:`ScreenerResult` instances,
+            sorted by overall confidence descending.
+        """
+        results: List[ScreenerResult] = []
+
+        for ticker, m in universe_metrics.items():
+            rsi: float = float(m.get("rsi", m.get("rsi14", 50.0)))
+            adx: float = float(m.get("adx", 0.0))
+            close: float = float(m.get("close", 0.0))
+            ema20: float = float(m.get("ema20", close))
+            macd: float = float(m.get("macd", 0.0))
+            macd_signal: float = float(m.get("macd_signal", 0.0))
+            atr: float = float(m.get("atr", 0.0))
+
+            if adx < self.min_adx:
+                continue
+
+            bullish = rsi < 65.0 and close > ema20 and macd > macd_signal
+            bearish = rsi > 35.0 and close < ema20 and macd < macd_signal
+
+            if not bullish and not bearish:
+                continue
+
+            bias = "bullish" if bullish else "bearish"
+
+            # Setup quality driven by ADX trend strength
+            if adx > 30.0:
+                setup_score = "exceptional"
+            elif adx > 25.0:
+                setup_score = "favorable"
+            else:
+                setup_score = "mediocre"
+
+            # Confidence scales with ADX (capped at 1.0)
+            confidence = min(1.0, adx / 40.0)
+
+            # Catalyst risk: low default (technical screener has no earnings data)
+            catalyst_risk = 0.15
+
+            results.append(
+                ScreenerResult(
+                    ticker=ticker,
+                    bias=bias,
+                    bias_confidence=confidence,
+                    setup_score=setup_score,
+                    setup_confidence=confidence,
+                    catalyst_risk=catalyst_risk,
+                    overall_confidence=confidence,
+                    strategy_type="momentum",
+                    metrics=m,
+                    state_document=f"[TechnicalFallback] {ticker} | RSI={rsi:.1f} ADX={adx:.1f} "
+                                   f"close={close:.4f} ema20={ema20:.4f} MACD={macd:.6f}/{macd_signal:.6f}",
+                )
+            )
+
+        results.sort(key=lambda r: r.overall_confidence, reverse=True)
+        logger.info(
+            "TechnicalFallbackScreener: %d/%d assets passed (top_n=%d)",
+            len(results), len(universe_metrics), self.top_n,
+        )
+        return results[: self.top_n]

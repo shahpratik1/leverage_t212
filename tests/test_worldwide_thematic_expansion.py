@@ -217,10 +217,25 @@ class TestWorldwideThematicExpansion(unittest.TestCase):
     def test_multi_asset_worldwide_curated_expansion(self):
         """Verify all multi-asset pairs, aliases, crypto sessions, and categories."""
         # 1. Total pairs count
-        self.assertEqual(len(self.universe.pairs), 105)
+        self.assertEqual(len(self.universe.pairs), 120)
 
         # 2. Key newly added assets lookup (EUR first preference)
         expanded_checks = {
+            "GS": ("Financials", "GS2El_EQ", "SGSEl_EQ"),
+            "V": ("Financials", "VISEl_EQ", None),
+            "BRK-B": ("Financials", "2BREl_EQ", None),
+            "ADI": ("Tech Equity", "ADI3a_EQ", None),
+            "JOBY": ("Space & Aerospace", "JOB3a_EQ", None),
+            "CBRS": ("AI Infrastructure", "3CBRd_EQ", None),
+            "CRCL": ("Crypto & Fintech", "CRC3a_EQ", None),
+            "BMNR": ("Crypto & Fintech", "BMN3a_EQ", None),
+            "IREN": ("AI Infrastructure", "IRN3a_EQ", None),
+            "DRM": ("Memory & Storage", "DRM3d_EQ", "DRMSd_EQ"),
+            "XEE": ("Commodity", "3XEEl_EQ", "3SEEl_EQ"),
+            "FAANG": ("Tech Basket", "3FNEl_EQ", "SFNEl_EQ"),
+            "VT": ("Global Index", "3VTEl_EQ", None),
+            "EWT": ("Global Index", "3TAEl_EQ", "STAEl_EQ"),
+            "M7": ("Tech Basket", "M73Ld_EQ", "M73Sd_EQ"),
             "UNG": ("Commodity", "3NGLm_EQ", "3NGSm_EQ"),
             "URNM": ("Commodity", "U3O8d_EQ", None),
             "COFF": ("Commodity", "3CFLm_EQ", None),

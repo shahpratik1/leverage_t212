@@ -529,7 +529,7 @@ def generate_html_dashboard(output_path: str) -> str:
           🛡️ <span id="header-stops-count">{data['broker_status']['active_server_stops']}</span> Native Stops Active
         </span>
         <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-sky-500/10 text-sky-300 border border-sky-500/20 font-mono">
-          105 Assets (82% EUR)
+          120 Assets (84% EUR)
         </span>
         <span id="sync-pill" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
           <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -646,7 +646,7 @@ def generate_html_dashboard(output_path: str) -> str:
         <div>
           <span class="text-base flex items-center gap-2">
             <span>📋 Monitored Asset Directory</span>
-            <span class="text-xs font-mono font-normal px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">105 Pairs • 82% EUR</span>
+            <span class="text-xs font-mono font-normal px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">120 Pairs • 84% EUR</span>
           </span>
           <p class="text-xs text-slate-400 font-normal mt-0.5">High-liquidity 3x & 5x Leverage Shares ETPs on Trading 212 with zero borrowing drag.</p>
         </div>
@@ -781,9 +781,9 @@ def generate_html_dashboard(output_path: str) -> str:
         grid.innerHTML = `
           <div class="col-span-full py-10 px-6 text-center bg-slate-900/40 border border-slate-800 rounded-2xl">
             <div class="text-3xl mb-2">🟢</div>
-            <div class="text-lg font-bold text-white">Engine is Active & Scanning 105 Leveraged ETPs</div>
+            <div class="text-lg font-bold text-white">Engine is Active & Scanning 120 Leveraged ETPs</div>
             <div class="text-sm text-slate-400 mt-1 max-w-xl mx-auto">
-              No open trades right now. The engine runs 24/7 on the Raspberry Pi, screening every 15 minutes across 105 high-liquidity ETPs (82% EUR) for 3-RSI oversold pullbacks (&lt;25) and momentum triggers. Orders execute automatically on Trading 212 when criteria are met.
+              No open trades right now. The engine runs 24/7 on the Raspberry Pi, screening every 15 minutes across 120 high-liquidity ETPs (84% EUR) for 3-RSI oversold pullbacks (&lt;25) and momentum triggers with pre-earnings radar tracking. Orders execute automatically on Trading 212 when criteria are met.
             </div>
             <div class="mt-4 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-800/80 text-emerald-400 text-xs font-mono">
               <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -813,6 +813,16 @@ def generate_html_dashboard(output_path: str) -> str:
                <span>🛡️ Stop Protection:</span>
                <span class="text-slate-300 font-medium">Software Polled</span>
              </div>`;
+
+        const earningsBadge = (s.earnings_in_days !== undefined && s.earnings_in_days !== null)
+          ? `<div class="flex items-center justify-between text-xs px-2.5 py-1.5 rounded-lg bg-purple-500/10 border border-purple-500/30 text-purple-300 font-semibold mb-2.5">
+               <span class="flex items-center gap-1.5">
+                 <span>📅</span>
+                 <span>Earnings Catalyst:</span>
+               </span>
+               <span class="font-mono font-bold text-purple-200">${{Number(s.earnings_in_days).toFixed(0)}}d away</span>
+             </div>`
+          : '';
 
         const pnlPct = (s.pnl_pct !== undefined && s.pnl_pct !== null) ? Number(s.pnl_pct) : 0.0;
         const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-300');
@@ -869,6 +879,7 @@ def generate_html_dashboard(output_path: str) -> str:
 
             <!-- Native Broker Stop Order Badge -->
             ${{stopOrderBadge}}
+            ${{earningsBadge}}
 
             <!-- Targets & Stop Grid -->
             <div class="space-y-2 text-xs mb-4">
