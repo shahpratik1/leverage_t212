@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.config import settings
+from trading_system.data.leveraged_universe import get_ticker_currency
 from trading_system.data.trading212_client import Trading212Client, Trading212Error
 from trading_system.notifications.notifier import Notifier
 
@@ -61,6 +62,7 @@ class TrackedPosition:
     tp1_stop_elevated: bool = False
     scale_calibrated: bool = False
     current_price: Optional[float] = None
+    currency: str = "EUR"
 
     def __post_init__(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -72,6 +74,10 @@ class TrackedPosition:
             self.highest_price = self.entry_price
         if self.lowest_price <= 0:
             self.lowest_price = self.entry_price
+        if self.ticker and (not self.currency or self.currency == "EUR"):
+            resolved = get_ticker_currency(self.ticker)
+            if resolved != "EUR":
+                self.currency = resolved
 
 
 class PositionMonitor:
@@ -809,6 +815,7 @@ class PositionMonitor:
                         broker_tp_order_id=broker_tp_id,
                         scale_calibrated=True,
                         current_price=cur_px,
+                        currency=get_ticker_currency(b_ticker),
                     )
                     self.positions[b_ticker] = adopted_pos
                     summary["adopted_from_broker"].append(b_ticker)
@@ -1657,6 +1664,7 @@ class PositionMonitor:
             known_fields = {f.name for f in fields(TrackedPosition)}
             positions = {}
             had_closed = False
+            state_updated = False
             for t, data in raw.items():
                 is_closed = bool(data.get("is_closed", False))
                 rem_qty = float(
@@ -1666,19 +1674,25 @@ class PositionMonitor:
                 )
                 if not is_closed and rem_qty > 0.0:
                     filtered_data = {k: v for k, v in data.items() if k in known_fields}
-                    positions[t] = TrackedPosition(**filtered_data)
+                    pos = TrackedPosition(**filtered_data)
+                    resolved_curr = get_ticker_currency(pos.ticker)
+                    if not pos.currency or (pos.currency == "EUR" and resolved_curr != "EUR"):
+                        pos.currency = resolved_curr
+                    if pos.currency != data.get("currency"):
+                        state_updated = True
+                    positions[t] = pos
                 else:
                     had_closed = True
 
             logger.info("Loaded %d active tracked positions from %s", len(positions), self.state_file)
 
-            # Auto-heal state file on disk if closed positions were present
-            if had_closed:
+            # Auto-heal state file on disk if closed positions were present or currency updated
+            if had_closed or state_updated:
                 tmp_file = f"{self.state_file}.tmp.{os.getpid()}"
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     json.dump({t: asdict(pos) for t, pos in positions.items()}, f, indent=2)
                 os.replace(tmp_file, self.state_file)
-                logger.info("Auto-healed %s: purged legacy closed positions from disk.", self.state_file)
+                logger.info("Auto-healed %s: persisted currency updates and purged closed positions.", self.state_file)
 
             return positions
         except Exception as exc:

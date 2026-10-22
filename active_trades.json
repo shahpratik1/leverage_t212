@@ -34,7 +34,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "EUR"
   },
   "3WHLl_EQ": {
     "ticker": "3WHLl_EQ",
@@ -71,7 +72,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   },
   "AMD3l_EQ": {
     "ticker": "AMD3l_EQ",
@@ -108,7 +110,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   },
   "3BCOl_EQ": {
     "ticker": "3BCOl_EQ",
@@ -145,7 +148,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "EUR"
   },
   "XLI_US_EQ": {
     "ticker": "XLI_US_EQ",
@@ -182,7 +186,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   },
   "IONQl1_EQ": {
     "ticker": "IONQl1_EQ",
@@ -219,7 +224,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   },
   "LUNRl_EQ": {
     "ticker": "LUNRl_EQ",
@@ -256,7 +262,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   },
   "USGBl_EQ": {
     "ticker": "USGBl_EQ",
@@ -293,7 +300,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "GBX"
   },
   "TM_US_EQ": {
     "ticker": "TM_US_EQ",
@@ -330,7 +338,8 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   },
   "HYG_US_EQ": {
     "ticker": "HYG_US_EQ",
@@ -367,6 +376,7 @@
     "tp1_escape_threshold": 0.0,
     "tp1_stop_elevated": false,
     "scale_calibrated": false,
-    "current_price": null
+    "current_price": null,
+    "currency": "USD"
   }
 }

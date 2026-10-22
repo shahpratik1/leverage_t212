@@ -26,7 +26,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from trading_system.agents.risk_manager import RiskManager
 from trading_system.config import settings
-from trading_system.data.leveraged_universe import CURATED_3X_PAIRS, LeveragedUniverse
+from trading_system.data.leveraged_universe import (
+    CURATED_3X_PAIRS,
+    LeveragedUniverse,
+    get_currency_display,
+    get_ticker_currency,
+)
 from trading_system.data.trading212_client import Trading212Client
 from trading_system.execution.position_monitor import PositionMonitor
 from trading_system.notifications.notifier import Notifier
@@ -84,12 +89,17 @@ class SSEBroadcaster:
     publish = broadcast
 
 
-def load_active_signals(state_file: str = "active_trades.json", live_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+def load_active_signals(
+    state_file: str = "active_trades.json",
+    live_prices: Optional[Dict[str, float]] = None,
+    universe: Optional[LeveragedUniverse] = None,
+) -> List[Dict[str, Any]]:
     """Load active tracked positions and enrich them with trade metrics."""
     if not os.path.exists(state_file):
         return []
     try:
-        universe = LeveragedUniverse()
+        if universe is None:
+            universe = LeveragedUniverse()
         with open(state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -120,31 +130,16 @@ def load_active_signals(state_file: str = "active_trades.json", live_prices: Opt
             pair = universe.get_pair_for_etp(ticker) if universe else None
             asset_name = pos.get("name") or (pair.name if pair else underlying)
             
-            curr = (pos.get("currency") or (pair.currency if pair else "")).upper()
+            # Authoritative ticker-level currency resolution (prefer ticker currency over pair base currency)
+            curr = pos.get("currency")
+            if not curr or curr == "EUR":
+                ticker_curr = universe.get_ticker_currency(ticker) if universe else get_ticker_currency(ticker)
+                if ticker_curr:
+                    curr = ticker_curr
             if not curr:
-                if ticker.startswith("3TSM") or entry > 500:
-                    curr = "GBX"
-                elif any(ticker.endswith(sfx) for sfx in ("p_EQ", "m_EQ", "e_EQ", "d_EQ")):
-                    curr = "EUR"
-                else:
-                    curr = "USD"
+                curr = "EUR"
 
-            if curr == "EUR":
-                currency_code = "EUR"
-                currency_prefix = "€"
-                currency_suffix = ""
-            elif curr == "GBP":
-                currency_code = "GBP"
-                currency_prefix = "£"
-                currency_suffix = ""
-            elif curr == "GBX":
-                currency_code = "GBX"
-                currency_prefix = ""
-                currency_suffix = " GBX"
-            else:
-                currency_code = "USD"
-                currency_prefix = "$"
-                currency_suffix = ""
+            currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
 
             # Estimate or extract current price and live P&L
             highest_price = float(pos.get("highest_price") or entry)
@@ -412,15 +407,8 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                     sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
                     pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 and direction == "LONG" else ((avg_px - cur_px) / avg_px * 100.0 if avg_px > 0 else 0.0)
 
-                    curr = (pair.currency if pair else ("EUR" if any(b_ticker.endswith(sfx) for sfx in ("p_EQ", "m_EQ", "e_EQ", "d_EQ")) else "USD")).upper()
-                    if curr == "EUR":
-                        currency_code, currency_prefix, currency_suffix = "EUR", "€", ""
-                    elif curr == "GBP":
-                        currency_code, currency_prefix, currency_suffix = "GBP", "£", ""
-                    elif curr == "GBX" or b_ticker.startswith("3TSM") or avg_px > 500:
-                        currency_code, currency_prefix, currency_suffix = "GBX", "", " GBX"
-                    else:
-                        currency_code, currency_prefix, currency_suffix = "USD", "$", ""
+                    curr = universe.get_ticker_currency(b_ticker) if universe else get_ticker_currency(b_ticker)
+                    currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
 
                     active_signals.append({
                         "ticker": b_ticker,
@@ -798,8 +786,9 @@ def generate_html_dashboard(output_path: str) -> str:
         const isLong = s.direction === 'LONG';
         const badgeColor = isLong ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20';
         const actionText = isLong ? '🟢 BUY / LONG (3x)' : '🔴 SELL / SHORT (3x)';
-        const currPrefix = s.currency_prefix || '€';
-        const currSuffix = s.currency_suffix || '';
+        const currPrefix = (s.currency_prefix !== undefined && s.currency_prefix !== null) ? s.currency_prefix : '€';
+        const currSuffix = (s.currency_suffix !== undefined && s.currency_suffix !== null) ? s.currency_suffix : '';
+        const currBadge = s.currency_code === 'GBX' ? '<span class="text-amber-400 font-semibold">Penny (GBX)</span>' : (s.currency_code || 'EUR');
 
         const stopOrderBadge = s.broker_stop_order_id
           ? `<div class="flex items-center justify-between text-xs px-2.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-semibold mb-2.5 shadow-sm">
@@ -848,7 +837,7 @@ def generate_html_dashboard(output_path: str) -> str:
                   <span class="text-lg font-black text-white tracking-wide">${{s.name || s.underlying}}</span>
                   <span class="text-xs font-mono text-slate-400 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">${{s.ticker}}</span>
                 </div>
-                <div class="text-xs text-slate-400 mt-0.5">3x Leveraged ETP &bull; ${{s.currency_code || 'EUR'}}</div>
+                <div class="text-xs text-slate-400 mt-0.5">3x Leveraged ETP &bull; ${{currBadge}}</div>
               </div>
 
               <span class="px-2.5 py-1 rounded-md text-xs font-black uppercase tracking-wider border ${{badgeColor}}">

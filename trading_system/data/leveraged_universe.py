@@ -11,7 +11,9 @@ for European accounts, falling back to USD and GBP/GBX when no EUR quote exists.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1735,3 +1737,127 @@ class LeveragedUniverse:
             if p.short_3x_ticker and p.short_3x_ticker != "None":
                 tickers.append(p.short_3x_ticker)
         return list(dict.fromkeys(tickers))
+
+    def get_ticker_currency(self, ticker: str) -> str:
+        """Return authoritative quote currency for an execution ticker ('GBX', 'EUR', 'USD', 'GBP')."""
+        return get_ticker_currency(ticker)
+
+
+# ── Authoritative Currency Resolution for Trading 212 Instruments ──────────────
+# Tickers trading in British Pence / Penny (GBX / p) on the London Stock Exchange
+GBX_TICKERS = {
+    '3ABNl_EQ', '3ARKl_EQ', '3ASMl1_EQ', '3BABl_EQ', '3BIDl_EQ', '3BLCl_EQ', '3BSRl_EQ',
+    '3CRWl_EQ', '3DISl_EQ', '3GDXl_EQ', '3GILl_EQ', '3GISl_EQ', '3GLDl_EQ', '3HNXl_EQ',
+    '3HODl_EQ', '3INTl_EQ', '3KLAl_EQ', '3KWEl_EQ', '3LAZl_EQ', '3LBA1l_EQ', '3LBC1l_EQ',
+    '3LDOl_EQ', '3LLYl_EQ', '3LRDl_EQ', '3LRIl_EQ', '3LRRl_EQ', '3LVOl_EQ', '3LZPl_EQ',
+    '3NBIl_EQ', '3NIOl_EQ', '3OKLl_EQ', '3ORCl_EQ', '3QBTl_EQ', '3QCOl_EQ', '3RACl_EQ',
+    '3RHMl_EQ', '3SAMl_EQ', '3SAZl_EQ', '3SBAl_EQ', '3SBCl_EQ', '3SBPl_EQ', '3SDOl_EQ',
+    '3SFPl_EQ', '3SIPl_EQ', '3SLMl_EQ', '3SLVl_EQ', '3SMGl_EQ', '3SMRl_EQ', '3SPSl_EQ',
+    '3SRAl_EQ', '3SRIl_EQ', '3SVO1l_EQ', '3SXLl_EQ', '3TSMl_EQ', '3UKLl_EQ', '3UKSl_EQ',
+    '3UNHl_EQ', '3URAl_EQ', '3XLFl_EQ', '3XOMl_EQ', '5UKXl_EQ', 'ARKSl_EQ', 'GBUSl_EQ',
+    'LMI3l_EQ', 'MARPl_EQ', 'S3CO1l_EQ', 'SASLl_EQ', 'SAVGl_EQ', 'SDISl_EQ', 'SGDXl_EQ',
+    'SKORl_EQ', 'SLLYl_EQ', 'SMC2l_EQ', 'SMI3l_EQ', 'SSQ3l_EQ', 'STSMl_EQ', 'SURAl_EQ',
+    'USGBl_EQ'
+}
+
+# Tickers trading in US Dollars (USD / $)
+USD_TICKERS = {
+    '3BRLl_EQ', '3HCLl_EQ', '3HCSl_EQ', '3LALl_EQ', '3LCOOl_EQ', '3LNVl_EQ', '3LPAl_EQ',
+    '3LTSl_EQ', '3LUBl_EQ', '3NGLl_EQ', '3NGSl_EQ', '3OISl_EQ', '3SEMl_EQ', '3SMSl_EQ',
+    '3SNFl_EQ', '3SNIl_EQ', '3SNVl_EQ', '3SPAl_EQ', '3STSl_EQ', '3SZNl_EQ', '3USLl_EQ',
+    '3USSl_EQ', 'AAP3l_EQ', 'AAPSl_EQ', 'ABN3l_EQ', 'AMD3l_EQ', 'ARK3l_EQ', 'ARM3l_EQ',
+    'AVG3l_EQ', 'BA3Sl_EQ', 'BA3l_EQ', 'BASl_EQ', 'BID3l_EQ', 'BLC3l_EQ', 'BTC3Ss_EQ',
+    'BTC3s_EQ', 'CRM3l_EQ', 'CRW3l_EQ', 'DIS3l_EQ', 'DISSl_EQ', 'ELONl_EQ', 'ETH3Ss_EQ',
+    'ETH3s_EQ', 'GDMSl_EQ', 'GDX3l_EQ', 'GPTSl_EQ', 'HNX3l_EQ', 'HOD3l_EQ', 'IBM_US_EQ',
+    'INTSl_EQ', 'JPNSl_EQ', 'KLA3l_EQ', 'KWE3l_EQ', 'LLY3l_EQ', 'LLYSl_EQ', 'MAR3l_EQ',
+    'MS3Sl_EQ', 'MSF3l_EQ', 'NBI3l_EQ', 'NFL3l_EQ', 'NIO3l_EQ', 'OKL3l_EQ', 'ORC3l_EQ',
+    'QBT3l_EQ', 'QCO3l_EQ', 'QQQ3l_EQ', 'QQQSl_EQ', 'RA3Sl_EQ', 'RAC3l_EQ', 'RHM3l_EQ',
+    'SARKl_EQ', 'SLMSl_EQ', 'SMCIl_EQ', 'SMG3l_EQ', 'SMR3l_EQ', 'URA3l_EQ', 'URASl_EQ',
+    'WDC_US_EQ', 'WTI3l_EQ', 'XOM3l_EQ'
+}
+
+_INSTRUMENTS_CACHE_MAP: Optional[Dict[str, str]] = None
+
+
+def _load_instruments_cache() -> Dict[str, str]:
+    """Load cached T212 instruments currency mapping if file exists."""
+    global _INSTRUMENTS_CACHE_MAP
+    if _INSTRUMENTS_CACHE_MAP is not None:
+        return _INSTRUMENTS_CACHE_MAP
+
+    mapping: Dict[str, str] = {}
+    possible_paths = [
+        ".t212_instruments_cache.json",
+        os.path.join(os.path.dirname(__file__), "..", "..", ".t212_instruments_cache.json"),
+    ]
+    for p in possible_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            tk = item.get("ticker")
+                            cc = item.get("currencyCode")
+                            if tk and cc:
+                                mapping[tk] = cc.upper()
+                break
+            except Exception:
+                pass
+    _INSTRUMENTS_CACHE_MAP = mapping
+    return mapping
+
+
+def get_ticker_currency(ticker: str) -> str:
+    """Return authoritative quote currency for any Trading 212 execution ticker ('GBX', 'EUR', 'USD', 'GBP')."""
+    if not ticker:
+        return "EUR"
+    clean = str(ticker).strip()
+
+    # 1. Authoritative broker cache check
+    cache = _load_instruments_cache()
+    if clean in cache:
+        return cache[clean]
+
+    # 2. Known sets
+    if clean in GBX_TICKERS or clean.endswith(".L"):
+        return "GBX"
+    if clean in USD_TICKERS or any(clean.endswith(sfx) for sfx in ("_US_EQ", "_US", ".US")):
+        return "USD"
+
+    # 3. European exchange suffix heuristics
+    if any(clean.endswith(sfx) for sfx in ("p_EQ", "m_EQ", "e_EQ", "d_EQ", "a_EQ", "fp_EQ")):
+        return "EUR"
+
+    return "EUR"
+
+
+def get_currency_display(currency: str) -> Tuple[str, str, str]:
+    """Returns (currency_code, currency_prefix, currency_suffix).
+
+    Examples:
+        'GBX' -> ('GBX', '', 'p')
+        'EUR' -> ('EUR', '€', '')
+        'GBP' -> ('GBP', '£', '')
+        'USD' -> ('USD', '$', '')
+    """
+    c = (currency or "").upper().strip()
+    if c == "GBX":
+        return ("GBX", "", "p")
+    elif c == "GBP":
+        return ("GBP", "£", "")
+    elif c == "USD":
+        return ("USD", "$", "")
+    return ("EUR", "€", "")
+
+
+def format_price(price: float, currency: str = "EUR") -> str:
+    """Format a numeric price with the appropriate currency prefix or suffix.
+
+    Examples:
+        format_price(3190.0, 'GBX') -> '3190.00p'
+        format_price(45.2, 'EUR')   -> '€45.20'
+        format_price(150.5, 'USD')  -> '$150.50'
+    """
+    _, prefix, suffix = get_currency_display(currency)
+    return f"{prefix}{price:.2f}{suffix}"

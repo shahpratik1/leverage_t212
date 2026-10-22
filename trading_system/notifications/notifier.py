@@ -55,10 +55,20 @@ class TradeNotification:
     pnl_pct: Optional[float] = None     # Percentage gain/loss
     rationale: str = ""                 # Context / commentary
     timestamp: str = ""
+    currency: Optional[str] = None      # Quote currency (e.g. 'EUR', 'GBX', 'USD')
 
     def __post_init__(self) -> None:
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def format_price(self, val: float) -> str:
+        """Format price with appropriate currency prefix or suffix."""
+        try:
+            from trading_system.data.leveraged_universe import format_price, get_ticker_currency
+            curr = self.currency or get_ticker_currency(self.ticker)
+            return format_price(val, curr)
+        except Exception:
+            return f"${val:.2f}"
 
 
 class Notifier:
@@ -385,15 +395,23 @@ class Notifier:
         print(f"\n{border}")
         print(f"  {title}")
         print(f"{border}")
+        px_str = note.format_price(note.price)
+        sl_str = note.format_price(note.stop_loss)
+        tsl_str = note.format_price(note.trailing_stop)
+        tp1_str = note.format_price(note.tp1)
+        tp2_str = note.format_price(note.tp2)
+        tp3_str = note.format_price(note.tp3)
+
         print(f"  Asset:      {note.ticker} (Underlying: {note.underlying}) | Direction: {note.direction}")
-        print(f"  Price:      ${note.price:.2f} | Quantity: {note.quantity:.2f} shares")
+        print(f"  Price:      {px_str} | Quantity: {note.quantity:.2f} shares")
         if note.stop_loss > 0:
-            print(f"  Stop Loss:  ${note.stop_loss:.2f} | Trailing Stop: ${note.trailing_stop:.2f}")
+            print(f"  Stop Loss:  {sl_str} | Trailing Stop: {tsl_str}")
         if note.tp1 > 0:
-            print(f"  Targets:    TP1: ${note.tp1:.2f} | TP2: ${note.tp2:.2f} | TP3: ${note.tp3:.2f}")
+            print(f"  Targets:    TP1: {tp1_str} | TP2: {tp2_str} | TP3: {tp3_str}")
         if note.pnl is not None and note.pnl_pct is not None:
-            sign = "+" if note.pnl >= 0 else ""
-            print(f"  Realized:   {sign}${note.pnl:.2f} ({sign}{note.pnl_pct:.2f}%)")
+            sign = "+" if note.pnl >= 0 else "-"
+            pnl_str = f"{sign}{note.format_price(abs(note.pnl))}"
+            print(f"  Realized:   {pnl_str} ({sign}{abs(note.pnl_pct):.2f}%)")
         print(f"  Details:    {note.rationale}")
         print(f"  Time:       {note.timestamp}")
         print(f"{border}\n")
@@ -402,7 +420,7 @@ class Notifier:
         """Display a native macOS banner alert."""
         try:
             title = f"Trading 212 3x Alert: {note.event_type} {note.direction}"
-            message = f"{note.ticker} @ ${note.price:.2f} — {note.rationale[:80]}"
+            message = f"{note.ticker} @ {note.format_price(note.price)} — {note.rationale[:80]}"
             # Escape quotes
             title_clean = title.replace('"', '\\"')
             msg_clean = message.replace('"', '\\"')
@@ -418,9 +436,9 @@ class Notifier:
             text = (
                 f"*{note.event_type} ALERT: {note.direction}*\n"
                 f"*Ticker:* `{note.ticker}` ({note.underlying})\n"
-                f"*Price:* `${note.price:.2f}`\n"
-                f"*SL:* `${note.stop_loss:.2f}` | *TSL:* `${note.trailing_stop:.2f}`\n"
-                f"*TP1:* `${note.tp1:.2f}` | *TP2:* `${note.tp2:.2f}` | *TP3:* `${note.tp3:.2f}`\n"
+                f"*Price:* `{note.format_price(note.price)}`\n"
+                f"*SL:* `{note.format_price(note.stop_loss)}` | *TSL:* `{note.format_price(note.trailing_stop)}`\n"
+                f"*TP1:* `{note.format_price(note.tp1)}` | *TP2:* `{note.format_price(note.tp2)}` | *TP3:* `{note.format_price(note.tp3)}`\n"
                 f"_{note.rationale}_\n"
                 f"`{note.timestamp}`"
             )
@@ -444,11 +462,11 @@ class Notifier:
                 "description": note.rationale,
                 "color": color,
                 "fields": [
-                    {"name": "Price", "value": f"${note.price:.2f}", "inline": True},
+                    {"name": "Price", "value": note.format_price(note.price), "inline": True},
                     {"name": "Shares", "value": f"{note.quantity:.2f}", "inline": True},
-                    {"name": "Stop Loss", "value": f"${note.stop_loss:.2f}", "inline": True},
-                    {"name": "Trailing Stop", "value": f"${note.trailing_stop:.2f}", "inline": True},
-                    {"name": "TP1 / TP2 / TP3", "value": f"${note.tp1:.2f} / ${note.tp2:.2f} / ${note.tp3:.2f}", "inline": False},
+                    {"name": "Stop Loss", "value": note.format_price(note.stop_loss), "inline": True},
+                    {"name": "Trailing Stop", "value": note.format_price(note.trailing_stop), "inline": True},
+                    {"name": "TP1 / TP2 / TP3", "value": f"{note.format_price(note.tp1)} / {note.format_price(note.tp2)} / {note.format_price(note.tp3)}", "inline": False},
                 ],
                 "footer": {"text": note.timestamp},
             }

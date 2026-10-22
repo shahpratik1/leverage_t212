@@ -72,6 +72,7 @@ class Position:
     ppl: float
     max_buy: float
     max_sell: float
+    currency: Optional[str] = None
 
 
 @dataclass
@@ -782,6 +783,7 @@ class Trading212Client:
                 ppl=_to_float(p.get("ppl")),
                 max_buy=_to_float(p.get("maxBuy")),
                 max_sell=_to_float(p.get("maxSell")),
+                currency=p.get("currency") or p.get("currencyCode"),
             )
             for p in data
         ]
