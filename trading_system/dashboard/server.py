@@ -341,6 +341,8 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                 "category": p.category,
                 "long_ticker": p.long_3x_ticker,
                 "short_ticker": p.short_3x_ticker,
+                "long_currency": universe.get_ticker_currency(p.long_3x_ticker),
+                "short_currency": universe.get_ticker_currency(p.short_3x_ticker),
                 "has_5x": p.has_5x,
                 "long_5x_ticker": p.long_5x_ticker or "—",
                 "short_5x_ticker": p.short_5x_ticker or "—",
@@ -681,7 +683,7 @@ def generate_html_dashboard(output_path: str) -> str:
       const btn = document.getElementById('refresh-btn-text');
       if (isManual && btn) btn.innerText = 'Syncing...';
       try {{
-        const resp = await fetch('/api/data', {{ cache: 'no-store' }});
+        const resp = await fetch('/api/data?_t=' + Date.now(), {{ cache: 'no-store' }});
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
         updateUI(data);
@@ -786,9 +788,26 @@ def generate_html_dashboard(output_path: str) -> str:
         const isLong = s.direction === 'LONG';
         const badgeColor = isLong ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20';
         const actionText = isLong ? '🟢 BUY / LONG (3x)' : '🔴 SELL / SHORT (3x)';
-        const currPrefix = (s.currency_prefix !== undefined && s.currency_prefix !== null) ? s.currency_prefix : '€';
-        const currSuffix = (s.currency_suffix !== undefined && s.currency_suffix !== null) ? s.currency_suffix : '';
-        const currBadge = s.currency_code === 'GBX' ? '<span class="text-amber-400 font-semibold">Penny (GBX)</span>' : (s.currency_code || 'EUR');
+        const code = (s.currency_code || '').toUpperCase();
+        const sTk = (s.ticker || '').toUpperCase();
+        let currPrefix = '';
+        let currSuffix = '';
+        if (code === 'GBX' || (s.currency_suffix && s.currency_suffix.includes('p')) || sTk.includes('SKOR') || sTk.includes('3XOM') || sTk.includes('3UNH') || sTk.endsWith('.L')) {{
+          currPrefix = '';
+          currSuffix = 'p';
+        }} else if (code === 'USD' || s.currency_prefix === '$' || sTk.includes('_US')) {{
+          currPrefix = '$';
+          currSuffix = '';
+        }} else if (code === 'GBP' || s.currency_prefix === '£') {{
+          currPrefix = '£';
+          currSuffix = '';
+        }} else {{
+          currPrefix = (s.currency_prefix !== undefined && s.currency_prefix !== null && s.currency_prefix !== '') ? s.currency_prefix : '€';
+          currSuffix = s.currency_suffix || '';
+        }}
+        const currBadge = (code === 'GBX' || currSuffix === 'p')
+          ? '<span class="text-amber-400 font-semibold">Penny (GBX / p)</span>'
+          : `<span class="text-slate-300 font-medium">${{code || 'EUR'}}</span>`;
 
         const stopOrderBadge = s.broker_stop_order_id
           ? `<div class="flex items-center justify-between text-xs px-2.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-semibold mb-2.5 shadow-sm">
@@ -815,7 +834,7 @@ def generate_html_dashboard(output_path: str) -> str:
 
         const pnlPct = (s.pnl_pct !== undefined && s.pnl_pct !== null) ? Number(s.pnl_pct) : 0.0;
         const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-300');
-        const pnlSign = pnlPct > 0 ? '+' : '';
+        const pnlSign = pnlPct > 0 ? '+' : (pnlPct < 0 ? '-' : '');
         const pnlAmount = s.pnl_amount !== undefined ? Number(s.pnl_amount) : 0.0;
         const remQty = s.remaining_quantity !== undefined ? Number(s.remaining_quantity) : Number(s.quantity || 1.0);
         const curPx = Number(s.current_price || s.entry_price || 0.0);
@@ -851,7 +870,7 @@ def generate_html_dashboard(output_path: str) -> str:
                 <div>
                   <div class="text-[10px] text-slate-400 uppercase font-semibold">Live P&L</div>
                   <div class="text-xl font-black ${{pnlColor}} font-mono">
-                    ${{pnlSign}}${{currPrefix}}${{Math.abs(pnlAmount).toFixed(2)}}${{currSuffix}} (${{pnlSign}}${{pnlPct.toFixed(2)}}%)
+                    ${{pnlSign}}${{currPrefix}}${{Math.abs(pnlAmount).toFixed(2)}}${{currSuffix}} (${{pnlPct >= 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)
                   </div>
                 </div>
                 <div class="text-right">
@@ -940,13 +959,24 @@ def generate_html_dashboard(output_path: str) -> str:
           ? `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30">5x Exists &rarr; 3x Exec</span>`
           : `<span class="text-slate-500 text-[10px]">3x Standard</span>`;
 
+        const lCurr = p.long_currency || p.currency || 'EUR';
+        const sCurr = p.short_currency || p.currency || 'EUR';
+        let currCellHtml = `<span class="text-slate-400">${{p.currency || 'EUR'}}</span>`;
+        if (lCurr !== sCurr) {{
+          const lBadge = lCurr === 'GBX' ? 'GBX (p)' : lCurr;
+          const sBadge = sCurr === 'GBX' ? 'GBX (p)' : sCurr;
+          currCellHtml = `<span class="text-emerald-400 font-mono">${{lBadge}}</span> <span class="text-slate-600">/</span> <span class="text-rose-400 font-mono">${{sBadge}}</span>`;
+        }} else if (lCurr === 'GBX') {{
+          currCellHtml = `<span class="text-amber-400 font-semibold">GBX (Penny)</span>`;
+        }}
+
         row.innerHTML = `
           <td class="py-2.5 px-4 font-bold text-white">${{p.underlying}}</td>
           <td class="py-2.5 px-4 font-sans text-slate-400">${{p.name}} <span class="text-slate-500">(${{p.category}})</span></td>
           <td class="py-2.5 px-4 text-emerald-400 font-bold">${{p.long_ticker}}</td>
           <td class="py-2.5 px-4 text-rose-400 font-bold">${{p.short_ticker}}</td>
           <td class="py-2.5 px-4">${{fiveXBadge}}</td>
-          <td class="py-2.5 px-4 text-slate-400">${{p.currency}}</td>
+          <td class="py-2.5 px-4">${{currCellHtml}}</td>
         `;
         tbody.appendChild(row);
       }});
@@ -1033,18 +1063,33 @@ def generate_html_dashboard(output_path: str) -> str:
           badgeIcon = '📈 TSL RATCHET';
         }}
 
+        const nCode = (n.currency || '').toUpperCase();
+        const nTk = (n.ticker || '').toUpperCase();
+        let nPrefix = '€';
+        let nSuffix = '';
+        if (nCode === 'GBX' || nTk.includes('SKOR') || nTk.includes('3XOM') || nTk.includes('3UNH') || nTk.endsWith('.L')) {{
+          nPrefix = '';
+          nSuffix = 'p';
+        }} else if (nCode === 'USD' || nTk.includes('_US') || nTk.includes('AMD') || nTk.includes('QQQ')) {{
+          nPrefix = '$';
+          nSuffix = '';
+        }} else if (nCode === 'GBP') {{
+          nPrefix = '£';
+          nSuffix = '';
+        }}
+
         const pnl = (n.pnl !== null && n.pnl !== undefined) ? Number(n.pnl) : null;
         const pnlPct = (n.pnl_pct !== null && n.pnl_pct !== undefined) ? Number(n.pnl_pct) : null;
         let pnlText = '—';
         if (pnl !== null) {{
           const color = pnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
-          const sign = pnl >= 0 ? '+' : '';
-          pnlText = `<span class="${{color}} font-bold">${{sign}}$${{pnl.toFixed(2)}} (${{sign}}${{pnlPct !== null ? pnlPct.toFixed(2) : '0.00'}}%)</span>`;
+          const sign = pnl >= 0 ? '+' : '-';
+          pnlText = `<span class="${{color}} font-bold">${{sign}}${{nPrefix}}${{Math.abs(pnl).toFixed(2)}}${{nSuffix}} (${{pnlPct !== null ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) : '0.00'}}%)</span>`;
         }} else if (n.quantity) {{
           pnlText = `<span class="text-slate-400">${{Number(n.quantity).toFixed(2)}} shs</span>`;
         }}
 
-        const price = (n.price !== undefined && n.price !== null) ? `$${{Number(n.price).toFixed(2)}}` : '—';
+        const price = (n.price !== undefined && n.price !== null) ? `${{nPrefix}}${{Number(n.price).toFixed(2)}}${{nSuffix}}` : '—';
         const underlyingText = n.underlying ? `(${{n.underlying}})` : '';
 
         row.innerHTML = `
