@@ -562,6 +562,13 @@ class PositionMonitor:
             is_short = (pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"))
             peak = pos.lowest_price if is_short else pos.highest_price
 
+            # Sanity guard: Peak cannot exceed 2.0x entry or be <0.2x entry on ETPs (indicates underlying scale contamination)
+            if peak > pos.entry_price * 2.0 or peak < pos.entry_price * 0.2:
+                logger.warning("Rejecting contaminated peak %.2f for %s (entry %.2f) in rollover stop calculation", peak, ticker, pos.entry_price)
+                pos.highest_price = pos.current_price or pos.entry_price
+                pos.lowest_price = pos.current_price or pos.entry_price
+                continue
+
             # Check if position experienced positive gain
             has_gain = (peak < pos.entry_price) if is_short else (peak > pos.entry_price)
             if not has_gain:
@@ -1734,6 +1741,25 @@ class PositionMonitor:
                         pos.currency = resolved_curr
                     if pos.currency != data.get("currency"):
                         state_updated = True
+
+                    # Auto-heal underlying scale contamination (e.g. tp1 computed on underlying index)
+                    if pos.entry_price > 0 and pos.tp1 > 3.0 * pos.entry_price:
+                        levels = self.calculate_exit_levels(entry_price=pos.entry_price, direction=pos.direction)
+                        pos.tp1 = levels["tp1"]
+                        pos.tp2 = levels["tp2"]
+                        pos.tp3 = levels["tp3"]
+                        pos.atr = levels["atr"]
+                        if pos.highest_price and pos.highest_price > 2.0 * pos.entry_price:
+                            pos.highest_price = pos.current_price or pos.entry_price
+                        if pos.lowest_price and pos.lowest_price < 0.2 * pos.entry_price:
+                            pos.lowest_price = pos.current_price or pos.entry_price
+                        pos.scale_calibrated = True
+                        state_updated = True
+                        logger.warning(
+                            "Auto-healed scale contamination for %s: recalibrated tp1=%.2f, tp2=%.2f, tp3=%.2f to ETP entry %.2f",
+                            pos.ticker, pos.tp1, pos.tp2, pos.tp3, pos.entry_price,
+                        )
+
                     positions[t] = pos
                 else:
                     had_closed = True
