@@ -43,6 +43,7 @@ from trading_system.agents.fundamental_agent import FundamentalAnalyst
 from trading_system.agents.debate_engine import DebateEngine
 from trading_system.agents.antigravity_agent import AntigravityTradingAgent
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
+from trading_system.agents.strategy_improvement_agent import StrategyImprovementAgent
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ class Orchestrator:
             max_catalyst_risk=settings.SCREENER_MAX_CATALYST_RISK,
             top_n=settings.SCREENER_TOP_N,
         )
+        self.improvement_agent = StrategyImprovementAgent()
 
         # ── 5. System 2: Deliberative Multi-Agent Stack ──────────
         self.technical_analyst = TechnicalAnalyst(
@@ -344,21 +346,25 @@ class Orchestrator:
                     len(universe_metrics), settings.MIN_ADX_TREND)
         AntigravityTradingAgent.set_active_universe_metrics(universe_metrics)
 
-        if not HAS_LAYA:
-            logger.warning(
-                "Laya NLI engine not installed — using TechnicalFallbackScreener for signal generation."
-            )
-            candidates = TechnicalFallbackScreener(top_n=10).scan_universe(universe_metrics)
-        else:
-            # LayaScreener.scan_universe() already falls back internally when it returns 0.
-            candidates = self.screener.scan_universe(universe_metrics)
+        # Evaluate candidates with primary screener (supports 3-RSI and Momentum)
+        candidates = self.screener.scan_universe(universe_metrics)
 
-        # Final safety net: if still no candidates, run fallback directly.
+        # Safety net: if primary returned 0, evaluate with TechnicalFallbackScreener
         if not candidates:
             logger.warning(
                 "Primary screener returned 0 candidates — running TechnicalFallbackScreener as safety net."
             )
             candidates = TechnicalFallbackScreener(top_n=10).scan_universe(universe_metrics)
+
+        # Record cycle yield with StrategyImprovementAgent
+        if getattr(self, "improvement_agent", None):
+            try:
+                self.improvement_agent.record_cycle_yield(
+                    candidate_count=len(candidates),
+                    universe_metrics=universe_metrics,
+                )
+            except Exception as audit_exc:
+                logger.debug("StrategyImprovementAgent record notice: %s", audit_exc)
 
         logger.info(
             "System 1 passed %d high-momentum candidates: %s",

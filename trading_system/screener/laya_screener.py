@@ -494,6 +494,10 @@ class TechnicalFallbackScreener:
     ) -> List[ScreenerResult]:
         """Evaluate all assets in *universe_metrics* using pure technical indicators.
 
+        Detects both:
+        1. Connors 3-RSI Mean Reversion (RSI3/RSI7 exhaustion above/below 200 SMA)
+        2. Trend Momentum Breakouts (EMA20/50 alignment, ADX trend strength, MACD confirmation)
+
         Args:
             universe_metrics: Mapping of ``{ticker: metrics_dict}``.
 
@@ -505,18 +509,68 @@ class TechnicalFallbackScreener:
 
         for ticker, m in universe_metrics.items():
             rsi: float = float(m.get("rsi", m.get("rsi14", 50.0)))
+            rsi3: float = float(m.get("rsi3", 50.0))
+            rsi7: float = float(m.get("rsi7", 50.0))
             adx: float = float(m.get("adx", 0.0))
             close: float = float(m.get("close", 0.0))
+            sma200: float = float(m.get("sma200", close))
             ema20: float = float(m.get("ema20", close))
-            macd: float = float(m.get("macd", 0.0))
-            macd_signal: float = float(m.get("macd_signal", 0.0))
+            ema50: float = float(m.get("ema50", close))
+            macd: float = float(m.get("macd", 0.0) or 0.0)
+            macd_signal: float = float(m.get("macd_signal", 0.0) or 0.0)
             atr: float = float(m.get("atr", 0.0))
 
+            # --- 1. Connors 3-RSI Mean Reversion Strategy (High Win-Rate) ---
+            is_3rsi_bullish = close > sma200 and rsi3 <= 22.0 and rsi7 <= 42.0
+            is_3rsi_bearish = close < sma200 and rsi3 >= 78.0 and rsi7 >= 58.0
+
+            if is_3rsi_bullish:
+                results.append(
+                    ScreenerResult(
+                        ticker=ticker,
+                        bias="bullish",
+                        bias_confidence=0.95,
+                        setup_score="exceptional",
+                        setup_confidence=0.95,
+                        catalyst_risk=0.05,
+                        overall_confidence=0.95,
+                        strategy_type="3rsi_mean_reversion",
+                        metrics=m,
+                        state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f} close={close:.2f} > sma200={sma200:.2f}",
+                    )
+                )
+                continue
+            elif is_3rsi_bearish:
+                results.append(
+                    ScreenerResult(
+                        ticker=ticker,
+                        bias="bearish",
+                        bias_confidence=0.92,
+                        setup_score="exceptional",
+                        setup_confidence=0.92,
+                        catalyst_risk=0.05,
+                        overall_confidence=0.92,
+                        strategy_type="3rsi_mean_reversion",
+                        metrics=m,
+                        state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f} close={close:.2f} < sma200={sma200:.2f}",
+                    )
+                )
+                continue
+
+            # --- 2. 3x Momentum & Trend Breakout Strategy ---
             if adx < self.min_adx:
                 continue
 
-            bullish = rsi < 65.0 and close > ema20 and macd > macd_signal
-            bearish = rsi > 35.0 and close < ema20 and macd < macd_signal
+            # Determine MACD or EMA trend confirmation
+            if macd != 0.0 or macd_signal != 0.0:
+                macd_bullish = macd > macd_signal
+                macd_bearish = macd < macd_signal
+            else:
+                macd_bullish = ema20 > ema50
+                macd_bearish = ema20 < ema50
+
+            bullish = rsi < 68.0 and close > ema20 and macd_bullish
+            bearish = rsi > 32.0 and close < ema20 and macd_bearish
 
             if not bullish and not bearish:
                 continue
@@ -531,11 +585,8 @@ class TechnicalFallbackScreener:
             else:
                 setup_score = "mediocre"
 
-            # Confidence scales with ADX (capped at 1.0)
             confidence = min(1.0, adx / 40.0)
-
-            # Catalyst risk: low default (technical screener has no earnings data)
-            catalyst_risk = 0.15
+            catalyst_risk = 0.10
 
             results.append(
                 ScreenerResult(
@@ -548,14 +599,44 @@ class TechnicalFallbackScreener:
                     overall_confidence=confidence,
                     strategy_type="momentum",
                     metrics=m,
-                    state_document=f"[TechnicalFallback] {ticker} | RSI={rsi:.1f} ADX={adx:.1f} "
-                                   f"close={close:.4f} ema20={ema20:.4f} MACD={macd:.6f}/{macd_signal:.6f}",
+                    state_document=f"[TechnicalFallback:Momentum] {ticker} | RSI={rsi:.1f} ADX={adx:.1f} "
+                                   f"close={close:.4f} ema20={ema20:.4f} MACD={macd:.4f}/{macd_signal:.4f}",
                 )
             )
 
-        results.sort(key=lambda r: r.overall_confidence, reverse=True)
-        logger.info(
-            "TechnicalFallbackScreener: %d/%d assets passed (top_n=%d)",
-            len(results), len(universe_metrics), self.top_n,
+        # Sort: best setup first, then highest confidence
+        results.sort(
+            key=lambda r: (
+                {"exceptional": 3, "favorable": 2, "mediocre": 1, "unfavorable": 0}.get(r.setup_score, 0),
+                r.overall_confidence,
+            ),
+            reverse=True,
         )
-        return results[: self.top_n]
+
+        # Sector-diversified selection across categories
+        try:
+            from trading_system.data.leveraged_universe import LeveragedUniverse
+            univ = LeveragedUniverse()
+            category_counts: Dict[str, int] = {}
+            diversified: List[ScreenerResult] = []
+            overflow: List[ScreenerResult] = []
+            max_per_category = 2
+
+            for r in results:
+                cat = univ.get_category_for_symbol(r.ticker)
+                count = category_counts.get(cat, 0)
+                if count < max_per_category:
+                    diversified.append(r)
+                    category_counts[cat] = count + 1
+                else:
+                    overflow.append(r)
+
+            final_candidates = (diversified + overflow)[: self.top_n]
+        except Exception:
+            final_candidates = results[: self.top_n]
+
+        logger.info(
+            "TechnicalFallbackScreener: %d/%d assets passed (top_n=%d, returned=%d)",
+            len(results), len(universe_metrics), self.top_n, len(final_candidates),
+        )
+        return final_candidates

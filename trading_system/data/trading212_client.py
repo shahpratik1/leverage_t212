@@ -1863,6 +1863,16 @@ class MarketDataProvider:
 
             high_20d = float(daily_data["high"].tail(20).max())
 
+            # MACD (12, 26, 9)
+            daily_series = pd.Series(daily_close)
+            ema12 = daily_series.ewm(span=12, adjust=False).mean()
+            ema26 = daily_series.ewm(span=26, adjust=False).mean()
+            macd_series = ema12 - ema26
+            macd_sig_series = macd_series.ewm(span=9, adjust=False).mean()
+            macd = float(macd_series.iloc[-1])
+            macd_signal = float(macd_sig_series.iloc[-1])
+            macd_hist = float((macd_series - macd_sig_series).iloc[-1])
+
             # 20-day annualized realized volatility for volatility-targeted sizing
             pct_chg = pd.Series(daily_close).pct_change().tail(20)
             realized_vol = float(pct_chg.std() * (252 ** 0.5)) if len(pct_chg.dropna()) > 5 else 0.25
@@ -1883,6 +1893,9 @@ class MarketDataProvider:
                 "rsi14": round(rsi14, 2),
                 "adx": round(adx, 2),
                 "atr": round(atr, 2),
+                "macd": round(macd, 4),
+                "macd_signal": round(macd_signal, 4),
+                "macd_hist": round(macd_hist, 4),
                 "realized_vol": round(realized_vol, 4),
                 "high_20d": round(high_20d, 2),
                 "earnings_in_days": earnings_days,
@@ -1951,6 +1964,13 @@ class MarketDataProvider:
         adx = 26.5 if trend == "up" and rsi14 > 55 else (27.0 if trend == "down" and rsi14 < 45 else 18.0)
         high_20d = max(highs[-20:]) if len(highs) >= 20 else max(highs)
 
+        # MACD (12, 26, 9)
+        ema12 = calc_ema(closes[-60:], 12)
+        ema26 = calc_ema(closes[-60:], 26)
+        macd = ema12 - ema26
+        macd_signal = calc_ema([macd * 0.9, macd * 0.95, macd], 9) if macd != 0 else 0.0
+        macd_hist = macd - macd_signal
+
         # 20-day annualized realized volatility fallback
         ret_window = [
             (closes[i] - closes[i - 1]) / closes[i - 1]
@@ -1977,6 +1997,9 @@ class MarketDataProvider:
             "rsi14": round(rsi14, 2),
             "adx": round(adx, 2),
             "atr": round(atr, 2),
+            "macd": round(macd, 4),
+            "macd_signal": round(macd_signal, 4),
+            "macd_hist": round(macd_hist, 4),
             "realized_vol": round(realized_vol, 4),
             "high_20d": round(high_20d, 2),
             "earnings_in_days": earnings_days,
