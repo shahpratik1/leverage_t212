@@ -710,10 +710,24 @@ class PositionMonitor:
                     if ratio > 5.0 or ratio < 0.20:
                         logger.warning(
                             "Entry price scale mismatch for %s: stored=%.4f broker_avg=%.4f (ratio=%.1f×). "
-                            "Correcting to broker average price.",
+                            "Recalibrating position levels to broker average price.",
                             ticker, pos.entry_price, broker_avg, ratio,
                         )
+                        levels = self.calculate_exit_levels(
+                            entry_price=broker_avg,
+                            direction=pos.direction,
+                            existing_stop_price=pos.stop_loss if (0.2 < (pos.stop_loss / broker_avg) < 5.0) else None,
+                        )
                         pos.entry_price = broker_avg
+                        pos.stop_loss = levels["stop_loss"]
+                        pos.trailing_stop_loss = levels["trailing_stop_loss"]
+                        pos.tp1 = levels["tp1"]
+                        pos.tp2 = levels["tp2"]
+                        pos.tp3 = levels["tp3"]
+                        pos.atr = levels["atr"]
+                        pos.highest_price = cur_px if cur_px > 0 else broker_avg
+                        pos.lowest_price = cur_px if cur_px > 0 else broker_avg
+                        pos.scale_calibrated = True
                         self._save_state()
 
                 # Link native stop order from broker if missing or unlinked
@@ -1098,8 +1112,10 @@ class PositionMonitor:
 
             current_price = current_prices.get(ticker)
             if not current_price or current_price <= 0:
-                # If direct price not available, try underlying
-                current_price = current_prices.get(pos.underlying)
+                # Do NOT use raw underlying price directly for calibrated ETPs (corrupts price scale)
+                current_price = getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0)
+                if (not current_price or current_price <= 0) and not getattr(pos, "scale_calibrated", False):
+                    current_price = current_prices.get(pos.underlying)
 
             if not current_price or current_price <= 0:
                 continue
@@ -1193,6 +1209,32 @@ class PositionMonitor:
                 stop_hit = current_price <= active_stop
 
             if stop_hit:
+                # Anti-Bid-Ask-Bounce Grace Period Check:
+                # During the first MIN_HOLD_SECONDS (e.g. 120s), broker portfolio price is typically
+                # the resting BID, whereas entry occurred at ASK. If price is resting near the entry bid
+                # and has not dropped catastrophically (>15%), absorb spread noise without software stop liquidation.
+                entry_ts = getattr(pos, "entry_timestamp", 0.0)
+                if not entry_ts and getattr(pos, "entry_time", None):
+                    try:
+                        entry_ts = datetime.fromisoformat(pos.entry_time.replace("Z", "+00:00")).timestamp()
+                        setattr(pos, "entry_timestamp", entry_ts)
+                    except Exception:
+                        entry_ts = 0.0
+
+                from trading_system.config import settings
+                min_hold_sec = getattr(settings, "MIN_HOLD_SECONDS", 120.0)
+                now_ts = current_time.timestamp() if current_time else time.time()
+                time_held = (now_ts - entry_ts) if entry_ts > 0 else 999.0
+                drop_from_entry = abs(pos.entry_price - current_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+
+                if time_held < min_hold_sec and drop_from_entry < 0.15 and not pos.tp1_hit:
+                    logger.info(
+                        "Anti-whipsaw grace period active for %s (held %.1fs < %.1fs, entry $%.2f, current $%.2f, drop %.1f%%). "
+                        "Absorbing entry bid-ask spread without software stop liquidation.",
+                        ticker, time_held, min_hold_sec, pos.entry_price, current_price, drop_from_entry * 100.0,
+                    )
+                    continue
+
                 event = self._handle_stop_exit(pos, current_price, is_tsl=(active_stop == pos.trailing_stop_loss and pos.tp1_hit))
                 events.append(event)
                 tickers_to_remove.append(ticker)
@@ -1563,6 +1605,12 @@ class PositionMonitor:
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
 
+        # Register anti-churn loss cooldown on RiskManager
+        if pnl < 0 and hasattr(self.risk_manager, "register_loss_exit"):
+            from trading_system.config import settings
+            cooldown = getattr(settings, "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0)
+            self.risk_manager.register_loss_exit(pos.ticker, pos.underlying, cooldown_seconds=cooldown)
+
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, shares_to_sell)
 
@@ -1591,6 +1639,12 @@ class PositionMonitor:
             time.sleep(delay)
 
         pnl, pnl_pct = self._calculate_pnl(pos, price, shares_to_sell)
+
+        # Register anti-churn loss cooldown on RiskManager
+        if pnl < 0 and hasattr(self.risk_manager, "register_loss_exit"):
+            from trading_system.config import settings
+            cooldown = getattr(settings, "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0)
+            self.risk_manager.register_loss_exit(pos.ticker, pos.underlying, cooldown_seconds=cooldown)
 
         # Execute sell order on Trading 212
         self._execute_sell(pos.ticker, shares_to_sell)

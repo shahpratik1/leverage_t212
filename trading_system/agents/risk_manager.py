@@ -7,6 +7,7 @@ Enforces strict position sizing, ATR-based Stop Loss, multi-target Take Profits
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -117,7 +118,10 @@ class RiskManager:
         self.max_portfolio_beta_heat = getattr(settings, "MAX_PORTFOLIO_BETA_HEAT", 3.0) if max_portfolio_beta_heat is None else max_portfolio_beta_heat
         self.enforce_daily_circuit_breaker = getattr(settings, "ENFORCE_DAILY_CIRCUIT_BREAKER", True) if enforce_daily_circuit_breaker is None else enforce_daily_circuit_breaker
         self.daily_max_drawdown_pct = getattr(settings, "DAILY_MAX_DRAWDOWN_PCT", 0.02) if daily_max_drawdown_pct is None else daily_max_drawdown_pct
+        self.trade_loss_cooldown_seconds = getattr(settings, "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0)
+        self.max_spread_to_stop_ratio = getattr(settings, "MAX_SPREAD_TO_STOP_RATIO", 0.50)
 
+        self.loss_cooldowns: Dict[str, float] = {}
         self.is_circuit_breaker_tripped: bool = False
         self.session_start_equity: Optional[float] = None
         self.current_drawdown_pct: float = 0.0
@@ -165,6 +169,35 @@ class RiskManager:
         self.current_drawdown_pct = 0.0
         if new_session_equity and new_session_equity > 0:
             self.session_start_equity = new_session_equity
+
+    def register_loss_exit(
+        self, ticker: str, underlying: Optional[str] = None, cooldown_seconds: Optional[float] = None
+    ) -> None:
+        """Place a ticker and its underlying on anti-churn cooldown after a stop loss exit."""
+        duration = cooldown_seconds if cooldown_seconds is not None else self.trade_loss_cooldown_seconds
+        expiry = time.time() + duration
+        t_clean = (ticker or "").upper().strip()
+        u_clean = (underlying or "").upper().strip()
+        if t_clean:
+            self.loss_cooldowns[t_clean] = expiry
+        if u_clean:
+            self.loss_cooldowns[u_clean] = expiry
+        logger.info(
+            "Placed %s (underlying %s) on post-loss anti-churn cooldown for %.0fs (expires in %.0f min)",
+            t_clean, u_clean or "N/A", duration, duration / 60.0
+        )
+
+    def is_in_loss_cooldown(self, ticker: str, underlying: Optional[str] = None) -> Tuple[bool, float]:
+        """Check if ticker or underlying is currently under anti-churn loss cooldown."""
+        now = time.time()
+        for sym in ((ticker or "").upper().strip(), (underlying or "").upper().strip()):
+            if sym and sym in self.loss_cooldowns:
+                exp = self.loss_cooldowns[sym]
+                if now < exp:
+                    return True, exp - now
+                else:
+                    self.loss_cooldowns.pop(sym, None)
+        return False, 0.0
 
     def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG") -> float:
         """Calculate stop loss based on ATR and minimum percentage distance.
@@ -416,19 +449,32 @@ class RiskManager:
         if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
             return False, f"Decision is {card.decision}, not an entry decision"
 
-        # 1. Daily Drawdown Circuit Breaker Gate
+        # 1. Anti-Churn Loss Cooldown Gate
+        in_cooldown, remaining_sec = self.is_in_loss_cooldown(card.trading212_ticker, card.ticker)
+        if in_cooldown:
+            return (
+                False,
+                f"Anti-churn cooldown active for {card.trading212_ticker} ({card.ticker}) after recent stop-loss exit ({remaining_sec:.0f}s remaining)",
+            )
+
+        # 2. Daily Drawdown Circuit Breaker Gate
         if self.enforce_daily_circuit_breaker and self.is_circuit_breaker_tripped:
             return (
                 False,
                 f"Daily circuit breaker tripped (Drawdown {self.current_drawdown_pct*100:.2f}% breached -{self.daily_max_drawdown_pct*100:.1f}%)",
             )
 
-        # 2. Bid-Ask Spread Gate
+        # 3. Bid-Ask Spread Gate & Spread-to-Stop Ratio Gate
         if self.enforce_spread_gate and spread_pct is not None:
             if spread_pct > self.max_bid_ask_spread_pct:
                 return (
                     False,
                     f"Bid-ask spread too wide ({spread_pct*100:.2f}% > {self.max_bid_ask_spread_pct*100:.2f}%)",
+                )
+            if card.stop_distance_pct > 0 and spread_pct >= (card.stop_distance_pct * self.max_spread_to_stop_ratio):
+                return (
+                    False,
+                    f"Spread ({spread_pct*100:.2f}%) exceeds {self.max_spread_to_stop_ratio*100:.0f}% of planned stop loss ({card.stop_distance_pct*100:.2f}%), trade would be vulnerable to immediate spread-stop whipsaw",
                 )
 
         from trading_system.config import settings

@@ -157,6 +157,9 @@ class Settings:
     # Advanced Risk & Safety Gates
     ENFORCE_SPREAD_GATE: bool = True
     MAX_BID_ASK_SPREAD_PCT: float = 0.0035    # 0.35% max relative spread
+    MAX_SPREAD_TO_STOP_RATIO: float = 0.50    # Spread must not exceed 50% of the stop loss distance
+    TRADE_LOSS_COOLDOWN_SECONDS: float = 3600.0  # 1 hour cooldown after a stop-out to prevent churn/re-entry whipsaw
+    MIN_HOLD_SECONDS: float = 120.0           # 2 minutes minimum hold time to absorb entry bid-ask bounce
     ENFORCE_CORRELATION_LIMITS: bool = True
     MAX_SECTOR_POSITIONS: int = 2             # Max concurrent positions per sector cluster
     MAX_PORTFOLIO_BETA_HEAT: float = 3.0      # Max aggregate portfolio beta exposure

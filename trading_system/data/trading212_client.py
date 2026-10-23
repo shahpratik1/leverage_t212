@@ -1360,12 +1360,26 @@ class MarketDataProvider:
             regular_price = float(meta.get("regularMarketPrice", 0.0) or 0.0)
             ask = float(meta.get("ask", 0.0) or 0.0)
             bid = float(meta.get("bid", 0.0) or 0.0)
+
+            # Try yfinance info if bid/ask missing from chart meta
+            if (not ask or not bid or ask <= bid) and HAS_DATA_LIBS and yf is not None:
+                try:
+                    yf_info = yf.Ticker(clean).info or {}
+                    yf_ask = float(yf_info.get("ask", 0.0) or 0.0)
+                    yf_bid = float(yf_info.get("bid", 0.0) or 0.0)
+                    if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
+                        ask, bid = yf_ask, yf_bid
+                except Exception:
+                    pass
+
             if ask > 0 and bid > 0 and ask >= bid:
                 mid = (ask + bid) / 2.0
                 spread_pct = (ask - bid) / mid if mid > 0 else 0.0
                 return {"bid": bid, "ask": ask, "mid": mid, "spread_pct": spread_pct}
             elif regular_price > 0:
-                approx_spread = 0.0018
+                # Conservative spread model: Milan (m_EQ / .MI) and exotic commodities have high retail OTC spread
+                is_milan_or_exotic = clean.endswith(".MI") or raw_sym.endswith("m_EQ") or any(k in raw_sym for k in ("WTI", "BRL", "CFL", "WHL", "NGL"))
+                approx_spread = 0.025 if is_milan_or_exotic else 0.0025
                 return {
                     "bid": round(regular_price * (1.0 - approx_spread / 2.0), 4),
                     "ask": round(regular_price * (1.0 + approx_spread / 2.0), 4),
@@ -1383,7 +1397,9 @@ class MarketDataProvider:
             if pair and pair.underlying_symbol and pair.underlying_symbol.upper() != raw_sym.upper():
                 und_spread = cls.get_bid_ask_spread(pair.underlying_symbol)
                 if und_spread.get("spread_pct", 0.0) > 0:
-                    proxy_pct = round(und_spread["spread_pct"] * 1.5, 4)
+                    is_milan_or_exotic = clean.endswith(".MI") or raw_sym.endswith("m_EQ") or any(k in raw_sym for k in ("WTI", "BRL", "CFL", "WHL", "NGL"))
+                    mult = 4.0 if is_milan_or_exotic else 1.5
+                    proxy_pct = round(und_spread["spread_pct"] * mult, 4)
                     return {
                         "bid": round(und_spread.get("bid", 0.0), 4),
                         "ask": round(und_spread.get("ask", 0.0), 4),
@@ -1393,8 +1409,10 @@ class MarketDataProvider:
         except Exception:
             pass
 
-        # 3. Safe institutional default spread for ETP execution (0.20%)
-        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread_pct": 0.0020}
+        # 3. Conservative default spread for unverified instruments
+        is_milan_or_exotic = clean.endswith(".MI") or raw_sym.endswith("m_EQ") or any(k in raw_sym for k in ("WTI", "BRL", "CFL", "WHL", "NGL"))
+        default_spread = 0.025 if is_milan_or_exotic else 0.0025
+        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread_pct": default_spread}
 
     @classmethod
     def is_ticker_synthetic(cls, symbol: str) -> bool:
