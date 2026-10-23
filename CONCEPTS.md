@@ -32,3 +32,15 @@ An ATR multiplier (e.g. 2.0x–2.5x) applied to stop-loss placement on high-beta
 *Avoid: Tight stop, scalping stop*
 
 Calibrating the noise buffer to at least 2.2x ATR prevents false-positive exits during peak adverse excursion on 3x leveraged ETPs, allowing short-term relief rallies to develop.
+
+### Schmitt Hysteresis Ratchet
+A two-stage protective stop-loss protocol that moves the stop to break-even upon reaching the first take-profit milestone and elevates it to lock in gains only after market price escapes past a volatility dead-band.
+*Avoid: Single-tick ratchet, instant break-even lock*
+
+Because wide bid-ask spreads on leveraged vehicles cause immediate resting bid executions, holding the stop at entry until price clears the escape boundary prevents bid-ask bounce from terminating profitable trades prematurely.
+
+### Asymmetric Session Protocol
+An execution rule governing overnight risk where leveraged inverse short positions are systematically flattened prior to exchange close, while long positions require positive unrealized cushion to hold overnight.
+*Avoid: Universal overnight hold, static session policy*
+
+Inverse leveraged products experience heightened path-dependency and compounding decay during off-market gap openings; liquidating inverse exposure intraday isolates risk to active trading hours.

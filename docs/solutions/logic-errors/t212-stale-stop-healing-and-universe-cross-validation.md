@@ -1,3 +1,26 @@
+---
+title: Trading 212 Stale Stop Healing, Fallback Screening & Universe Cross-Validation
+date: 2026-10-22
+category: logic-errors
+module: trading_system/execution
+problem_type: logic_error
+component: position_monitor
+symptoms:
+  - "Stale stop orders returning HTTP 400 'price too far from current market price' during broker resubmission"
+  - "UK GBX pence scale mismatches distorting unrealized P&L calculations by 10x to 100x"
+  - "Transformer NLI cold-start failures causing total signal starvation"
+  - "Unverified speculative tickers causing broken order submissions on Trading 212"
+root_cause: broker_rejection_drift
+resolution_type: dynamic_recalibration
+severity: high
+tags:
+  - stale-stop-loss
+  - trading212
+  - fallback-screener
+  - currency-scaling
+  - universe-validation
+---
+
 # Trading 212 Stale Stop Healing, Fallback Screening & Universe Cross-Validation
 
 ## Problem Context
