@@ -1,8 +1,10 @@
-"""Nixtla Data Provider for 5-Day TimeGPT Time-Series Price Forecasting.
+"""Nixtla & Keyless Quantitative 5-Day Time-Series Price Forecasting Provider.
 
-Provides 5-day horizon price forecasting (h=5, freq='D') using Nixtla TimeGPT
-(https://docs.nixtla.io/docs/timegpt_quickstart) to forecast directional trajectories,
-expected return percentage, and predictive bias for candidate assets.
+Provides 5-day horizon price forecasting:
+1. Nixtla TimeGPT API (when NIXTLA_API_KEY is configured).
+2. Keyless quantitative time-series smoothing on real historical candle closes (yfinance).
+
+Strictly avoids mock/simulated data. Requires real historical candle prices.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import logging
 import os
 import time
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class NixtlaProvider:
-    """Provider for 5-day price trajectory forecasting via Nixtla TimeGPT."""
+    """Provider for 5-day price trajectory forecasting."""
 
     BASE_URL: str = "https://api.nixtla.io/v2"
 
@@ -45,10 +47,10 @@ class NixtlaProvider:
         self.timeout = timeout
         self.horizon = int(getattr(settings, "NIXTLA_FORECAST_HORIZON", horizon) or 5)
         self.cache_ttl = cache_ttl
-        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 
     def is_configured(self) -> bool:
-        """Check if an API key is provided."""
+        """Check if a Nixtla API key is provided."""
         return bool(self.api_key)
 
     def _call_nixtla_api(
@@ -87,7 +89,6 @@ class NixtlaProvider:
             except Exception as exc:
                 logger.debug("Nixtla HTTPX request failed: %s", exc)
 
-        # urllib fallback
         try:
             data_bytes = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
@@ -106,7 +107,6 @@ class NixtlaProvider:
         """Extract forecasted price sequence from Nixtla response object."""
         if not isinstance(data, dict):
             return None
-        # Could be {"forecast": [...]}, {"data": {"forecast": [...]}}, or {"data": [{"TimeGPT": ...}]}
         if "forecast" in data and isinstance(data["forecast"], list):
             return [float(x) for x in data["forecast"] if x is not None]
         sub = data.get("data")
@@ -125,36 +125,40 @@ class NixtlaProvider:
                 return prices
         return None
 
-    def _generate_statistical_baseline(
+    def _compute_quantitative_candle_forecast(
         self,
         last_price: float,
         closes: List[float],
-    ) -> List[float]:
-        """Generate high-fidelity statistical 5-day trajectory projection.
+    ) -> Optional[List[float]]:
+        """Compute real quantitative 5-day trajectory projection on historical candles.
 
-        Uses recent momentum drift, dampened towards mean, ensuring realistic forecast paths.
+        Uses Holt's double exponential smoothing (level + trend) on real candle closes.
+        Requires at least 5 real historical closes. Returns None if data is missing.
         """
-        p0 = max(0.01, last_price)
-        if len(closes) >= 10:
-            # Short-term drift per day based on 10-day lookback
-            recent_return = (p0 - closes[-10]) / max(0.01, closes[-10])
-            daily_drift = (recent_return / 10.0) * 0.65  # dampen forward
-        elif len(closes) >= 3:
-            recent_return = (p0 - closes[0]) / max(0.01, closes[0])
-            daily_drift = (recent_return / len(closes)) * 0.50
-        else:
-            daily_drift = 0.002  # mild baseline growth 0.2% / day
+        if len(closes) < 5:
+            return None
 
-        # Clamp daily drift between -2.0% and +2.0% per day
-        daily_drift = max(-0.02, min(0.02, daily_drift))
+        p0 = max(0.0001, last_price)
+        # Level and Trend initialization
+        level = closes[0]
+        trend = (closes[min(4, len(closes)-1)] - closes[0]) / max(1, min(4, len(closes)-1))
 
+        alpha = 0.35
+        beta = 0.15
+
+        for price in closes:
+            prev_level = level
+            level = alpha * price + (1 - alpha) * (level + trend)
+            trend = beta * (level - prev_level) + (1 - beta) * trend
+
+        # Damped trend forward projection
+        damping = 0.85
         forecast = []
         curr = p0
         for i in range(self.horizon):
-            # Gradual deceleration factor
-            decay = 1.0 - (0.05 * i)
-            curr = curr * (1.0 + (daily_drift * decay))
-            forecast.append(round(curr, 4))
+            curr = curr + (trend * (damping ** (i + 1)))
+            forecast.append(round(max(0.0001, curr), 4))
+
         return forecast
 
     def get_5day_forecast(
@@ -162,20 +166,11 @@ class NixtlaProvider:
         symbol: str,
         candles: Optional[List[Dict[str, Any]]] = None,
         force_refresh: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """Compute or fetch 5-day price forecast and directional bias for a symbol.
 
-        Returns:
-            Dict containing:
-                - symbol: str
-                - horizon_days: int (5)
-                - last_price: float
-                - forecast_prices: List[float] (5 days)
-                - expected_return_pct: float
-                - directional_bias: "BULLISH" | "BEARISH" | "NEUTRAL"
-                - confidence: float (0.0 to 1.0)
-                - summary: str
-                - is_forecast_simulated: bool
+        Prioritizes Nixtla TimeGPT if configured; otherwise uses real candle quantitative model.
+        Returns None if real candle data cannot be retrieved. Strictly no mocks.
         """
         clean_sym = normalize_finnhub_symbol(symbol)
         now = time.time()
@@ -201,7 +196,7 @@ class NixtlaProvider:
                         else:
                             dates.append(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
 
-        # Fallback closes if empty
+        # Fetch real candles from MarketDataProvider if not provided
         if not closes:
             try:
                 from trading_system.data.trading212_client import MarketDataProvider
@@ -216,27 +211,36 @@ class NixtlaProvider:
                                 closes.append(float(row["close"]))
                                 dates.append(str(row.get("date", ""))[:10])
             except Exception as exc:
-                logger.debug("Could not fetch daily candles for Nixtla forecast: %s", exc)
+                logger.debug("Could not fetch daily candles for forecast: %s", exc)
 
-        last_price = closes[-1] if closes else 100.0
+        if not closes or len(closes) < 5:
+            # Strictly no mock
+            self._cache[clean_sym] = (now, None)
+            return None
 
+        last_price = closes[-1]
         forecast_prices: Optional[List[float]] = None
-        is_simulated = True
+        source = "Quantitative Candle Model (yfinance)"
 
+        # 1. Nixtla API if configured
         if self.is_configured() and getattr(settings, "ENABLE_NIXTLA_FORECAST", True) and len(closes) >= 15:
             try:
                 api_forecast = self._call_nixtla_api(dates, closes)
                 if api_forecast and len(api_forecast) >= self.horizon:
                     forecast_prices = [round(float(p), 4) for p in api_forecast[:self.horizon]]
-                    is_simulated = False
+                    source = "Nixtla TimeGPT API"
             except Exception as exc:
                 logger.debug("Nixtla forecast call failed for %s: %s", clean_sym, exc)
 
+        # 2. Keyless quantitative model on historical candles
         if not forecast_prices:
-            forecast_prices = self._generate_statistical_baseline(last_price, closes)
-            is_simulated = True
+            forecast_prices = self._compute_quantitative_candle_forecast(last_price, closes)
 
-        p0 = max(0.01, last_price)
+        if not forecast_prices:
+            self._cache[clean_sym] = (now, None)
+            return None
+
+        p0 = max(0.0001, last_price)
         p5 = forecast_prices[-1]
         exp_return_pct = round(((p5 - p0) / p0) * 100.0, 2)
 
@@ -251,7 +255,7 @@ class NixtlaProvider:
             confidence = 0.65
 
         summary = (
-            f"Nixtla 5-Day Forecast for {clean_sym}: {directional_bias} bias with {exp_return_pct:+.2f}% "
+            f"5-Day Forecast for {clean_sym} [{source}]: {directional_bias} bias with {exp_return_pct:+.2f}% "
             f"expected return over 5 trading days (Target: ${p5:.2f} vs Current: ${p0:.2f})."
         )
 
@@ -264,26 +268,28 @@ class NixtlaProvider:
             "directional_bias": directional_bias,
             "confidence": round(confidence, 2),
             "summary": summary,
-            "is_forecast_simulated": is_simulated,
+            "source": source,
         }
 
         self._cache[clean_sym] = (now, result)
         return result
 
-    def format_forecast_report(self, data: Dict[str, Any]) -> str:
+    def format_forecast_report(self, data: Optional[Dict[str, Any]]) -> str:
         """Format 5-day forecast into clean summary string."""
+        if not data:
+            return "5-Day forecast unavailable (insufficient candle data)."
         sym = data.get("symbol", "")
         bias = data.get("directional_bias", "NEUTRAL")
         ret = data.get("expected_return_pct", 0.0)
         p0 = data.get("last_price", 0.0)
         prices = data.get("forecast_prices", [])
-        sim = " (Simulated TimeGPT Baseline)" if data.get("is_forecast_simulated") else ""
+        source = data.get("source", "Quantitative Model")
 
         icon = "🟢" if bias == "BULLISH" else ("🔴" if bias == "BEARISH" else "⚪")
         path_str = " → ".join(f"${p:.2f}" for p in prices)
 
         return (
-            f"Nixtla TimeGPT 5-Day Forecast for {sym}{sim}:\n"
+            f"5-Day Price Forecast for {sym} [{source}]:\n"
             f"  • Bias: {icon} {bias} ({ret:+.2f}% expected 5d return, Confidence: {data.get('confidence', 0.65):.2f})\n"
             f"  • Trajectory: Current ${p0:.2f} → {path_str}\n"
             f"  • Summary: {data.get('summary', '')}"

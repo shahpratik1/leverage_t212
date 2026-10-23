@@ -225,16 +225,16 @@ def tool_get_asset_intelligence(ticker: str) -> str:
         fh = MarketDataProvider.get_company_fundamentals(clean)
         olo = MarketDataProvider.get_sentiment_search(clean)
         nxt = MarketDataProvider.get_5day_forecast(clean)
-        summary["finnhub_valuation"] = fh.get("valuation_summary", "Normal valuation")
+        summary["finnhub_valuation"] = fh.get("valuation_summary", "Unavailable") if fh else "Unavailable"
         summary["olostep_sentiment"] = {
             "label": olo.get("sentiment_label", "NEUTRAL"),
             "score": olo.get("sentiment_score", 0.50),
-        }
+        } if olo else "Unavailable"
         summary["nixtla_5d_forecast"] = {
             "bias": nxt.get("directional_bias", "NEUTRAL"),
             "expected_return_pct": nxt.get("expected_return_pct", 0.0),
             "target_5d": nxt.get("forecast_prices", [last_close])[-1] if nxt.get("forecast_prices") else last_close,
-        }
+        } if nxt else "Unavailable"
     except Exception as exc:
         logger.debug("Provider enrichment in tool_get_asset_intelligence: %s", exc)
 
@@ -242,24 +242,25 @@ def tool_get_asset_intelligence(ticker: str) -> str:
 
 
 def tool_get_finnhub_fundamentals(ticker: str) -> str:
-    """Fetch Finnhub company profile and valuation multiples (P/E, P/B, EV/EBITDA, Beta, Market Cap).
+    """Fetch real company profile and valuation multiples (P/E, P/B, EV/EBITDA, Beta, Market Cap).
 
     Args:
         ticker: Underlying ticker symbol (e.g. 'NVDA', 'QQQ', 'AAPL').
 
     Returns:
-        JSON string of Finnhub fundamental metrics.
+        JSON string of fundamental metrics or unavailable status.
     """
     try:
-        from trading_system.data.trading212_client import MarketDataProvider
         data = MarketDataProvider.get_company_fundamentals(ticker)
-        return json.dumps(data)
+        if data:
+            return json.dumps(data)
+        return json.dumps({"ticker": ticker, "status": "unavailable", "detail": "Fundamentals unavailable."})
     except Exception as exc:
-        return json.dumps({"ticker": ticker, "error": str(exc), "pe_ratio": 24.5, "is_simulated": True})
+        return json.dumps({"ticker": ticker, "status": "unavailable", "error": str(exc)})
 
 
 def tool_get_company_news(ticker: str, days: int = 7) -> str:
-    """Fetch recent Finnhub company-specific news articles and sentiment ratings.
+    """Fetch real company-specific news articles and sentiment ratings.
 
     Args:
         ticker: Underlying ticker symbol (e.g. 'NVDA', 'TSLA').
@@ -269,7 +270,6 @@ def tool_get_company_news(ticker: str, days: int = 7) -> str:
         JSON string containing recent headlines, summaries, sources, and sentiment.
     """
     try:
-        from trading_system.data.trading212_client import MarketDataProvider
         articles = MarketDataProvider.get_company_news(ticker, days=days, limit=5)
         return json.dumps({"ticker": ticker, "articles": articles, "count": len(articles)})
     except Exception as exc:
@@ -277,31 +277,25 @@ def tool_get_company_news(ticker: str, days: int = 7) -> str:
 
 
 def tool_get_olostep_sentiment(ticker: str) -> str:
-    """Execute Olostep web & analyst sentiment search for a candidate asset.
+    """Execute real web & analyst sentiment search for a candidate asset.
 
     Args:
         ticker: Underlying ticker symbol (e.g. 'NVDA', 'AAPL').
 
     Returns:
-        JSON string with sentiment_label ('BULLISH'/'BEARISH'/'NEUTRAL'), sentiment_score, summary, and catalysts.
+        JSON string with sentiment_label, sentiment_score, summary, and catalysts.
     """
     try:
-        from trading_system.data.trading212_client import MarketDataProvider
         data = MarketDataProvider.get_sentiment_search(ticker)
-        return json.dumps(data)
+        if data:
+            return json.dumps(data)
+        return json.dumps({"symbol": ticker, "status": "unavailable", "detail": "Live web sentiment unavailable."})
     except Exception as exc:
-        return json.dumps({
-            "symbol": ticker,
-            "sentiment_label": "NEUTRAL",
-            "sentiment_score": 0.50,
-            "summary": "Neutral sentiment baseline",
-            "is_simulated": True,
-            "error": str(exc),
-        })
+        return json.dumps({"symbol": ticker, "status": "unavailable", "error": str(exc)})
 
 
 def tool_get_nixtla_forecast(ticker: str) -> str:
-    """Retrieve Nixtla TimeGPT 5-day price trajectory forecast and directional bias.
+    """Retrieve 5-day price trajectory forecast and directional bias on real candles.
 
     Args:
         ticker: Underlying ticker symbol (e.g. 'NVDA', 'QQQ').
@@ -310,19 +304,12 @@ def tool_get_nixtla_forecast(ticker: str) -> str:
         JSON string with 5-day forecasted prices, expected return percentage, and directional bias.
     """
     try:
-        from trading_system.data.trading212_client import MarketDataProvider
         data = MarketDataProvider.get_5day_forecast(ticker)
-        return json.dumps(data)
+        if data:
+            return json.dumps(data)
+        return json.dumps({"symbol": ticker, "status": "unavailable", "detail": "5-day forecast unavailable."})
     except Exception as exc:
-        return json.dumps({
-            "symbol": ticker,
-            "horizon_days": 5,
-            "directional_bias": "NEUTRAL",
-            "expected_return_pct": 0.0,
-            "forecast_prices": [],
-            "is_forecast_simulated": True,
-            "error": str(exc),
-        })
+        return json.dumps({"symbol": ticker, "status": "unavailable", "error": str(exc)})
 
 
 def tool_get_portfolio_status() -> str:

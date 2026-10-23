@@ -71,11 +71,14 @@ class FundamentalAnalyst:
         except Exception as exc:
             logger.debug("Failed to retrieve provider data in FundamentalAnalyst: %s", exc)
 
+        has_fundamentals = bool(finnhub_data)
+        has_sentiment = bool(olostep_data)
+
         finnhub_data = finnhub_data or {}
         finnhub_news = finnhub_news or []
         olostep_data = olostep_data or {}
 
-        # 1. Valuation rating from Finnhub multiples
+        # 1. Valuation rating from real multiples
         pe = finnhub_data.get("pe_ratio")
         ev = finnhub_data.get("ev_to_ebitda")
         if (pe is not None and pe < 18.0) or (ev is not None and ev < 10.0):
@@ -85,24 +88,28 @@ class FundamentalAnalyst:
         else:
             valuation_rating = "fair"
 
-        # 2. Catalyst assessment from Olostep sentiment search & Finnhub news
-        olostep_label = olostep_data.get("sentiment_label", "NEUTRAL").upper()
-        olostep_score = float(olostep_data.get("sentiment_score", 0.50) or 0.50)
+        # 2. Catalyst assessment from real sentiment search & news
+        if has_sentiment:
+            olostep_label = olostep_data.get("sentiment_label", "NEUTRAL").upper()
+            olostep_score = float(olostep_data.get("sentiment_score", 0.50) or 0.50)
+            pos_news = sum(1 for n in finnhub_news if n.get("sentiment") == "positive")
+            neg_news = sum(1 for n in finnhub_news if n.get("sentiment") == "negative")
 
-        pos_news = sum(1 for n in finnhub_news if n.get("sentiment") == "positive")
-        neg_news = sum(1 for n in finnhub_news if n.get("sentiment") == "negative")
-
-        if olostep_label == "BULLISH" or (olostep_score >= 0.58 and pos_news >= neg_news):
-            catalyst_assessment = "positive"
-        elif olostep_label == "BEARISH" or (olostep_score <= 0.42 and neg_news >= pos_news):
-            catalyst_assessment = "negative"
+            if olostep_label == "BULLISH" or (olostep_score >= 0.58 and pos_news >= neg_news):
+                catalyst_assessment = "positive"
+            elif olostep_label == "BEARISH" or (olostep_score <= 0.42 and neg_news >= pos_news):
+                catalyst_assessment = "negative"
+            else:
+                catalyst_assessment = "neutral"
         else:
+            olostep_label = "NEUTRAL"
+            olostep_score = 0.50
             catalyst_assessment = "neutral"
 
         # 3. Macro environment
-        if olostep_score >= 0.55 and finnhub_data.get("beta", 1.0) < 1.4:
+        if has_sentiment and olostep_score >= 0.55 and finnhub_data.get("beta", 1.0) < 1.4:
             macro_environment = "favorable"
-        elif olostep_score <= 0.42:
+        elif has_sentiment and olostep_score <= 0.42:
             macro_environment = "headwind"
         else:
             macro_environment = "neutral"
@@ -127,23 +134,26 @@ class FundamentalAnalyst:
             earnings_drift = "no_drift"
 
         # 5. Synthesis Summary & Confidence
-        val_summary = finnhub_data.get("valuation_summary", f"P/E: {pe or 'N/A'}")
+        val_source = finnhub_data.get("source", "Market Data") if has_fundamentals else "None"
+        val_summary = finnhub_data.get("valuation_summary", f"P/E: {pe or 'N/A'}") if has_fundamentals else "Data unavailable"
         catalysts_list = olostep_data.get("key_catalysts", [])
         cat_snippet = f" Key Catalysts: {'; '.join(catalysts_list[:2])}." if catalysts_list else ""
         news_count = len(finnhub_news)
-        news_snippet = f" {news_count} recent Finnhub articles analyzed." if news_count > 0 else ""
+        news_snippet = f" {news_count} live news articles analyzed." if news_count > 0 else ""
 
-        summary = (
-            f"Finnhub Valuation: {valuation_rating.title()} ({val_summary}). "
-            f"Olostep Sentiment: {olostep_label} (Score: {olostep_score:.2f})."
-            f"{cat_snippet}{news_snippet}"
-        )
-
-        confidence = 0.70
-        if not finnhub_data.get("is_simulated", True):
-            confidence += 0.08
-        if not olostep_data.get("is_simulated", True):
-            confidence += 0.08
+        if has_fundamentals or has_sentiment:
+            summary = (
+                f"Valuation [{val_source}]: {valuation_rating.title()} ({val_summary}). "
+                f"Web Sentiment: {olostep_label} (Score: {olostep_score:.2f})."
+                f"{cat_snippet}{news_snippet}"
+            )
+            confidence = 0.70 + (0.05 if has_fundamentals else 0.0) + (0.05 if has_sentiment else 0.0)
+        else:
+            summary = (
+                f"Fundamental and live sentiment data unavailable for {ticker}. "
+                "Defaulted to conservative neutral assessments for valuation, catalyst, and macro."
+            )
+            confidence = 0.50
 
         return FundamentalAnalysis(
             ticker=ticker,

@@ -104,19 +104,22 @@ class TechnicalAnalyst:
                 logger.debug("Failed to retrieve Nixtla forecast in TechnicalAnalyst: %s", exc)
         nixtla_data = nixtla_data or {}
 
-        forecast_prices = nixtla_data.get("forecast_prices") or []
-        target_5d = forecast_prices[-1] if forecast_prices else metrics.get("close", 0.0)
-        nixtla_return = float(nixtla_data.get("expected_return_pct", 0.0) or 0.0)
-        nixtla_bias = nixtla_data.get("directional_bias", "NEUTRAL")
-
         key_levels = {
             'support': metrics.get('support', 0.0),
             'resistance': metrics.get('resistance', 0.0),
             'breakout_level': metrics.get('breakout_level', 0.0),
             'sma5_mr_target': metrics.get('sma5', 0.0),
-            'nixtla_5d_target': target_5d,
-            'nixtla_expected_return_pct': nixtla_return,
         }
+
+        has_forecast = bool(nixtla_data and nixtla_data.get("forecast_prices"))
+        if has_forecast:
+            forecast_prices = nixtla_data["forecast_prices"]
+            target_5d = forecast_prices[-1]
+            nixtla_return = float(nixtla_data.get("expected_return_pct", 0.0) or 0.0)
+            nixtla_bias = nixtla_data.get("directional_bias", "NEUTRAL")
+            source = nixtla_data.get("source", "5-Day Forecast")
+            key_levels['nixtla_5d_target'] = target_5d
+            key_levels['nixtla_expected_return_pct'] = nixtla_return
         
         is_mr = "3-RSI Mean Reversion" in momentum
         base_summary = (
@@ -126,12 +129,15 @@ class TechnicalAnalyst:
             f"Trend Momentum: {trend} trend structure with {momentum} momentum. RSI14={rsi14:.1f}, ADX={metrics.get('adx', 0.0):.1f}."
         )
 
-        nixtla_summary = f" Nixtla 5-Day Forecast: {nixtla_bias} ({nixtla_return:+.2f}%, 5d target ${target_5d:.2f})."
-        summary_text = base_summary + nixtla_summary
+        if has_forecast:
+            forecast_summary = f" 5-Day Forecast [{source}]: {nixtla_bias} ({nixtla_return:+.2f}%, 5d target ${target_5d:.2f})."
+            summary_text = base_summary + forecast_summary
+        else:
+            summary_text = base_summary
 
         conf = 0.88 if is_mr else 0.70
-        # Boost confidence when Nixtla 5-day bias aligns with trend
-        if (trend == "bullish" and nixtla_bias == "BULLISH") or (trend == "bearish" and nixtla_bias == "BEARISH"):
+        # Boost confidence when 5-day predictive bias aligns with trend
+        if has_forecast and ((trend == "bullish" and nixtla_bias == "BULLISH") or (trend == "bearish" and nixtla_bias == "BEARISH")):
             conf = min(0.95, conf + 0.05)
 
         return TechnicalAnalysis(

@@ -1,4 +1,4 @@
-"""Unit tests for Finnhub, Olostep, and Nixtla data providers and their system integration."""
+"""Unit tests for Finnhub, Olostep, and Nixtla data providers with keyless real data & no mocks."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from trading_system.agents.antigravity_agent import (
 
 
 class TestFinnhubProvider(unittest.TestCase):
-    """Test Finnhub fundamentals, news, symbol normalization, and fallback mechanisms."""
+    """Test Finnhub fundamentals, news, symbol normalization, and keyless real data mechanisms."""
 
     def test_symbol_normalization(self):
         self.assertEqual(normalize_finnhub_symbol("QQQ3l_EQ"), "QQQ")
@@ -33,14 +33,31 @@ class TestFinnhubProvider(unittest.TestCase):
         self.assertEqual(normalize_finnhub_symbol("MSFT"), "MSFT")
         self.assertEqual(normalize_finnhub_symbol("3USLl_EQ"), "USL")
 
-    def test_fundamentals_fallback_when_unconfigured(self):
+    def test_no_mock_data_when_unconfigured_and_offline(self):
         provider = FinnhubProvider(api_key="")
-        data = provider.get_company_fundamentals("AAPL")
-        self.assertEqual(data["symbol"], "AAPL")
-        self.assertTrue(data["is_simulated"])
-        self.assertIn("pe_ratio", data)
-        self.assertIn("beta", data)
-        self.assertGreater(data["market_cap"], 0)
+        # When offline or symbol unknown, strictly returns None rather than fake mock numbers
+        with patch.object(provider, "_get_keyless_fundamentals", return_value=None):
+            data = provider.get_company_fundamentals("UNKNOWN_XYZ", force_refresh=True)
+            self.assertIsNone(data)
+
+    def test_keyless_fundamentals_via_yfinance(self):
+        provider = FinnhubProvider(api_key="")
+        # When keyless yfinance succeeds, returns real data
+        mock_info = {
+            "symbol": "AAPL",
+            "name": "Apple Inc",
+            "pe_ratio": 33.2,
+            "pb_ratio": 42.1,
+            "market_cap": 3200000.0,
+            "beta": 1.05,
+            "source": "Yahoo Finance (keyless)",
+        }
+        with patch.object(provider, "_get_keyless_fundamentals", return_value=mock_info):
+            data = provider.get_company_fundamentals("AAPL", force_refresh=True)
+            self.assertIsNotNone(data)
+            self.assertEqual(data["symbol"], "AAPL")
+            self.assertEqual(data["source"], "Yahoo Finance (keyless)")
+            self.assertEqual(data["pe_ratio"], 33.2)
 
     @patch.object(FinnhubProvider, "_http_get")
     def test_fundamentals_with_mocked_api(self, mock_http):
@@ -71,12 +88,12 @@ class TestFinnhubProvider(unittest.TestCase):
         provider = FinnhubProvider(api_key="mock_finnhub_key")
         data = provider.get_company_fundamentals("AAPL", force_refresh=True)
 
+        self.assertIsNotNone(data)
         self.assertEqual(data["symbol"], "AAPL")
         self.assertEqual(data["name"], "Apple Inc")
         self.assertEqual(data["pe_ratio"], 28.5)
         self.assertEqual(data["beta"], 1.15)
-        self.assertFalse(data["is_simulated"])
-        self.assertIn("P/E: 28.5", data["valuation_summary"])
+        self.assertEqual(data["source"], "Finnhub API")
 
     @patch.object(FinnhubProvider, "_http_get")
     def test_company_news_with_mocked_api(self, mock_http):
@@ -117,15 +134,18 @@ class TestFinnhubProvider(unittest.TestCase):
             "beta": 1.75,
             "industry": "Semiconductors",
             "valuation_summary": "P/E: 45.0, Beta: 1.75",
-            "is_simulated": False,
+            "source": "Finnhub API",
         }
         report = provider.format_fundamentals_report(fund_data)
         self.assertIn("NVDA", report)
         self.assertIn("P/E=45.0", report)
 
+        none_report = provider.format_fundamentals_report(None)
+        self.assertIn("unavailable", none_report)
+
 
 class TestOlostepProvider(unittest.TestCase):
-    """Test Olostep AI sentiment search, lexical scoring, and fallback mechanisms."""
+    """Test Olostep AI sentiment search, lexical scoring, and keyless real web search."""
 
     def test_sentiment_scoring_lexicon(self):
         provider = OlostepProvider(api_key="")
@@ -142,13 +162,28 @@ class TestOlostepProvider(unittest.TestCase):
         self.assertEqual(b_label, "BEARISH")
         self.assertLess(b_score, 0.42)
 
-    def test_sentiment_fallback_when_unconfigured(self):
+    def test_no_mock_sentiment_when_offline(self):
         provider = OlostepProvider(api_key="")
-        data = provider.get_sentiment_search("TSLA")
-        self.assertEqual(data["symbol"], "TSLA")
-        self.assertEqual(data["sentiment_label"], "NEUTRAL")
-        self.assertEqual(data["sentiment_score"], 0.50)
-        self.assertTrue(data["is_simulated"])
+        with patch.object(provider, "_get_keyless_web_sentiment", return_value=None):
+            data = provider.get_sentiment_search("TSLA", force_refresh=True)
+            self.assertIsNone(data)
+
+    def test_keyless_web_sentiment(self):
+        provider = OlostepProvider(api_key="")
+        mock_web = {
+            "symbol": "TSLA",
+            "sentiment_label": "BULLISH",
+            "sentiment_score": 0.65,
+            "summary": "Live web & analyst news sentiment: BULLISH",
+            "key_catalysts": ["Strong delivery growth"],
+            "sources": [{"title": "Reuters", "url": "https://reuters.com"}],
+            "source": "Live Web Search (keyless)",
+        }
+        with patch.object(provider, "_get_keyless_web_sentiment", return_value=mock_web):
+            data = provider.get_sentiment_search("TSLA", force_refresh=True)
+            self.assertIsNotNone(data)
+            self.assertEqual(data["symbol"], "TSLA")
+            self.assertEqual(data["sentiment_label"], "BULLISH")
 
     @patch.object(OlostepProvider, "_call_olostep_api")
     def test_sentiment_with_mocked_api(self, mock_call):
@@ -166,34 +201,43 @@ class TestOlostepProvider(unittest.TestCase):
         provider = OlostepProvider(api_key="mock_olostep_key")
         result = provider.get_sentiment_search("NVDA", force_refresh=True)
 
+        self.assertIsNotNone(result)
         self.assertEqual(result["symbol"], "NVDA")
         self.assertEqual(result["sentiment_label"], "BULLISH")
         self.assertGreaterEqual(result["sentiment_score"], 0.58)
-        self.assertFalse(result["is_simulated"])
-        self.assertTrue(len(result["sources"]) > 0)
+        self.assertEqual(result["source"], "Olostep Search API")
 
 
 class TestNixtlaProvider(unittest.TestCase):
-    """Test Nixtla TimeGPT 5-day forecast, statistical baseline, and directional bias."""
+    """Test Nixtla TimeGPT 5-day forecast and keyless candle quantitative model."""
 
-    def test_statistical_baseline_generation(self):
+    def test_quantitative_candle_forecast(self):
         provider = NixtlaProvider(api_key="")
         # Upward trending closes
         closes = [100.0 + i * 1.5 for i in range(20)]
-        forecast = provider._generate_statistical_baseline(130.0, closes)
+        forecast = provider._compute_quantitative_candle_forecast(130.0, closes)
+        self.assertIsNotNone(forecast)
         self.assertEqual(len(forecast), 5)
-        # Verify monotonically increasing
-        self.assertGreater(forecast[-1], forecast[0])
+        # Verify upward trajectory
+        self.assertGreater(forecast[-1], 130.0)
 
-    def test_forecast_fallback_when_unconfigured(self):
+    def test_no_mock_forecast_when_no_candles(self):
         provider = NixtlaProvider(api_key="")
-        data = provider.get_5day_forecast("MSFT")
+        with patch("trading_system.data.trading212_client.MarketDataProvider.get_daily_candles", return_value=None):
+            data = provider.get_5day_forecast("UNKNOWN_NO_CANDLES", candles=[], force_refresh=True)
+            self.assertIsNone(data)
+
+    def test_keyless_candle_forecast_generation(self):
+        provider = NixtlaProvider(api_key="")
+        candles = [{"close": 100.0 + i * 2.0, "date": f"2026-01-{i+1:02d}"} for i in range(20)]
+        data = provider.get_5day_forecast("MSFT", candles=candles, force_refresh=True)
+        self.assertIsNotNone(data)
         self.assertEqual(data["symbol"], "MSFT")
         self.assertEqual(data["horizon_days"], 5)
         self.assertEqual(len(data["forecast_prices"]), 5)
-        self.assertIn("expected_return_pct", data)
-        self.assertIn(data["directional_bias"], ["BULLISH", "BEARISH", "NEUTRAL"])
-        self.assertTrue(data["is_forecast_simulated"])
+        self.assertEqual(data["source"], "Quantitative Candle Model (yfinance)")
+        self.assertGreater(data["expected_return_pct"], 0.0)
+        self.assertEqual(data["directional_bias"], "BULLISH")
 
     @patch.object(NixtlaProvider, "_call_nixtla_api")
     def test_forecast_with_mocked_api(self, mock_call):
@@ -203,9 +247,10 @@ class TestNixtlaProvider(unittest.TestCase):
         candles = [{"close": 100.0 + i, "date": f"2026-01-{i+1:02d}"} for i in range(25)]
         data = provider.get_5day_forecast("QQQ", candles=candles, force_refresh=True)
 
+        self.assertIsNotNone(data)
         self.assertEqual(data["symbol"], "QQQ")
         self.assertEqual(data["forecast_prices"], [125.5, 127.0, 128.5, 130.0, 132.0])
-        self.assertFalse(data["is_forecast_simulated"])
+        self.assertEqual(data["source"], "Nixtla TimeGPT API")
         self.assertGreater(data["expected_return_pct"], 0.0)
         self.assertEqual(data["directional_bias"], "BULLISH")
 
@@ -216,20 +261,25 @@ class TestMarketDataProviderIntegration(unittest.TestCase):
     def test_market_data_provider_unified_accessors(self):
         MarketDataProvider.clear_candle_cache()
 
+        # Should not crash even when offline (strictly returns None or data)
         fund = MarketDataProvider.get_company_fundamentals("AAPL")
-        self.assertIn("symbol", fund)
-        self.assertEqual(fund["symbol"], "AAPL")
+        if fund is not None:
+            self.assertEqual(fund["symbol"], "AAPL")
 
         news = MarketDataProvider.get_company_news("AAPL", days=5)
         self.assertIsInstance(news, list)
 
         sentiment = MarketDataProvider.get_sentiment_search("AAPL")
-        self.assertIn("sentiment_score", sentiment)
+        if sentiment is not None:
+            self.assertIn("sentiment_score", sentiment)
 
-        forecast = MarketDataProvider.get_5day_forecast("AAPL")
+        # Forecast with candles
+        candles = [{"close": 150.0 + i, "date": f"2026-01-{i+1:02d}"} for i in range(15)]
+        forecast = MarketDataProvider.get_5day_forecast("AAPL", candles=candles)
+        self.assertIsNotNone(forecast)
         self.assertEqual(forecast["horizon_days"], 5)
 
-        # Test cache clearing does not crash
+        # Cache clearing
         MarketDataProvider.clear_candle_cache()
 
 
@@ -245,7 +295,7 @@ class TestAgentIntegration(unittest.TestCase):
                 "ev_to_ebitda": 9.5,
                 "beta": 1.10,
                 "valuation_summary": "P/E: 16.5, EV/EBITDA: 9.5",
-                "is_simulated": False,
+                "source": "Yahoo Finance (keyless)",
             },
             "finnhub_news": [
                 {"headline": "Strong quarterly performance", "sentiment": "positive"},
@@ -254,15 +304,15 @@ class TestAgentIntegration(unittest.TestCase):
                 "sentiment_label": "BULLISH",
                 "sentiment_score": 0.75,
                 "key_catalysts": ["Accelerating growth"],
-                "is_simulated": False,
+                "source": "Live Web Search (keyless)",
             },
         }
         res = analyst.analyze("AAPL", metrics)
         self.assertEqual(res.valuation_rating, "undervalued")
         self.assertEqual(res.catalyst_assessment, "positive")
         self.assertEqual(res.macro_environment, "favorable")
-        self.assertIn("Finnhub Valuation", res.summary)
-        self.assertIn("Olostep Sentiment", res.summary)
+        self.assertIn("Valuation [Yahoo Finance (keyless)]", res.summary)
+        self.assertIn("Web Sentiment", res.summary)
 
     def test_technical_analyst_integration(self):
         analyst = TechnicalAnalyst(openai_api_key="")
@@ -277,13 +327,14 @@ class TestAgentIntegration(unittest.TestCase):
                 "forecast_prices": [202.0, 204.0, 206.0, 208.0, 210.0],
                 "expected_return_pct": 5.0,
                 "directional_bias": "BULLISH",
+                "source": "Quantitative Candle Model (yfinance)",
             },
         }
         res = analyst.analyze("NVDA", metrics)
         self.assertEqual(res.trend_structure, "bullish")
         self.assertEqual(res.key_levels["nixtla_5d_target"], 210.0)
         self.assertEqual(res.key_levels["nixtla_expected_return_pct"], 5.0)
-        self.assertIn("Nixtla 5-Day Forecast", res.summary)
+        self.assertIn("5-Day Forecast", res.summary)
 
     def test_debate_engine_integration(self):
         engine = DebateEngine(openai_api_key="", speculative_routing=False)
@@ -314,27 +365,22 @@ class TestAgentIntegration(unittest.TestCase):
         self.assertIn("Nixtla TimeGPT 5-day forecast is BULLISH", evidence_text)
 
     def test_antigravity_agent_tools(self):
-        # 1. Finnhub tool
         fh_json = tool_get_finnhub_fundamentals("NVDA")
         fh_data = json.loads(fh_json)
-        self.assertIn("symbol", fh_data)
+        self.assertIn(fh_data.get("status"), [None, "unavailable"])
 
-        # 2. Company news tool
         news_json = tool_get_company_news("NVDA", days=3)
         news_data = json.loads(news_json)
         self.assertIn("articles", news_data)
 
-        # 3. Olostep sentiment tool
         olo_json = tool_get_olostep_sentiment("NVDA")
         olo_data = json.loads(olo_json)
-        self.assertIn("sentiment_score", olo_data)
+        self.assertIn(olo_data.get("status"), [None, "unavailable"])
 
-        # 4. Nixtla forecast tool
         nxt_json = tool_get_nixtla_forecast("NVDA")
         nxt_data = json.loads(nxt_json)
-        self.assertIn("expected_return_pct", nxt_data)
+        self.assertIn(nxt_data.get("status"), [None, "unavailable"])
 
-        # 5. Asset intelligence tool returns provider fields
         intel_json = tool_get_asset_intelligence("NVDA")
         intel_data = json.loads(intel_json)
         self.assertIn("finnhub_valuation", intel_data)
