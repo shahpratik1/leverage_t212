@@ -411,6 +411,19 @@ class Orchestrator:
             instrument = self.t212.get_instrument_by_symbol(underlying)
             t212_ticker = instrument.ticker if instrument else f"{underlying}_US_EQ"
 
+        # ── 1b. Ingest Finnhub, Olostep, and Nixtla Provider Data ──
+        try:
+            if "finnhub_fundamentals" not in metrics:
+                metrics["finnhub_fundamentals"] = MarketDataProvider.get_company_fundamentals(underlying)
+            if "finnhub_news" not in metrics:
+                metrics["finnhub_news"] = MarketDataProvider.get_company_news(underlying, days=7)
+            if "olostep_sentiment" not in metrics:
+                metrics["olostep_sentiment"] = MarketDataProvider.get_sentiment_search(underlying)
+            if "nixtla_forecast" not in metrics:
+                metrics["nixtla_forecast"] = MarketDataProvider.get_5day_forecast(underlying)
+        except Exception as exc:
+            logger.debug("Provider enrichment for %s in deep_analyse: %s", underlying, exc)
+
         # ── 2 & 3. Concurrent Technical & Fundamental Subagent Analysis ──
         tech_report = ""
         fund_report = ""

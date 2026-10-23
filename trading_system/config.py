@@ -104,6 +104,15 @@ class Settings:
     # Market Data API keys
     POLYGON_API_KEY: str = ""
     FINNHUB_API_KEY: str = ""
+    OLOSTEP_API_KEY: str = ""
+    NIXTLA_API_KEY: str = ""
+
+    # External Data Provider Flags
+    ENABLE_FINNHUB_FUNDAMENTALS: bool = True
+    ENABLE_FINNHUB_NEWS: bool = True
+    ENABLE_OLOSTEP_SENTIMENT: bool = True
+    ENABLE_NIXTLA_FORECAST: bool = True
+    NIXTLA_FORECAST_HORIZON: int = 5
 
     # Risk parameters
     MAX_RISK_PER_TRADE: float = 0.005  # 0.5% of equity
@@ -203,6 +212,12 @@ class Settings:
 
         if not self.FINNHUB_API_KEY:
             self.FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+
+        if not self.OLOSTEP_API_KEY:
+            self.OLOSTEP_API_KEY = os.environ.get("OLOSTEP_API_KEY", "")
+
+        if not self.NIXTLA_API_KEY:
+            self.NIXTLA_API_KEY = os.environ.get("NIXTLA_API_KEY", "")
 
         # Optional environment overrides for URLs, models, and flags
         env_use_live = os.environ.get("USE_LIVE")

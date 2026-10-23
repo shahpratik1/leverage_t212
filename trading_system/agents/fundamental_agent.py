@@ -45,30 +45,114 @@ class FundamentalAnalyst:
 
     def _fallback_analysis(self, ticker: str, metrics: Dict[str, Any]) -> FundamentalAnalysis:
         """
-        Return conservative default analysis when fundamental data or LLM is unavailable.
+        Evaluate fundamental valuation, Finnhub news, and Olostep sentiment.
 
         Args:
             ticker: Stock ticker symbol.
             metrics: Dictionary of financial and technical metrics.
 
         Returns:
-            FundamentalAnalysis with neutral/conservative defaults.
+            FundamentalAnalysis with quantitative and sentiment assessments.
         """
-        logger.info(f"Using conservative fallback fundamental analysis for {ticker}")
+        logger.info(f"Synthesizing Finnhub fundamentals & news with Olostep sentiment for {ticker}")
+
+        finnhub_data = metrics.get("finnhub_fundamentals")
+        finnhub_news = metrics.get("finnhub_news")
+        olostep_data = metrics.get("olostep_sentiment")
+
+        try:
+            from trading_system.data.trading212_client import MarketDataProvider
+            if finnhub_data is None:
+                finnhub_data = MarketDataProvider.get_company_fundamentals(ticker)
+            if finnhub_news is None:
+                finnhub_news = MarketDataProvider.get_company_news(ticker, days=7)
+            if olostep_data is None:
+                olostep_data = MarketDataProvider.get_sentiment_search(ticker)
+        except Exception as exc:
+            logger.debug("Failed to retrieve provider data in FundamentalAnalyst: %s", exc)
+
+        finnhub_data = finnhub_data or {}
+        finnhub_news = finnhub_news or []
+        olostep_data = olostep_data or {}
+
+        # 1. Valuation rating from Finnhub multiples
+        pe = finnhub_data.get("pe_ratio")
+        ev = finnhub_data.get("ev_to_ebitda")
+        if (pe is not None and pe < 18.0) or (ev is not None and ev < 10.0):
+            valuation_rating = "undervalued"
+        elif (pe is not None and pe > 38.0) or (ev is not None and ev > 25.0):
+            valuation_rating = "overvalued"
+        else:
+            valuation_rating = "fair"
+
+        # 2. Catalyst assessment from Olostep sentiment search & Finnhub news
+        olostep_label = olostep_data.get("sentiment_label", "NEUTRAL").upper()
+        olostep_score = float(olostep_data.get("sentiment_score", 0.50) or 0.50)
+
+        pos_news = sum(1 for n in finnhub_news if n.get("sentiment") == "positive")
+        neg_news = sum(1 for n in finnhub_news if n.get("sentiment") == "negative")
+
+        if olostep_label == "BULLISH" or (olostep_score >= 0.58 and pos_news >= neg_news):
+            catalyst_assessment = "positive"
+        elif olostep_label == "BEARISH" or (olostep_score <= 0.42 and neg_news >= pos_news):
+            catalyst_assessment = "negative"
+        else:
+            catalyst_assessment = "neutral"
+
+        # 3. Macro environment
+        if olostep_score >= 0.55 and finnhub_data.get("beta", 1.0) < 1.4:
+            macro_environment = "favorable"
+        elif olostep_score <= 0.42:
+            macro_environment = "headwind"
+        else:
+            macro_environment = "neutral"
+
+        # 4. Earnings drift
+        earnings_raw = metrics.get("earnings_in_days")
+        earnings_days: Optional[float] = None
+        if earnings_raw is not None:
+            try:
+                earnings_days = float(earnings_raw)
+            except (ValueError, TypeError):
+                earnings_days = None
+
+        if earnings_days is not None and 3.0 <= earnings_days <= 21.0:
+            if catalyst_assessment == "positive":
+                earnings_drift = "positive_drift"
+            elif catalyst_assessment == "negative":
+                earnings_drift = "negative_drift"
+            else:
+                earnings_drift = "no_drift"
+        else:
+            earnings_drift = "no_drift"
+
+        # 5. Synthesis Summary & Confidence
+        val_summary = finnhub_data.get("valuation_summary", f"P/E: {pe or 'N/A'}")
+        catalysts_list = olostep_data.get("key_catalysts", [])
+        cat_snippet = f" Key Catalysts: {'; '.join(catalysts_list[:2])}." if catalysts_list else ""
+        news_count = len(finnhub_news)
+        news_snippet = f" {news_count} recent Finnhub articles analyzed." if news_count > 0 else ""
 
         summary = (
-            f"Fundamental data was not available for deep analysis of {ticker}. "
-            "Defaulted to conservative neutral assessments for valuation, catalyst, macro, and earnings drift."
+            f"Finnhub Valuation: {valuation_rating.title()} ({val_summary}). "
+            f"Olostep Sentiment: {olostep_label} (Score: {olostep_score:.2f})."
+            f"{cat_snippet}{news_snippet}"
         )
+
+        confidence = 0.70
+        if not finnhub_data.get("is_simulated", True):
+            confidence += 0.08
+        if not olostep_data.get("is_simulated", True):
+            confidence += 0.08
 
         return FundamentalAnalysis(
             ticker=ticker,
-            valuation_rating='fair',
-            catalyst_assessment='neutral',
-            macro_environment='neutral',
-            earnings_drift='no_drift',
+            valuation_rating=valuation_rating,
+            catalyst_assessment=catalyst_assessment,
+            macro_environment=macro_environment,
+            earnings_drift=earnings_drift,
             summary=summary,
-            confidence=0.5,
+            confidence=round(confidence, 2),
             raw_analysis=None,
         )
 

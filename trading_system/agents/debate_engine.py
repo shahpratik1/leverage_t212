@@ -352,6 +352,35 @@ class DebateEngine:
 
         if high_20d > 0 and close >= high_20d * 0.98:
             bull_evidence.append("Price is testing 20-day high, potential breakout.")
+
+        # Ingest Finnhub, Olostep, and Nixtla evidence
+        finnhub_data = metrics.get("finnhub_fundamentals")
+        olostep_data = metrics.get("olostep_sentiment")
+        nixtla_data = metrics.get("nixtla_forecast")
+
+        if olostep_data:
+            ol_label = olostep_data.get("sentiment_label", "NEUTRAL")
+            ol_score = olostep_data.get("sentiment_score", 0.50)
+            if ol_label == "BULLISH":
+                bull_evidence.append(f"Olostep sentiment search is BULLISH (Score: {ol_score:.2f}) with positive analyst catalyst coverage.")
+            elif ol_label == "BEARISH":
+                bear_evidence.append(f"Olostep sentiment search is BEARISH (Score: {ol_score:.2f}) with negative news flow.")
+
+        if nixtla_data:
+            nx_bias = nixtla_data.get("directional_bias", "NEUTRAL")
+            nx_ret = nixtla_data.get("expected_return_pct", 0.0)
+            target_p = nixtla_data.get("forecast_prices", [close])[-1] if nixtla_data.get("forecast_prices") else close
+            if nx_bias == "BULLISH":
+                bull_evidence.append(f"Nixtla TimeGPT 5-day forecast is BULLISH ({nx_ret:+.2f}% expected return, 5d target ${target_p:.2f}).")
+            elif nx_bias == "BEARISH":
+                bear_evidence.append(f"Nixtla TimeGPT 5-day forecast is BEARISH ({nx_ret:+.2f}% expected downside, 5d target ${target_p:.2f}).")
+
+        if finnhub_data:
+            pe = finnhub_data.get("pe_ratio")
+            if pe and pe < 20.0:
+                bull_evidence.append(f"Finnhub valuation multiples show attractive P/E of {pe:.1f}.")
+            elif pe and pe > 40.0:
+                bear_risks.append(f"Elevated Finnhub P/E of {pe:.1f} creates multiple compression risk.")
             
         bull_signals_count = len(bull_evidence)
         bear_signals_count = len(bear_evidence)

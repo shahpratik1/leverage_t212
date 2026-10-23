@@ -1221,12 +1221,66 @@ class MarketDataProvider:
     SYNTHETIC_TICKERS: set = set()
     _CANDLE_CACHE: Dict[str, Tuple[float, Any]] = {}
     _EARNINGS_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
+    _FINNHUB_PROVIDER: Optional[Any] = None
+    _OLOSTEP_PROVIDER: Optional[Any] = None
+    _NIXTLA_PROVIDER: Optional[Any] = None
+
+    @classmethod
+    def get_finnhub_provider(cls) -> Any:
+        """Get or initialize the shared FinnhubProvider instance."""
+        if cls._FINNHUB_PROVIDER is None:
+            from trading_system.data.finnhub_provider import FinnhubProvider
+            cls._FINNHUB_PROVIDER = FinnhubProvider()
+        return cls._FINNHUB_PROVIDER
+
+    @classmethod
+    def get_olostep_provider(cls) -> Any:
+        """Get or initialize the shared OlostepProvider instance."""
+        if cls._OLOSTEP_PROVIDER is None:
+            from trading_system.data.olostep_provider import OlostepProvider
+            cls._OLOSTEP_PROVIDER = OlostepProvider()
+        return cls._OLOSTEP_PROVIDER
+
+    @classmethod
+    def get_nixtla_provider(cls) -> Any:
+        """Get or initialize the shared NixtlaProvider instance."""
+        if cls._NIXTLA_PROVIDER is None:
+            from trading_system.data.nixtla_provider import NixtlaProvider
+            cls._NIXTLA_PROVIDER = NixtlaProvider()
+        return cls._NIXTLA_PROVIDER
+
+    @classmethod
+    def get_company_fundamentals(cls, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Fetch company fundamentals (multiples, beta, market cap) from Finnhub."""
+        return cls.get_finnhub_provider().get_company_fundamentals(symbol, force_refresh=force_refresh)
+
+    @classmethod
+    def get_company_news(cls, symbol: str, days: int = 7, limit: int = 5, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Fetch recent company-specific news articles from Finnhub."""
+        return cls.get_finnhub_provider().get_company_news(symbol, days=days, limit=limit, force_refresh=force_refresh)
+
+    @classmethod
+    def get_sentiment_search(cls, symbol: str, query_override: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
+        """Run Olostep web & analyst sentiment search for a candidate asset."""
+        return cls.get_olostep_provider().get_sentiment_search(symbol, query_override=query_override, force_refresh=force_refresh)
+
+    @classmethod
+    def get_5day_forecast(cls, symbol: str, candles: Optional[List[Dict[str, Any]]] = None, force_refresh: bool = False) -> Dict[str, Any]:
+        """Compute Nixtla 5-day price trajectory forecast and directional bias."""
+        return cls.get_nixtla_provider().get_5day_forecast(symbol, candles=candles, force_refresh=force_refresh)
 
     @classmethod
     def clear_candle_cache(cls) -> None:
         """Clear cached candles and earnings data in memory."""
         cls._CANDLE_CACHE.clear()
         cls._EARNINGS_CACHE.clear()
+        if cls._FINNHUB_PROVIDER is not None:
+            cls._FINNHUB_PROVIDER._fundamentals_cache.clear()
+            cls._FINNHUB_PROVIDER._news_cache.clear()
+        if cls._OLOSTEP_PROVIDER is not None:
+            cls._OLOSTEP_PROVIDER._cache.clear()
+        if cls._NIXTLA_PROVIDER is not None:
+            cls._NIXTLA_PROVIDER._cache.clear()
 
     @classmethod
     def get_days_to_earnings(cls, symbol: str) -> Optional[float]:

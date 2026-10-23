@@ -220,7 +220,109 @@ def tool_get_asset_intelligence(ticker: str) -> str:
             "short_5x": pair.short_5x_ticker if pair and pair.has_5x else None,
         } if pair else "Non-standard pair",
     }
+
+    try:
+        fh = MarketDataProvider.get_company_fundamentals(clean)
+        olo = MarketDataProvider.get_sentiment_search(clean)
+        nxt = MarketDataProvider.get_5day_forecast(clean)
+        summary["finnhub_valuation"] = fh.get("valuation_summary", "Normal valuation")
+        summary["olostep_sentiment"] = {
+            "label": olo.get("sentiment_label", "NEUTRAL"),
+            "score": olo.get("sentiment_score", 0.50),
+        }
+        summary["nixtla_5d_forecast"] = {
+            "bias": nxt.get("directional_bias", "NEUTRAL"),
+            "expected_return_pct": nxt.get("expected_return_pct", 0.0),
+            "target_5d": nxt.get("forecast_prices", [last_close])[-1] if nxt.get("forecast_prices") else last_close,
+        }
+    except Exception as exc:
+        logger.debug("Provider enrichment in tool_get_asset_intelligence: %s", exc)
+
     return json.dumps(summary)
+
+
+def tool_get_finnhub_fundamentals(ticker: str) -> str:
+    """Fetch Finnhub company profile and valuation multiples (P/E, P/B, EV/EBITDA, Beta, Market Cap).
+
+    Args:
+        ticker: Underlying ticker symbol (e.g. 'NVDA', 'QQQ', 'AAPL').
+
+    Returns:
+        JSON string of Finnhub fundamental metrics.
+    """
+    try:
+        from trading_system.data.trading212_client import MarketDataProvider
+        data = MarketDataProvider.get_company_fundamentals(ticker)
+        return json.dumps(data)
+    except Exception as exc:
+        return json.dumps({"ticker": ticker, "error": str(exc), "pe_ratio": 24.5, "is_simulated": True})
+
+
+def tool_get_company_news(ticker: str, days: int = 7) -> str:
+    """Fetch recent Finnhub company-specific news articles and sentiment ratings.
+
+    Args:
+        ticker: Underlying ticker symbol (e.g. 'NVDA', 'TSLA').
+        days: Lookback window in days (default: 7).
+
+    Returns:
+        JSON string containing recent headlines, summaries, sources, and sentiment.
+    """
+    try:
+        from trading_system.data.trading212_client import MarketDataProvider
+        articles = MarketDataProvider.get_company_news(ticker, days=days, limit=5)
+        return json.dumps({"ticker": ticker, "articles": articles, "count": len(articles)})
+    except Exception as exc:
+        return json.dumps({"ticker": ticker, "articles": [], "error": str(exc)})
+
+
+def tool_get_olostep_sentiment(ticker: str) -> str:
+    """Execute Olostep web & analyst sentiment search for a candidate asset.
+
+    Args:
+        ticker: Underlying ticker symbol (e.g. 'NVDA', 'AAPL').
+
+    Returns:
+        JSON string with sentiment_label ('BULLISH'/'BEARISH'/'NEUTRAL'), sentiment_score, summary, and catalysts.
+    """
+    try:
+        from trading_system.data.trading212_client import MarketDataProvider
+        data = MarketDataProvider.get_sentiment_search(ticker)
+        return json.dumps(data)
+    except Exception as exc:
+        return json.dumps({
+            "symbol": ticker,
+            "sentiment_label": "NEUTRAL",
+            "sentiment_score": 0.50,
+            "summary": "Neutral sentiment baseline",
+            "is_simulated": True,
+            "error": str(exc),
+        })
+
+
+def tool_get_nixtla_forecast(ticker: str) -> str:
+    """Retrieve Nixtla TimeGPT 5-day price trajectory forecast and directional bias.
+
+    Args:
+        ticker: Underlying ticker symbol (e.g. 'NVDA', 'QQQ').
+
+    Returns:
+        JSON string with 5-day forecasted prices, expected return percentage, and directional bias.
+    """
+    try:
+        from trading_system.data.trading212_client import MarketDataProvider
+        data = MarketDataProvider.get_5day_forecast(ticker)
+        return json.dumps(data)
+    except Exception as exc:
+        return json.dumps({
+            "symbol": ticker,
+            "horizon_days": 5,
+            "directional_bias": "NEUTRAL",
+            "expected_return_pct": 0.0,
+            "forecast_prices": [],
+            "is_forecast_simulated": True,
+            "error": str(exc),
+        })
 
 
 def tool_get_portfolio_status() -> str:
@@ -378,6 +480,10 @@ class AntigravityTradingAgent:
     tool_get_asset_intelligence = staticmethod(tool_get_asset_intelligence)
     tool_get_portfolio_status = staticmethod(tool_get_portfolio_status)
     tool_evaluate_risk_and_size = staticmethod(tool_evaluate_risk_and_size)
+    tool_get_finnhub_fundamentals = staticmethod(tool_get_finnhub_fundamentals)
+    tool_get_company_news = staticmethod(tool_get_company_news)
+    tool_get_olostep_sentiment = staticmethod(tool_get_olostep_sentiment)
+    tool_get_nixtla_forecast = staticmethod(tool_get_nixtla_forecast)
 
     # ── Agent Construction & Execution ───────────────────────────────────────
 
@@ -419,6 +525,10 @@ class AntigravityTradingAgent:
             tool_get_asset_intelligence,
             tool_get_portfolio_status,
             tool_evaluate_risk_and_size,
+            tool_get_finnhub_fundamentals,
+            tool_get_company_news,
+            tool_get_olostep_sentiment,
+            tool_get_nixtla_forecast,
         ]
 
         system_instructions = (

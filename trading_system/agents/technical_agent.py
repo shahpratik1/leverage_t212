@@ -83,8 +83,8 @@ class TechnicalAnalyst:
         return 'neutral'
 
     def _fallback_analysis(self, ticker: str, metrics: Dict[str, Any]) -> TechnicalAnalysis:
-        """Pure rule-based technical analysis from the metrics dict."""
-        logger.info(f"Using fallback analysis for {ticker}")
+        """Pure rule-based technical analysis enriched with Nixtla 5-day forecast."""
+        logger.info(f"Using technical indicators & Nixtla 5-day forecast for {ticker}")
         
         trend = self._determine_trend_structure(metrics)
         ma_alignment = self._determine_ma_alignment(metrics)
@@ -94,20 +94,45 @@ class TechnicalAnalyst:
         rsi7 = metrics.get('rsi7', 50.0)
         rsi14 = metrics.get('rsi14', metrics.get('rsi', 50.0))
         
+        # Ingest Nixtla 5-day forecast
+        nixtla_data = metrics.get("nixtla_forecast")
+        if nixtla_data is None:
+            try:
+                from trading_system.data.trading212_client import MarketDataProvider
+                nixtla_data = MarketDataProvider.get_5day_forecast(ticker)
+            except Exception as exc:
+                logger.debug("Failed to retrieve Nixtla forecast in TechnicalAnalyst: %s", exc)
+        nixtla_data = nixtla_data or {}
+
+        forecast_prices = nixtla_data.get("forecast_prices") or []
+        target_5d = forecast_prices[-1] if forecast_prices else metrics.get("close", 0.0)
+        nixtla_return = float(nixtla_data.get("expected_return_pct", 0.0) or 0.0)
+        nixtla_bias = nixtla_data.get("directional_bias", "NEUTRAL")
+
         key_levels = {
             'support': metrics.get('support', 0.0),
             'resistance': metrics.get('resistance', 0.0),
             'breakout_level': metrics.get('breakout_level', 0.0),
             'sma5_mr_target': metrics.get('sma5', 0.0),
+            'nixtla_5d_target': target_5d,
+            'nixtla_expected_return_pct': nixtla_return,
         }
         
         is_mr = "3-RSI Mean Reversion" in momentum
-        summary_text = (
+        base_summary = (
             f"3-RSI Mean Reversion Dip: RSI3={rsi3:.1f}, RSI7={rsi7:.1f}, RSI14={rsi14:.1f}. "
             f"Asset in macro {trend} trend testing deep oversold support (Target: 5-SMA @ {metrics.get('sma5', 0.0):.2f})."
             if is_mr else
             f"Trend Momentum: {trend} trend structure with {momentum} momentum. RSI14={rsi14:.1f}, ADX={metrics.get('adx', 0.0):.1f}."
         )
+
+        nixtla_summary = f" Nixtla 5-Day Forecast: {nixtla_bias} ({nixtla_return:+.2f}%, 5d target ${target_5d:.2f})."
+        summary_text = base_summary + nixtla_summary
+
+        conf = 0.88 if is_mr else 0.70
+        # Boost confidence when Nixtla 5-day bias aligns with trend
+        if (trend == "bullish" and nixtla_bias == "BULLISH") or (trend == "bearish" and nixtla_bias == "BEARISH"):
+            conf = min(0.95, conf + 0.05)
 
         return TechnicalAnalysis(
             ticker=ticker,
@@ -117,7 +142,7 @@ class TechnicalAnalyst:
             volume_assessment=volume_assessment,
             key_levels=key_levels,
             summary=summary_text,
-            confidence=0.88 if is_mr else 0.70,
+            confidence=round(conf, 2),
             raw_analysis=None
         )
 
