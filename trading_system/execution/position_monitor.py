@@ -138,12 +138,17 @@ class PositionMonitor:
         direction: str = "LONG",
         atr: Optional[float] = None,
         existing_stop_price: Optional[float] = None,
+        ticker: Optional[str] = None,
+        underlying_atr_pct: Optional[float] = None,
+        leverage_factor: Optional[float] = None,
     ) -> Dict[str, float]:
         """Calculate dynamic ATR/volatility-based SL, TP1, TP2, TP3.
 
-        For 3x Leveraged ETPs:
+        For Leveraged ETPs (3x and 5x):
         - Uses existing stop price if one was already set on broker, aligning R-multiples.
-        - Otherwise, calculates stop distance from ATR (or 2.5% default), clamped between 3% and 8%.
+        - Scales underlying market ATR percentage by instrument leverage (3x / 5x) to reflect
+          true product volatility, preventing noise stop-outs.
+        - Calculates stop distance from ATR (or 3.5% default for 3x ETPs), clamped between 2.5% and 8%.
         - Derives multi-stage targets:
             TP1 = Entry +/- 1.0R (+1x SL distance)
             TP2 = Entry +/- 2.0R (+2x SL distance)
@@ -152,21 +157,47 @@ class PositionMonitor:
         is_short = (direction.upper() == "SHORT" and not direction.upper().endswith("_ETP"))
         entry = max(0.01, entry_price)
 
+        # Resolve leverage multiplier (defaults to 3.0 for ETPs, 5.0 for 5x, 1.0 for ordinary)
+        if leverage_factor is None or leverage_factor <= 0:
+            if ticker:
+                try:
+                    from trading_system.data.leveraged_universe import LeveragedUniverse
+                    univ = LeveragedUniverse()
+                    pair = univ.get_pair_for_etp(ticker)
+                    if pair and (ticker == pair.long_5x_ticker or ticker == pair.short_5x_ticker):
+                        leverage_factor = 5.0
+                    elif "5" in ticker and ("_EQ" in ticker or ".L" in ticker):
+                        leverage_factor = 5.0
+                    elif pair or "3" in ticker:
+                        leverage_factor = 3.0
+                    else:
+                        leverage_factor = 1.0
+                except Exception:
+                    leverage_factor = 3.0 if ("3" in ticker or "5" in ticker) else 1.0
+            else:
+                leverage_factor = 3.0
+
         if existing_stop_price and existing_stop_price > 0:
             sl = round(existing_stop_price, 4)
             sl_dist = abs(entry - sl)
-            # Ensure distance is at least 1% of entry to prevent zero-width targets
+            # Ensure distance is at least 2% of entry to prevent zero-width targets
             sl_dist = max(sl_dist, round(entry * 0.02, 4))
+            effective_atr = atr if (atr and atr > 0) else round(entry * 0.025, 4)
         else:
-            calc_atr = atr if (atr and atr > 0) else round(entry * 0.025, 4)
-            # 2.2x ATR stop distance, bounded between 3% and 8% of price
-            raw_dist = calc_atr * 2.2
-            min_dist = entry * 0.03
+            if underlying_atr_pct and underlying_atr_pct > 0:
+                etp_atr_pct = underlying_atr_pct * leverage_factor
+                effective_atr = round(entry * etp_atr_pct, 4)
+            elif atr and atr > 0:
+                effective_atr = atr
+            else:
+                effective_atr = round(entry * 0.035, 4)
+
+            # 2.2x ATR stop distance, bounded between 2.5% and 8% of price
+            raw_dist = effective_atr * 2.2
+            min_dist = entry * 0.025
             max_dist = entry * 0.08
             sl_dist = round(min(max_dist, max(min_dist, raw_dist)), 4)
             sl = round((entry + sl_dist) if is_short else (entry - sl_dist), 4)
-
-        effective_atr = atr if (atr and atr > 0) else round(entry * 0.025, 4)
 
         if is_short:
             tp1 = round(max(0.01, entry - sl_dist), 4)
@@ -628,13 +659,17 @@ class PositionMonitor:
             self._save_state()
         return results
 
-    def reconcile_with_broker(self, adopt_untracked: bool = True) -> Dict[str, Any]:
+    def reconcile_with_broker(
+        self,
+        adopt_untracked: bool = True,
+        active_metrics: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Reconcile local active positions with actual broker portfolio.
 
         Detects:
         - Positions closed externally (stopped out via native stop, limit filled, or manual app close)
         - Partial quantity mismatches and external trims
-        - Untracked broker positions (with automatic adoption)
+        - Untracked broker positions (with automatic adoption using real market ATR & metrics)
         """
         summary: Dict[str, Any] = {
             "closed_externally": [],
@@ -709,6 +744,21 @@ class PositionMonitor:
                     pos.highest_price = max(pos.highest_price or cur_px, cur_px)
                     pos.lowest_price = min(pos.lowest_price or cur_px, cur_px)
 
+                # Ingest real market ATR and indicators into existing position if active_metrics supplied
+                if active_metrics:
+                    m = active_metrics.get(pos.underlying) or active_metrics.get(ticker)
+                    if m:
+                        und_atr = float(m.get("atr") or 0.0)
+                        und_close = float(m.get("close") or 0.0)
+                        if und_atr > 0 and und_close > 0:
+                            scaled_atr_pct = (und_atr / und_close) * 3.0
+                            setattr(pos, "_last_atr_pct", scaled_atr_pct)
+                            if not getattr(pos, "scale_calibrated", False) or pos.atr <= 0:
+                                pos.atr = round(pos.entry_price * scaled_atr_pct, 4)
+                        if m.get("nixtla_5d_target") is not None:
+                            setattr(pos, "nixtla_5d_target", float(m["nixtla_5d_target"]))
+                            setattr(pos, "nixtla_expected_return_pct", float(m.get("nixtla_expected_return_pct", 0.0)))
+
                 # Detect and fix entry-price currency scale mismatch (e.g. GBX pence stored vs EUR)
                 # If entry_price and broker average_price differ by more than 5× either way, trust broker.
                 broker_avg = getattr(bp, "average_price", 0.0) or 0.0
@@ -724,6 +774,7 @@ class PositionMonitor:
                             entry_price=broker_avg,
                             direction=pos.direction,
                             existing_stop_price=pos.stop_loss if (0.2 < (pos.stop_loss / broker_avg) < 5.0) else None,
+                            ticker=ticker,
                         )
                         pos.entry_price = broker_avg
                         pos.stop_loss = levels["stop_loss"]
@@ -804,10 +855,23 @@ class PositionMonitor:
                     so_id = str(so.get("id") if isinstance(so, dict) else getattr(so, "id", "")) if so else None
                     so_price = float(so.get("stopPrice", 0.0) if isinstance(so, dict) else getattr(so, "stop_price", 0.0)) if so else 0.0
 
+                    # Ingest real market ATR and indicators if active_metrics is provided
+                    und_atr_pct = None
+                    m = None
+                    if active_metrics:
+                        m = active_metrics.get(underlying) or active_metrics.get(b_ticker)
+                        if m:
+                            und_atr = float(m.get("atr") or 0.0)
+                            und_close = float(m.get("close") or 0.0)
+                            if und_atr > 0 and und_close > 0:
+                                und_atr_pct = und_atr / und_close
+
                     levels = self.calculate_exit_levels(
                         entry_price=avg_px,
                         direction=direction,
                         existing_stop_price=so_price if so_price > 0 else None,
+                        ticker=b_ticker,
+                        underlying_atr_pct=und_atr_pct,
                     )
 
                     broker_stop_id = so_id if so_id else (f"DRY_STOP_{b_ticker}_{int(time.time())}" if self.dry_run else None)
@@ -838,6 +902,11 @@ class PositionMonitor:
                         current_price=cur_px,
                         currency=get_ticker_currency(b_ticker),
                     )
+                    if m and m.get("nixtla_5d_target") is not None:
+                        setattr(adopted_pos, "nixtla_5d_target", float(m["nixtla_5d_target"]))
+                        setattr(adopted_pos, "nixtla_expected_return_pct", float(m.get("nixtla_expected_return_pct", 0.0)))
+                    setattr(adopted_pos, "_last_atr_pct", (levels["atr"] / avg_px) if avg_px > 0 else 0.04)
+
                     self.positions[b_ticker] = adopted_pos
                     summary["adopted_from_broker"].append(b_ticker)
                     logger.info(
@@ -1456,6 +1525,43 @@ class PositionMonitor:
                         event = self._handle_tp2_hit(pos, cur_px)
                         event["signal_reason"] = f"3RSI_EXTREME_OVERSOLD_COVER_{pos.rsi3:.1f}"
                         events.append(event)
+
+            # 3. Nixtla 5-Day Forecast Reversal / Target Signals
+            nixtla_ret = metrics.get("nixtla_expected_return_pct")
+            if nixtla_ret is not None:
+                try:
+                    ret_val = float(nixtla_ret)
+                    if not is_short:
+                        # Long: If Nixtla forecasts sharp downward trend (<= -3.0%) and position has profit >= 1.5%
+                        if ret_val <= -3.0 and pnl_pct >= 1.5 and not pos.tp1_hit:
+                            logger.info(
+                                "🎯 Signal Achieved for %s: Nixtla 5-Day Bearish Reversal (%.1f%%) with PnL +%.2f%%. Executing TP1 trim.",
+                                ticker, ret_val, pnl_pct,
+                            )
+                            event = self._handle_tp1_hit(pos, cur_px)
+                            event["signal_reason"] = f"NIXTLA_BEARISH_REVERSAL_{ret_val:.1f}%"
+                            events.append(event)
+                        # Long: If profit reached or exceeded forecast return (>= 4.0%)
+                        elif ret_val > 0 and pnl_pct >= max(4.0, ret_val) and pos.tp1_hit and not pos.tp2_hit:
+                            logger.info(
+                                "🎯 Signal Achieved for %s: Nixtla 5-Day Target Achieved (PnL +%.2f%% >= Forecast %.1f%%). Executing TP2 trim.",
+                                ticker, pnl_pct, ret_val,
+                            )
+                            event = self._handle_tp2_hit(pos, cur_px)
+                            event["signal_reason"] = f"NIXTLA_TARGET_ACHIEVED_{pnl_pct:.1f}%"
+                            events.append(event)
+                    else:
+                        # Short: If Nixtla forecasts sharp upward rally (>= +3.0%) and position has profit >= 1.5%
+                        if ret_val >= 3.0 and pnl_pct >= 1.5 and not pos.tp1_hit:
+                            logger.info(
+                                "🎯 Signal Achieved for %s: Nixtla 5-Day Bullish Reversal on Short (%.1f%%) with PnL +%.2f%%. Executing TP1 trim.",
+                                ticker, ret_val, pnl_pct,
+                            )
+                            event = self._handle_tp1_hit(pos, cur_px)
+                            event["signal_reason"] = f"NIXTLA_BULLISH_REVERSAL_{ret_val:.1f}%"
+                            events.append(event)
+                except (ValueError, TypeError):
+                    pass
 
         for t in tickers_to_remove:
             if t in self.positions:

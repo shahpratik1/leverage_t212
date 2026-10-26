@@ -44,3 +44,15 @@ An execution rule governing overnight risk where leveraged inverse short positio
 *Avoid: Universal overnight hold, static session policy*
 
 Inverse leveraged products experience heightened path-dependency and compounding decay during off-market gap openings; liquidating inverse exposure intraday isolates risk to active trading hours.
+
+### Leverage-Scaled ATR Engine
+A volatility normalization mechanism that scales underlying benchmark ATR percentage by the instrument leverage multiplier (3x or 5x) to compute true expected price volatility for leveraged ETPs.
+*Avoid: Raw underlying stop, fixed percentage stop*
+
+Because leveraged products experience amplified daily range, stop loss distance is calculated using the scaled volatility and clamped between safety thresholds (2.5% to 8.0%) to prevent false-positive noise stop-outs.
+
+### Dual-Trigger Exit Protocol
+An execution architecture that couples native broker server-side GTC protective stop and limit orders with algorithmic leading-indicator exits (e.g. Connors 3-RSI exhaustion, Nixtla 5-day forecast reversals).
+*Avoid: Client-only stop, price-only limit*
+
+Broker-side orders ensure capital protection persists across network drops and off-hours, while algorithmic signals capture peak momentum trims before price reversal degrades unrealized gains.

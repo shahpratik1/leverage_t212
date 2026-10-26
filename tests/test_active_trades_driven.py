@@ -364,6 +364,160 @@ class TestActiveTradesDriven(unittest.TestCase):
         self.assertEqual(metrics["NVDA"]["rsi3"], 72.0)
         orch.shutdown()
 
+    # ── 6. Leverage-Scaled ATR and Nixtla Signal Exit Tests ──────
+    def test_calculate_exit_levels_with_leverage_and_underlying_atr(self):
+        """Test exit levels scaled by leverage (e.g. 3x for ETPs, 5x for 5QQEl_EQ)."""
+        # 3x ETP with underlying ATR% = 1.0%
+        # scaled ETP ATR% = 3.0%, effective_atr = 100 * 0.03 = 3.0
+        # raw_dist = 3.0 * 2.2 = 6.6
+        levels_3x = self.monitor.calculate_exit_levels(
+            entry_price=100.0,
+            direction="LONG",
+            ticker="QQQ3l_EQ",
+            underlying_atr_pct=0.01,
+        )
+        self.assertEqual(levels_3x["atr"], 3.0)
+        self.assertEqual(levels_3x["stop_loss"], 93.4)
+        self.assertEqual(levels_3x["tp1"], 106.6)
+        self.assertEqual(levels_3x["tp2"], 113.2)
+        self.assertEqual(levels_3x["tp3"], 119.8)
+
+        # 5x ETP with underlying ATR% = 1.0% -> scaled 5.0%
+        # raw_dist = 5.0 * 2.2 = 11.0 -> clamped to 8.0 max
+        levels_5x = self.monitor.calculate_exit_levels(
+            entry_price=100.0,
+            direction="LONG",
+            ticker="5QQEl_EQ",
+            underlying_atr_pct=0.01,
+        )
+        self.assertEqual(levels_5x["atr"], 5.0)
+        self.assertEqual(levels_5x["stop_loss"], 92.0)
+        self.assertEqual(levels_5x["tp1"], 108.0)
+
+    def test_reconciliation_adopts_with_live_market_metrics(self):
+        """When untracked broker position is adopted with active_metrics, ATR and levels use real market data."""
+        pos_broker = Position(
+            ticker="QQQ3l_EQ",
+            quantity=10.0,
+            average_price=100.0,
+            current_price=102.0,
+            ppl=20.0,
+            max_buy=100.0,
+            max_sell=100.0,
+        )
+        self.mock_t212.get_portfolio.return_value = [pos_broker]
+        self.mock_t212.get_orders.return_value = []
+        self.mock_t212.place_stop_order.return_value = OrderResult(
+            id="STOP_QQQ_001",
+            ticker="QQQ3l_EQ",
+            type="STOP",
+            status="NEW",
+            quantity=-10.0,
+            filled_quantity=0.0,
+            fill_price=0.0,
+        )
+        self.mock_t212.place_limit_order.return_value = OrderResult(
+            id="LIMIT_QQQ_001",
+            ticker="QQQ3l_EQ",
+            type="LIMIT",
+            status="NEW",
+            quantity=-5.0,
+            filled_quantity=0.0,
+            fill_price=0.0,
+        )
+
+        active_metrics = {
+            "QQQ": {
+                "close": 500.0,
+                "atr": 5.0,  # 1.0% underlying ATR -> 3.0% scaled on QQQ3l_EQ
+                "nixtla_5d_target": 525.0,
+                "nixtla_expected_return_pct": 5.0,
+            }
+        }
+
+        summary = self.monitor.reconcile_with_broker(adopt_untracked=True, active_metrics=active_metrics)
+        self.assertIn("QQQ3l_EQ", summary["adopted_from_broker"])
+        adopted = self.monitor.positions["QQQ3l_EQ"]
+        self.assertEqual(adopted.atr, 3.0)
+        self.assertEqual(adopted.stop_loss, 93.4)
+        self.assertEqual(getattr(adopted, "nixtla_5d_target", None), 525.0)
+        self.assertEqual(getattr(adopted, "nixtla_expected_return_pct", None), 5.0)
+
+    def test_evaluate_active_trade_signals_nixtla_bearish_reversal_long(self):
+        """Nixtla 5-day bearish forecast reversal (<= -3%) on long position with profit >= 1.5% triggers TP1 trim."""
+        pos = TrackedPosition(
+            ticker="3NVDl_EQ",
+            underlying="NVDA",
+            direction="LONG",
+            entry_price=100.0,
+            current_price=102.0,  # +2.0% profit
+            original_quantity=10.0,
+            remaining_quantity=10.0,
+            stop_loss=94.0,
+            trailing_stop_loss=94.0,
+            highest_price=102.0,
+            lowest_price=100.0,
+            tp1=106.0,
+            tp2=112.0,
+            tp3=118.0,
+            atr=3.0,
+        )
+        self.monitor.positions["3NVDl_EQ"] = pos
+        self.monitor._execute_sell = MagicMock(return_value=True)
+        self.monitor.place_broker_stop = MagicMock(return_value="BE_STOP")
+        self.monitor.place_broker_tp_limit = MagicMock(return_value="TP2_LIMIT")
+
+        active_metrics = {
+            "NVDA": {
+                "close": 120.0,
+                "rsi3": 50.0,
+                "nixtla_expected_return_pct": -4.2,  # Bearish forecast reversal
+            }
+        }
+        events = self.monitor.evaluate_active_trade_signals(active_metrics)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "TP1")
+        self.assertIn("NIXTLA_BEARISH_REVERSAL_-4.2%", events[0]["signal_reason"])
+        self.assertTrue(pos.tp1_hit)
+
+    def test_evaluate_active_trade_signals_nixtla_target_achieved(self):
+        """Nixtla 5-day forecast target achieved (profit >= forecast return) triggers TP2 trim."""
+        pos = TrackedPosition(
+            ticker="3NVDl_EQ",
+            underlying="NVDA",
+            direction="LONG",
+            entry_price=100.0,
+            current_price=105.5,  # +5.5% profit
+            original_quantity=10.0,
+            remaining_quantity=5.0,  # Remaining after TP1
+            stop_loss=100.0,
+            trailing_stop_loss=100.0,
+            highest_price=105.5,
+            lowest_price=100.0,
+            tp1=104.0,
+            tp2=108.0,
+            tp3=112.0,
+            atr=3.0,
+            tp1_hit=True,  # TP1 already hit
+        )
+        self.monitor.positions["3NVDl_EQ"] = pos
+        self.monitor._execute_sell = MagicMock(return_value=True)
+        self.monitor.place_broker_stop = MagicMock(return_value="TP1_STOP")
+        self.monitor.place_broker_tp_limit = MagicMock(return_value="TP3_LIMIT")
+
+        active_metrics = {
+            "NVDA": {
+                "close": 125.0,
+                "rsi3": 60.0,
+                "nixtla_expected_return_pct": 5.0,  # Forecast +5.0%
+            }
+        }
+        events = self.monitor.evaluate_active_trade_signals(active_metrics)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "TP2")
+        self.assertIn("NIXTLA_TARGET_ACHIEVED_5.5%", events[0]["signal_reason"])
+        self.assertTrue(pos.tp2_hit)
+
 
 if __name__ == "__main__":
     unittest.main()

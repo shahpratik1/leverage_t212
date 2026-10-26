@@ -241,6 +241,14 @@ class Orchestrator:
                 daily = MarketDataProvider.get_daily_candles(symbol, period="1y")
                 hourly = MarketDataProvider.get_hourly_candles(symbol, period="1mo")
                 metrics = MarketDataProvider.compute_indicators(daily, hourly, symbol=symbol)
+                # Ingest Nixtla 5-day forecast for active underlying if available
+                try:
+                    forecast = MarketDataProvider.get_5day_forecast(symbol)
+                    if forecast and "target_5d" in forecast:
+                        metrics["nixtla_5d_target"] = forecast.get("target_5d")
+                        metrics["nixtla_expected_return_pct"] = forecast.get("expected_return_pct", 0.0)
+                except Exception as f_exc:
+                    logger.debug("Active trade forecast fetch notice for %s: %s", symbol, f_exc)
                 return symbol, metrics
             except Exception as exc:
                 logger.debug("Active trade metric fetch notice for %s: %s", symbol, exc)
@@ -976,9 +984,12 @@ class Orchestrator:
                     continue
 
                 # ── PRIORITY 1: High-Frequency Active Position Management ──
-                # 1. Reconcile with Trading 212 & adopt untracked positions
+                # Fetch targeted indicators & forecasts for active trade underlyings (<0.5s)
+                active_metrics = self.fetch_active_trades_metrics()
+
+                # 1. Reconcile with Trading 212 & adopt untracked positions using live market data
                 if now - getattr(self, "_last_reconciliation_time", 0.0) >= getattr(settings, "RECONCILIATION_INTERVAL_SECONDS", 30):
-                    rec = self.position_monitor.reconcile_with_broker(adopt_untracked=True)
+                    rec = self.position_monitor.reconcile_with_broker(adopt_untracked=True, active_metrics=active_metrics)
                     if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
                         logger.info("Active trade reconciliation: %s", rec)
                         self._update_dashboard()
@@ -1001,8 +1012,6 @@ class Orchestrator:
                     except Exception as e:
                         logger.debug("T212 portfolio price fetch notice: %s", e)
 
-                    # Targeted indicators for active trade underlyings (<0.5s)
-                    active_metrics = self.fetch_active_trades_metrics()
                     for und, met in active_metrics.items():
                         if met.get("close"):
                             current_prices[und] = met["close"]
