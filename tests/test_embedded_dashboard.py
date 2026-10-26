@@ -244,6 +244,61 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertEqual(sl_ev["pnl"], -2.0)
         self.assertEqual(sl_ev["pnl_pct"], -7.25)
 
+    def test_load_active_signals_ionq_direction_and_spot_pnl(self):
+        """Verify load_active_signals corrects IONQl1_EQ direction to LONG and calculates spot P&L accurately."""
+        import json
+        from trading_system.dashboard.server import load_active_signals
+
+        signals_file = Path(self.temp_dir.name) / "active_trades.json"
+        # Simulate an erroneous state where IONQl1_EQ was recorded as SHORT
+        state_data = {
+            "IONQl1_EQ": {
+                "ticker": "IONQl1_EQ",
+                "underlying": "IONQ",
+                "direction": "SHORT",  # Erroneous label in file
+                "entry_price": 1.68,
+                "current_price": 1.66,  # Price dropped from 1.68 to 1.66 (-1.19%)
+                "original_quantity": 10.0,
+                "remaining_quantity": 10.0,
+                "stop_loss": 1.39,
+                "tp1": 1.97,
+            }
+        }
+        signals_file.write_text(json.dumps(state_data), encoding="utf-8")
+
+        signals = load_active_signals(str(signals_file), live_prices={"IONQl1_EQ": 1.66})
+        self.assertEqual(len(signals), 1)
+        sig = signals[0]
+        # Must authoritatively correct direction to LONG
+        self.assertEqual(sig["direction"], "LONG")
+        # Must reflect true spot loss: (1.66 - 1.68) * 10 = -0.20 (-1.19%)
+        self.assertEqual(sig["pnl_amount"], -0.20)
+        self.assertAlmostEqual(sig["pnl_pct"], -1.19, places=2)
+        # Currency must be USD
+        self.assertEqual(sig["currency_code"], "USD")
+        self.assertEqual(sig["currency_prefix"], "$")
+
+    def test_orchestrator_rejects_short_without_inverse_etp(self):
+        """Verify Orchestrator rejects SHORT trade for IONQ since no inverse ETP exists."""
+        from trading_system.screener.laya_screener import ScreenerResult
+
+        orch = Orchestrator(dry_run=True, notifier=self.notifier, enable_dashboard=False)
+        candidate = ScreenerResult(
+            ticker="IONQ",
+            bias="bearish",
+            bias_confidence=0.85,
+            setup_score="favorable",
+            setup_confidence=0.80,
+            catalyst_risk=0.10,
+            overall_confidence=0.82,
+            metrics={"close": 1.68, "atr": 0.05, "adx": 25.0},
+        )
+        card = orch.deep_analyse(candidate)
+        # Must reject trade and return None
+        self.assertIsNone(card)
+        orch.shutdown()
+
+
 
 if __name__ == "__main__":
     unittest.main()

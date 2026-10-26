@@ -30,6 +30,7 @@ from trading_system.data.leveraged_universe import (
     CURATED_3X_PAIRS,
     LeveragedUniverse,
     get_currency_display,
+    get_etp_direction,
     get_ticker_currency,
 )
 from trading_system.data.trading212_client import Trading212Client
@@ -122,13 +123,17 @@ def load_active_signals(
             tp1 = float(pos.get("tp1") or 0.0)
             tp2 = float(pos.get("tp2") or 0.0)
             tp3 = float(pos.get("tp3") or 0.0)
-            direction = pos.get("direction", "LONG").upper()
+            # Authoritative direction: if instrument is an ETP, its direction is derived authoritatively
+            etp_dir = universe.get_etp_direction(ticker) if universe else get_etp_direction(ticker)
+            direction = etp_dir if etp_dir else pos.get("direction", "LONG").upper()
             underlying = pos.get("underlying", "")
             broker_stop_order_id = pos.get("broker_stop_order_id")
 
             # Determine human-readable asset name and quote currency
             pair = universe.get_pair_for_etp(ticker) if universe else None
             asset_name = pos.get("name") or (pair.name if pair else underlying)
+            if not underlying and pair:
+                underlying = pair.underlying_symbol
             
             # Authoritative ticker-level currency resolution (prefer ticker currency over pair base currency)
             curr = pos.get("currency")
@@ -149,15 +154,14 @@ def load_active_signals(
             elif pos.get("current_price") and float(pos.get("current_price")) > 0:
                 current_price = float(pos.get("current_price"))
             else:
-                current_price = highest_price if direction == "LONG" else lowest_price
+                current_price = entry if entry > 0 else (highest_price if direction == "LONG" else lowest_price)
 
+            # On Trading 212 Invest, all positions (Long ETPs, Inverse Short ETPs, stocks) are spot assets
+            # held long (Q > 0). When current_price > entry, it is ALWAYS a profit; when current_price < entry,
+            # it is ALWAYS a loss. Inverse ETPs already reflect underlying moves inversely in their market price.
             if entry > 0 and current_price > 0:
-                if direction == "LONG":
-                    pnl_pct = ((current_price - entry) / entry) * 100.0
-                    pnl_amount = (current_price - entry) * remaining_quantity
-                else:
-                    pnl_pct = ((entry - current_price) / entry) * 100.0
-                    pnl_amount = (entry - current_price) * remaining_quantity
+                pnl_pct = ((current_price - entry) / entry) * 100.0
+                pnl_amount = (current_price - entry) * remaining_quantity
             else:
                 pnl_pct = 0.0
                 pnl_amount = 0.0
@@ -505,14 +509,14 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                     pair = universe.get_pair_for_etp(b_ticker)
                     underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
                     underlying_name = pair.name if pair else underlying
-                    direction = "LONG"
-                    if pair and (b_ticker == pair.short_3x_ticker or b_ticker == pair.short_5x_ticker):
-                        direction = "SHORT"
+                    direction = universe.get_etp_direction(b_ticker) if universe else get_etp_direction(b_ticker)
                     avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
                     cur_px = bp.current_price if bp.current_price > 0 else avg_px
                     sl_dist = round(avg_px * 0.05, 2)
-                    sl = round(avg_px - sl_dist, 2) if direction == "LONG" else round(avg_px + sl_dist, 2)
-                    pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 and direction == "LONG" else ((avg_px - cur_px) / avg_px * 100.0 if avg_px > 0 else 0.0)
+                    # All spot ETPs on Trading 212 are held long, so SL is below entry and TP is above entry
+                    sl = round(max(0.01, avg_px - sl_dist), 2)
+                    pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 else 0.0
+                    pnl_amount = round((cur_px - avg_px) * bp.quantity, 2)
 
                     curr = universe.get_ticker_currency(b_ticker) if universe else get_ticker_currency(b_ticker)
                     currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
@@ -531,7 +535,7 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                         "entry_price": round(avg_px, 2),
                         "current_price": round(cur_px, 2),
                         "pnl_pct": round(pnl_pct, 2),
-                        "pnl_amount": round((cur_px - avg_px) * bp.quantity if direction == "LONG" else (avg_px - cur_px) * bp.quantity, 2),
+                        "pnl_amount": pnl_amount,
                         "currency_code": currency_code,
                         "currency_prefix": currency_prefix,
                         "currency_suffix": currency_suffix,
@@ -539,11 +543,11 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                         "trailing_stop_loss": sl,
                         "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2) if avg_px > 0 else 5.0,
                         "broker_stop_order_id": None,
-                        "tp1": round(avg_px + sl_dist, 2) if direction == "LONG" else round(avg_px - sl_dist, 2),
+                        "tp1": round(avg_px + sl_dist, 2),
                         "tp1_pct": round(abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 5.0,
-                        "tp2": round(avg_px + 2 * sl_dist, 2) if direction == "LONG" else round(avg_px - 2 * sl_dist, 2),
+                        "tp2": round(avg_px + 2 * sl_dist, 2),
                         "tp2_pct": round(2 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 10.0,
-                        "tp3": round(avg_px + 3 * sl_dist, 2) if direction == "LONG" else round(avg_px - 3 * sl_dist, 2),
+                        "tp3": round(avg_px + 3 * sl_dist, 2),
                         "tp3_pct": round(3 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 15.0,
                         "quantity": bp.quantity,
                         "remaining_quantity": bp.quantity,

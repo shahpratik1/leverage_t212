@@ -154,6 +154,40 @@ class Test5xLeveragedUniverse(unittest.TestCase):
         self.assertFalse(valid_6x)
         self.assertIn("exceeds maximum allowed cap", msg_6x)
 
+    def test_etp_direction_authoritative_resolution(self):
+        """Authoritatively resolve ETP direction as LONG or SHORT and ensure IONQ is LONG."""
+        from trading_system.data.leveraged_universe import get_etp_direction, get_ticker_currency
+
+        # IONQ 3x ETPs are spot LONG instruments
+        self.assertEqual(self.universe.get_etp_direction("IONQl1_EQ"), "LONG")
+        self.assertEqual(self.universe.get_etp_direction("ION3a_EQ"), "LONG")
+        self.assertEqual(get_etp_direction("IONQl1_EQ"), "LONG")
+        self.assertEqual(get_etp_direction("ION3a_EQ"), "LONG")
+
+        # Standard Long ETPs
+        self.assertEqual(self.universe.get_etp_direction("QQQ3m_EQ"), "LONG")
+        self.assertEqual(self.universe.get_etp_direction("3LVEl_EQ"), "LONG")
+        self.assertEqual(self.universe.get_etp_direction("5QQEl_EQ"), "LONG")
+
+        # Inverse Short ETPs
+        self.assertEqual(self.universe.get_etp_direction("QQQSm_EQ"), "SHORT")
+        self.assertEqual(self.universe.get_etp_direction("3SVEl_EQ"), "SHORT")
+        self.assertEqual(self.universe.get_etp_direction("SQQEl_EQ"), "SHORT")
+        self.assertEqual(self.universe.get_etp_direction("3SNIl_EQ"), "SHORT")
+        self.assertEqual(self.universe.get_etp_direction("3DESl_EQ"), "SHORT")
+        self.assertEqual(get_etp_direction("QQQSm_EQ"), "SHORT")
+        self.assertEqual(get_etp_direction("3SVEl_EQ"), "SHORT")
+
+        # IONQ USD resolution & currency
+        pair = self.universe.get_pair_for_etp("IONQl1_EQ")
+        self.assertIsNotNone(pair)
+        self.assertEqual(pair.underlying_symbol, "IONQ")
+        self.assertEqual(get_ticker_currency("IONQl1_EQ"), "USD")
+
+        # IONQ has no inverse short ticker, short execution ticker must return None
+        self.assertIsNone(self.universe.get_execution_ticker("IONQ", "SHORT"))
+
+
 
 if __name__ == "__main__":
     unittest.main()

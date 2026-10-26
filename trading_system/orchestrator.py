@@ -413,18 +413,41 @@ class Orchestrator:
             return None
 
         # ── 1. Map to Leveraged Execution Ticker (5x if available, else 3x) ──────
+        direction_upper = direction.upper()
+        is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
         if settings.USE_LEVERAGED_3X:
             # Policy: if 5x exists, prioritize 5x completely over 3x
             has_5x = self.leveraged_universe.has_5x_leverage(underlying, direction)
             target_leverage = 5 if (has_5x and getattr(settings, "ENABLE_5X_LEVERAGE", True)) else 3
             t212_ticker = self.leveraged_universe.get_execution_ticker(underlying, direction, leverage=target_leverage)
             if not t212_ticker:
+                if is_short:
+                    logger.warning(
+                        "SHORT signal rejected for %s: no inverse / short leveraged ETP exists on Trading 212 Invest",
+                        underlying,
+                    )
+                    return None
                 logger.warning("No paired %dx %s ETP found for %s — using standard mapping", target_leverage, direction, underlying)
                 instrument = self.t212.get_instrument_by_symbol(underlying)
                 t212_ticker = instrument.ticker if instrument else f"{underlying}_US_EQ"
         else:
+            if is_short:
+                logger.warning(
+                    "SHORT signal rejected for %s: direct stock shorting not supported on Trading 212 Invest without inverse ETP",
+                    underlying,
+                )
+                return None
             instrument = self.t212.get_instrument_by_symbol(underlying)
             t212_ticker = instrument.ticker if instrument else f"{underlying}_US_EQ"
+
+        # Authoritative direction validation check: never execute SHORT on a LONG instrument
+        resolved_direction = self.leveraged_universe.get_etp_direction(t212_ticker)
+        if is_short and resolved_direction == "LONG":
+            logger.critical(
+                "CRITICAL SAFETY VIOLATION PREVENTED: %s is a LONG instrument, but signal direction is SHORT for %s! Rejecting trade.",
+                t212_ticker, underlying,
+            )
+            return None
 
         # ── 1b. Ingest Finnhub, Olostep, and Nixtla Provider Data ──
         try:
@@ -515,6 +538,17 @@ class Orchestrator:
         if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
             logger.info("Skipping execution for %s — decision=%s", card.ticker, card.decision)
             self._log_trade(card, executed=False, reason=card.decision)
+            return False
+
+        # ── Execution Direction Safety Check ─────────────────────
+        is_short = card.direction.upper() in ("SHORT", "SELL", "BEARISH")
+        etp_dir = self.leveraged_universe.get_etp_direction(card.trading212_ticker)
+        if is_short and etp_dir == "LONG":
+            logger.critical(
+                "CRITICAL EXECUTION SAFETY ABORT: Card requests %s for %s, but %s is a spot LONG instrument! Rejecting order placement.",
+                card.direction, card.ticker, card.trading212_ticker
+            )
+            self._log_trade(card, executed=False, reason=f"Direction mismatch: {card.trading212_ticker} is LONG but signal is SHORT")
             return False
 
         # ── System Halt Check (from Panic Flatten) ───────────────

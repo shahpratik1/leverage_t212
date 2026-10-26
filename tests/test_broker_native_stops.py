@@ -146,6 +146,48 @@ class TestBrokerNativeStops(unittest.TestCase):
 
         self.mock_t212.cancel_order.assert_called_with("stop_to_cancel_55")
 
+    def test_position_monitor_auto_heals_direction_discrepancy(self):
+        """When loading a position with mismatched direction (e.g. IONQl1_EQ marked as SHORT), auto-heal to LONG."""
+        import json
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "IONQl1_EQ": {
+                    "ticker": "IONQl1_EQ",
+                    "underlying": "IONQ",
+                    "direction": "SHORT",  # erroneous
+                    "entry_price": 1.68,
+                    "original_quantity": 1.0,
+                    "remaining_quantity": 1.0,
+                    "stop_loss": 1.80,  # inverted stop
+                    "trailing_stop_loss": 1.80,
+                    "highest_price": 1.68,
+                    "lowest_price": 1.68,
+                    "tp1": 1.50,  # inverted TP
+                    "tp2": 1.40,
+                    "tp3": 1.30,
+                    "atr": 0.05,
+                }
+            }, f)
+
+        # Create fresh monitor which calls _load_state()
+        monitor = PositionMonitor(
+            t212_client=self.mock_t212,
+            risk_manager=RiskManager(),
+            notifier=self.notifier,
+            state_file=self.state_file,
+            dry_run=True,
+        )
+
+        pos = monitor.positions.get("IONQl1_EQ")
+        self.assertIsNotNone(pos)
+        # Direction must be auto-healed to LONG
+        self.assertEqual(pos.direction, "LONG")
+        # Stop loss must be below entry for a LONG position
+        self.assertLess(pos.stop_loss, pos.entry_price)
+        # TP1 must be above entry for a LONG position
+        self.assertGreater(pos.tp1, pos.entry_price)
+
+
 
 if __name__ == "__main__":
     unittest.main()

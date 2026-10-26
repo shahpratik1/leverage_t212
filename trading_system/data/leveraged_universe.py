@@ -1495,7 +1495,7 @@ CURRENCY_ALTERNATIVES: Dict[str, Dict[str, Tuple[Optional[str], Optional[str]]]]
     "EWI": {"EUR": ("5ITLm_EQ", "5ITSm_EQ")},
     "INDA": {"EUR": ("3INDd_EQ", "None")},
     "EWY": {"EUR": ("3SKEl_EQ", "None")},
-    "IONQ": {"EUR": ("ION3a_EQ", "None")},
+    "IONQ": {"EUR": ("ION3a_EQ", "None"), "USD": ("IONQl1_EQ", "None")},
     "RGTI": {"EUR": ("RGT3a_EQ", "None")},
     "IBM": {"EUR": ("IBMd_EQ", "None"), "USD": ("IBM_US_EQ", "None")},
     "RKLB": {"EUR": ("RKL3a_EQ", "None")},
@@ -1757,6 +1757,40 @@ class LeveragedUniverse:
         """Return authoritative quote currency for an execution ticker ('GBX', 'EUR', 'USD', 'GBP')."""
         return get_ticker_currency(ticker)
 
+    def get_etp_direction(self, etp_ticker: str) -> str:
+        """Authoritatively determine if an execution ETP ticker is an inverse SHORT or LONG instrument.
+
+        Returns:
+            "SHORT" if the instrument is an inverse / short ETP.
+            "LONG" if the instrument is a long ETP or standard long equity.
+        """
+        if not etp_ticker:
+            return "LONG"
+        clean = etp_ticker.strip().upper()
+        if clean in ("NONE", "N/A"):
+            return "LONG"
+
+        # 1. Check curated pairs short tickers
+        for p in self.pairs:
+            if p.short_3x_ticker and p.short_3x_ticker != "None" and p.short_3x_ticker.upper() == clean:
+                return "SHORT"
+            if p.short_5x_ticker and p.short_5x_ticker != "None" and p.short_5x_ticker.upper() == clean:
+                return "SHORT"
+            if p.long_3x_ticker and p.long_3x_ticker.upper() == clean:
+                return "LONG"
+            if p.long_5x_ticker and p.long_5x_ticker.upper() == clean:
+                return "LONG"
+
+        # 2. Check CURRENCY_ALTERNATIVES
+        for sym, alt_dict in CURRENCY_ALTERNATIVES.items():
+            for curr, (l_tkr, s_tkr) in alt_dict.items():
+                if s_tkr and s_tkr != "None" and s_tkr.upper() == clean:
+                    return "SHORT"
+                if l_tkr and l_tkr != "None" and l_tkr.upper() == clean:
+                    return "LONG"
+
+        return "LONG"
+
 
 # ── Authoritative Currency Resolution for Trading 212 Instruments ──────────────
 # Tickers trading in British Pence / Penny (GBX / p) on the London Stock Exchange
@@ -1784,7 +1818,7 @@ USD_TICKERS = {
     'AVG3l_EQ', 'BA3Sl_EQ', 'BA3l_EQ', 'BASl_EQ', 'BID3l_EQ', 'BLC3l_EQ', 'BTC3Ss_EQ',
     'BTC3s_EQ', 'CRM3l_EQ', 'CRW3l_EQ', 'DIS3l_EQ', 'DISSl_EQ', 'ELONl_EQ', 'ETH3Ss_EQ',
     'ETH3s_EQ', 'GDMSl_EQ', 'GDX3l_EQ', 'GPTSl_EQ', 'HNX3l_EQ', 'HOD3l_EQ', 'IBM_US_EQ',
-    'INTSl_EQ', 'JPNSl_EQ', 'KLA3l_EQ', 'KWE3l_EQ', 'LLY3l_EQ', 'LLYSl_EQ', 'MAR3l_EQ',
+    'INTSl_EQ', 'IONQl1_EQ', 'JPNSl_EQ', 'KLA3l_EQ', 'KWE3l_EQ', 'LLY3l_EQ', 'LLYSl_EQ', 'MAR3l_EQ',
     'MS3Sl_EQ', 'MSF3l_EQ', 'NBI3l_EQ', 'NFL3l_EQ', 'NIO3l_EQ', 'OKL3l_EQ', 'ORC3l_EQ',
     'QBT3l_EQ', 'QCO3l_EQ', 'QQQ3l_EQ', 'QQQSl_EQ', 'RA3Sl_EQ', 'RAC3l_EQ', 'RHM3l_EQ',
     'SARKl_EQ', 'SLMSl_EQ', 'SMCIl_EQ', 'SMG3l_EQ', 'SMR3l_EQ', 'URA3l_EQ', 'URASl_EQ',
@@ -1876,3 +1910,15 @@ def format_price(price: float, currency: str = "EUR") -> str:
     """
     _, prefix, suffix = get_currency_display(currency)
     return f"{prefix}{price:.2f}{suffix}"
+
+
+_DEFAULT_UNIVERSE: Optional[LeveragedUniverse] = None
+
+
+def get_etp_direction(etp_ticker: str) -> str:
+    """Authoritative module-level helper to determine if an ETP ticker is SHORT or LONG."""
+    global _DEFAULT_UNIVERSE
+    if _DEFAULT_UNIVERSE is None:
+        _DEFAULT_UNIVERSE = LeveragedUniverse()
+    return _DEFAULT_UNIVERSE.get_etp_direction(etp_ticker)
+

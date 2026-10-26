@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.config import settings
-from trading_system.data.leveraged_universe import get_ticker_currency
+from trading_system.data.leveraged_universe import get_etp_direction, get_ticker_currency
 from trading_system.data.trading212_client import Trading212Client, Trading212Error
 from trading_system.notifications.notifier import Notifier
 
@@ -154,7 +154,13 @@ class PositionMonitor:
             TP2 = Entry +/- 2.0R (+2x SL distance)
             TP3 = Entry +/- 3.0R (+3x SL distance)
         """
-        is_short = (direction.upper() == "SHORT" and not direction.upper().endswith("_ETP"))
+        is_short = (
+            direction.upper() == "SHORT"
+            and not (
+                (ticker and (ticker.endswith("_EQ") or ticker.endswith(".L")))
+                or direction.upper().endswith("_ETP")
+            )
+        )
         entry = max(0.01, entry_price)
 
         # Resolve leverage multiplier (defaults to 3.0 for ETPs, 5.0 for 5x, 1.0 for ordinary)
@@ -745,6 +751,16 @@ class PositionMonitor:
                     pos.highest_price = max(pos.highest_price or cur_px, cur_px)
                     pos.lowest_price = min(pos.lowest_price or cur_px, cur_px)
 
+                # Authoritative direction verification
+                authoritative_dir = get_etp_direction(ticker)
+                if authoritative_dir and pos.direction != authoritative_dir:
+                    logger.warning(
+                        "Reconciliation: fixing direction discrepancy for %s: %s -> %s",
+                        ticker, pos.direction, authoritative_dir,
+                    )
+                    pos.direction = authoritative_dir
+                    self._save_state()
+
                 # Ingest real market ATR and indicators into existing position if active_metrics supplied
                 if active_metrics:
                     m = active_metrics.get(pos.underlying) or active_metrics.get(ticker)
@@ -844,9 +860,7 @@ class PositionMonitor:
                     univ = LeveragedUniverse()
                     pair = univ.get_pair_for_etp(b_ticker)
                     underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
-                    direction = "LONG"
-                    if pair and (b_ticker == pair.short_3x_ticker or b_ticker == pair.short_5x_ticker):
-                        direction = "SHORT"
+                    direction = univ.get_etp_direction(b_ticker)
 
                     avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
                     cur_px = bp.current_price if bp.current_price > 0 else avg_px
@@ -1847,6 +1861,23 @@ class PositionMonitor:
                     if not pos.currency or (pos.currency == "EUR" and resolved_curr != "EUR"):
                         pos.currency = resolved_curr
                     if pos.currency != data.get("currency"):
+                        state_updated = True
+
+                    # Auto-heal direction discrepancy (e.g. spot Long ETP marked as SHORT)
+                    authoritative_dir = get_etp_direction(pos.ticker)
+                    if authoritative_dir and pos.direction != authoritative_dir:
+                        logger.warning(
+                            "Auto-healed direction discrepancy for %s: changed %s -> %s",
+                            pos.ticker, pos.direction, authoritative_dir,
+                        )
+                        pos.direction = authoritative_dir
+                        if pos.direction == "LONG" and pos.stop_loss >= pos.entry_price > 0:
+                            levels = self.calculate_exit_levels(entry_price=pos.entry_price, direction="LONG", ticker=pos.ticker)
+                            pos.stop_loss = levels["stop_loss"]
+                            pos.trailing_stop_loss = levels["trailing_stop_loss"]
+                            pos.tp1 = levels["tp1"]
+                            pos.tp2 = levels["tp2"]
+                            pos.tp3 = levels["tp3"]
                         state_updated = True
 
                     # Auto-heal underlying scale contamination (e.g. tp1 computed on underlying index)
