@@ -731,6 +731,7 @@ class PositionMonitor:
                                 quantity=pos.original_quantity,
                                 realized_pnl=0.0,
                                 realized_pnl_pct=0.0,
+                                direction=pos.direction,
                                 is_tsl=False,
                                 details="Reconciliation: Position closed on broker (Native stop hit, limit filled, or manual close)",
                             )

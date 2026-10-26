@@ -316,6 +316,85 @@ def load_recent_notifications(log_path: str = "notifications.jsonl", limit: int 
         return []
 
 
+def fetch_live_broker_notifications(
+    client: Any, universe: Any, limit: int = 25
+) -> List[Dict[str, Any]]:
+    """Fetch live executed and filled orders from Trading 212 and format as notifications."""
+    try:
+        hist = client.get_historical_orders(limit=limit)
+        items = (
+            hist.get("items", [])
+            if isinstance(hist, dict)
+            else (hist if isinstance(hist, list) else [])
+        )
+        broker_events = []
+        for it in items:
+            order = it.get("order", {})
+            fill = it.get("fill", {})
+            ticker = order.get("ticker", "")
+            if not ticker:
+                continue
+
+            order_id = str(order.get("id", ""))
+            fill_id = str(fill.get("id", ""))
+            o_side = (order.get("side") or "").upper()
+            o_type = (order.get("type") or "").upper()
+            o_status = (order.get("status") or "").upper()
+            filled_at = fill.get("filledAt") or order.get("createdAt") or ""
+            fill_px = float(fill.get("price") or order.get("stopPrice") or 0.0)
+            fill_qty = abs(float(fill.get("quantity") or order.get("filledQuantity") or 0.0))
+
+            wallet_impact = fill.get("walletImpact", {}) or {}
+            realized_pnl = wallet_impact.get("realisedProfitLoss")
+            pnl_val = float(realized_pnl) if realized_pnl is not None else None
+            currency = wallet_impact.get("currency") or order.get("currency") or universe.get_ticker_currency(ticker)
+
+            pair = universe.get_pair_for_etp(ticker)
+            underlying = pair.underlying_symbol if pair else ticker.replace("3", "").replace("5", "").split("_")[0]
+
+            if o_side == "BUY":
+                ev = "BUY"
+                direction = "LONG"
+                rationale = f"Live T212 Market Fill #{fill_id or order_id}"
+            else:
+                direction = "SHORT"
+                if "STOP" in o_type:
+                    ev = "SL" if (pnl_val is not None and pnl_val < 0) else "TSL"
+                    rationale = f"Live T212 Stop Order Executed #{order_id}"
+                elif "LIMIT" in o_type:
+                    ev = "TP1" if (pnl_val is not None and pnl_val > 0) else "SELL"
+                    rationale = f"Live T212 Limit Target Filled #{order_id}"
+                else:
+                    ev = "SELL"
+                    rationale = f"Live T212 Exit Order Filled #{order_id}"
+
+            ts_str = filled_at.replace("T", " ").replace(".000Z", " UTC").replace("Z", " UTC")
+            if not ts_str.endswith("UTC"):
+                ts_str += " UTC"
+
+            broker_events.append({
+                "event_type": ev,
+                "ticker": ticker,
+                "underlying": underlying,
+                "direction": direction,
+                "price": fill_px,
+                "quantity": fill_qty,
+                "stop_loss": float(order.get("stopPrice") or 0.0),
+                "trailing_stop": float(order.get("stopPrice") or 0.0),
+                "tp1": 0.0, "tp2": 0.0, "tp3": 0.0,
+                "pnl": pnl_val,
+                "pnl_pct": None,
+                "rationale": rationale,
+                "timestamp": ts_str,
+                "currency": currency,
+                "order_id": order_id,
+            })
+        return broker_events
+    except Exception as exc:
+        logger.debug("Failed to fetch live broker notifications: %s", exc)
+        return []
+
+
 _DASHBOARD_DATA_CACHE: Optional[Dict[str, Any]] = None
 _DASHBOARD_DATA_CACHE_TIME: float = 0.0
 _DASHBOARD_DATA_LOCK = threading.Lock()
@@ -452,7 +531,28 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                     })
 
         history = load_recent_history(settings.TRADES_LOG_PATH)
-        recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH)
+        recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH, limit=30)
+
+        # Merge live broker order executions from Trading 212
+        if client is not None:
+            broker_events = fetch_live_broker_notifications(client, universe, limit=25)
+            if broker_events:
+                seen_orders = set()
+                merged_events = []
+                for b_ev in broker_events:
+                    oid = b_ev.get("order_id")
+                    if oid:
+                        seen_orders.add(oid)
+                    merged_events.append(b_ev)
+                for n in recent_notifications:
+                    n_oid = str(n.get("order_id") or "")
+                    if n_oid and n_oid in seen_orders:
+                        continue
+                    merged_events.append(n)
+                # Sort chronologically descending
+                merged_events.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+                recent_notifications = merged_events[:30]
+
         active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
 
         res = {

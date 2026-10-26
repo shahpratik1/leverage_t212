@@ -804,6 +804,28 @@ class Trading212Client:
         self._orders_cache_time = now
         return data
 
+    def get_historical_orders(self, limit: int = 50, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get historical filled, cancelled, or rejected orders from Trading 212."""
+        now = time.time()
+        if (
+            not force_refresh
+            and hasattr(self, "_history_orders_cache")
+            and self._history_orders_cache is not None
+            and (now - getattr(self, "_history_orders_cache_time", 0.0)) < 15.0
+        ):
+            return self._history_orders_cache
+
+        try:
+            data = self._request("GET", f"/equity/history/orders?limit={limit}")
+            if not isinstance(data, dict):
+                data = {"items": []}
+            self._history_orders_cache = data
+            self._history_orders_cache_time = now
+            return data
+        except Exception as exc:
+            logger.warning("Failed to fetch historical orders: %s", exc)
+            return {"items": []}
+
     def get_instruments(self, force_refresh: bool = False) -> List[Instrument]:
         """Get all tradeable instruments, cached in memory (1h) and on disk (24h)."""
         now = time.time()
@@ -1482,8 +1504,9 @@ class MarketDataProvider:
                     l = float(row.get("Low", 0))
                     v_raw = row.get("Volume", 0)
                     v = float(v_raw) if v_raw and v_raw != "-" else 0.0
+                    dt = row.get("Date", "")
                     if c > 0 and o > 0:
-                        candles.append({"open": o, "high": h, "low": l, "close": c, "volume": v})
+                        candles.append({"date": dt, "open": o, "high": h, "low": l, "close": c, "volume": v})
                 except (ValueError, KeyError):
                     continue
             candles.reverse()
@@ -1554,12 +1577,14 @@ class MarketDataProvider:
                 data = json.loads(resp.read().decode("utf-8"))
             result = data["chart"]["result"][0]
             quotes = result["indicators"]["quote"][0]
+            timestamps = result.get("timestamp", [])
             candles = []
-            for o, h, l, c, v in zip(
-                quotes["open"], quotes["high"], quotes["low"], quotes["close"], quotes.get("volume", [0] * len(quotes["close"]))
+            for ts, o, h, l, c, v in zip(
+                timestamps, quotes["open"], quotes["high"], quotes["low"], quotes["close"], quotes.get("volume", [0] * len(quotes["close"]))
             ):
                 if c is not None and o is not None and h is not None and l is not None:
-                    candles.append({"open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v or 0)})
+                    dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d" if interval == "1d" else "%Y-%m-%d %H:%M:%S")
+                    candles.append({"date": dt_str, "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v or 0)})
             if candles:
                 return candles
         except Exception as exc:
@@ -1568,7 +1593,7 @@ class MarketDataProvider:
 
     @staticmethod
     def get_daily_candles(symbol: str, period: str = "1y", force_refresh: bool = False) -> Any:
-        """Get daily OHLCV candles across yfinance, Yahoo Chart, Stooq, Polygon, Finnhub, or synthetic fallback."""
+        """Get daily OHLCV candles with persistent CandleDatabase caching and incremental delta fetching."""
         try:
             from trading_system.config import settings
             use_cache = getattr(settings, "ENABLE_CANDLE_CACHE", True)
@@ -1583,7 +1608,6 @@ class MarketDataProvider:
             if time.time() - ts < ttl:
                 return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
 
-        result = None
         clean_upper = symbol.upper().strip()
         yahoo_translations = {
             "COFF": "KC=F",
@@ -1604,27 +1628,63 @@ class MarketDataProvider:
         }
         query_sym = yahoo_translations.get(clean_upper, symbol)
 
+        # ── Fast-path: Check persistent CandleDatabase ──
+        fetch_period = period
+        try:
+            from trading_system.data.candle_db import CandleDatabase
+            cdb = CandleDatabase.get_instance()
+            stored_count = cdb.get_candle_count(clean_upper, "1d")
+            latest_date = cdb.get_latest_date(clean_upper, "1d")
+            today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            # If today's candle is already in local SQLite database, return immediately (0 API calls)
+            if stored_count >= 30 and not force_refresh and latest_date and latest_date >= today_utc:
+                candles = cdb.get_candles(clean_upper, "1d", limit=250)
+                if candles:
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                    MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
+                    MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                    if HAS_DATA_LIBS and pd is not None:
+                        result = pd.DataFrame(candles)[["open", "high", "low", "close", "volume"]]
+                    else:
+                        result = candles
+                    if use_cache and result is not None:
+                        MarketDataProvider._CANDLE_CACHE[cache_key] = (
+                            time.time(),
+                            result.copy() if hasattr(result, "copy") else [dict(x) for x in result],
+                        )
+                    return result
+
+            # If we have substantial history, fetch ONLY the recent missing delta (5d instead of 1y)
+            if stored_count >= 30 and not force_refresh and latest_date and period == "1y":
+                fetch_period = "5d"
+        except Exception as cdb_err:
+            logger.debug("Candle DB check failed for %s: %s", clean_upper, cdb_err)
+            fetch_period = period
+
+        result = None
+
         # 1. Try yfinance if installed
         if HAS_DATA_LIBS and yf is not None:
             try:
                 ticker = yf.Ticker(query_sym)
-                df = ticker.history(period=period, interval="1d")
+                df = ticker.history(period=fetch_period, interval="1d")
                 if not df.empty:
                     df.reset_index(inplace=True)
                     df.rename(
-                        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
+                        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume", "Date": "date"},
                         inplace=True,
                     )
                     MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
                     MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
                     MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                    result = df[["open", "high", "low", "close", "volume"]]
+                    result = df
             except Exception as yf_exc:
                 logger.debug("yfinance history failed for %s (%s)", query_sym, yf_exc)
 
         # 2. Try raw Yahoo Finance Chart API
         if result is None:
-            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str="1y", interval="1d")
+            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str=fetch_period, interval="1d")
             if candles:
                 MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
                 MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
@@ -1668,22 +1728,52 @@ class MarketDataProvider:
             except Exception:
                 pass
 
+        # Merge newly fetched candles into CandleDatabase
+        if result is not None and not MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC:
+            try:
+                from trading_system.data.candle_db import CandleDatabase
+                cdb = CandleDatabase.get_instance()
+                if HAS_DATA_LIBS and pd is not None and isinstance(result, pd.DataFrame):
+                    records = result.to_dict(orient="records")
+                    if "date" not in result.columns and hasattr(result, "index"):
+                        for idx, rec in enumerate(records):
+                            rec["date"] = str(result.index[idx]).split(" ")[0]
+                else:
+                    records = result if isinstance(result, list) else []
+
+                if records:
+                    cdb.upsert_candles(clean_upper, "1d", records)
+                    merged = cdb.get_candles(clean_upper, "1d", limit=250)
+                    if merged and len(merged) >= len(records):
+                        if HAS_DATA_LIBS and pd is not None:
+                            result = pd.DataFrame(merged)[["open", "high", "low", "close", "volume"]]
+                        else:
+                            result = merged
+            except Exception as upsert_exc:
+                logger.debug("Candle DB upsert failed for %s: %s", clean_upper, upsert_exc)
+
         # 6. Fallback to synthetic candles (tagged as synthetic for safety)
         if result is None:
             MarketDataProvider.SYNTHETIC_TICKERS.add(symbol.upper())
             MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = True
             result = MarketDataProvider._generate_synthetic_candles(symbol, range_str="1y", interval="1d")
 
-        if use_cache and result is not None:
+        # Format final output
+        if HAS_DATA_LIBS and pd is not None and isinstance(result, pd.DataFrame):
+            final_output = result[["open", "high", "low", "close", "volume"]] if all(c in result.columns for c in ["open", "high", "low", "close", "volume"]) else result
+        else:
+            final_output = result
+
+        if use_cache and final_output is not None:
             MarketDataProvider._CANDLE_CACHE[cache_key] = (
                 time.time(),
-                result.copy() if hasattr(result, "copy") else [dict(x) for x in result],
+                final_output.copy() if hasattr(final_output, "copy") else [dict(x) for x in final_output],
             )
-        return result
+        return final_output
 
     @staticmethod
     def get_hourly_candles(symbol: str, period: str = "1mo", force_refresh: bool = False) -> Any:
-        """Get 1H OHLCV candles."""
+        """Get 1H OHLCV candles with persistent CandleDatabase caching and delta fetching."""
         try:
             from trading_system.config import settings
             use_cache = getattr(settings, "ENABLE_CANDLE_CACHE", True)
@@ -1698,7 +1788,6 @@ class MarketDataProvider:
             if time.time() - ts < ttl:
                 return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
 
-        result = None
         clean_upper = symbol.upper().strip()
         yahoo_translations = {
             "COFF": "KC=F",
@@ -1719,34 +1808,78 @@ class MarketDataProvider:
         }
         query_sym = yahoo_translations.get(clean_upper, symbol)
 
+        # ── Fast-path: Check persistent CandleDatabase ──
+        fetch_period = period
+        try:
+            from trading_system.data.candle_db import CandleDatabase
+            cdb = CandleDatabase.get_instance()
+            stored_count = cdb.get_candle_count(clean_upper, "1h")
+            latest_date = cdb.get_latest_date(clean_upper, "1h")
+            # If we have substantial history (>= 40 hourly candles), fetch only 5d delta
+            if stored_count >= 40 and not force_refresh and latest_date:
+                fetch_period = "5d"
+        except Exception:
+            fetch_period = period
+
+        result = None
+
         if HAS_DATA_LIBS and yf is not None:
             try:
                 ticker = yf.Ticker(query_sym)
-                df = ticker.history(period=period, interval="1h")
+                df = ticker.history(period=fetch_period, interval="1h")
                 if not df.empty:
                     df.reset_index(inplace=True)
                     df.rename(
-                        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"},
+                        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume", "Datetime": "date", "Date": "date"},
                         inplace=True,
                     )
-                    result = df[["open", "high", "low", "close", "volume"]]
+                    result = df
             except Exception:
                 pass
 
         if result is None:
-            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str="1mo", interval="1h")
+            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str=fetch_period, interval="1h")
             if candles:
                 result = candles
+
+        # Merge newly fetched hourly candles into CandleDatabase
+        if result is not None:
+            try:
+                from trading_system.data.candle_db import CandleDatabase
+                cdb = CandleDatabase.get_instance()
+                if HAS_DATA_LIBS and pd is not None and isinstance(result, pd.DataFrame):
+                    records = result.to_dict(orient="records")
+                    if "date" not in result.columns and hasattr(result, "index"):
+                        for idx, rec in enumerate(records):
+                            rec["date"] = str(result.index[idx])
+                else:
+                    records = result if isinstance(result, list) else []
+
+                if records:
+                    cdb.upsert_candles(clean_upper, "1h", records)
+                    merged = cdb.get_candles(clean_upper, "1h", limit=120)
+                    if merged and len(merged) >= len(records):
+                        if HAS_DATA_LIBS and pd is not None:
+                            result = pd.DataFrame(merged)[["open", "high", "low", "close", "volume"]]
+                        else:
+                            result = merged
+            except Exception as upsert_exc:
+                logger.debug("Hourly Candle DB upsert failed for %s: %s", clean_upper, upsert_exc)
 
         if result is None:
             result = MarketDataProvider._generate_synthetic_candles(symbol, range_str="1mo", interval="1h")
 
-        if use_cache and result is not None:
+        if HAS_DATA_LIBS and pd is not None and isinstance(result, pd.DataFrame):
+            final_output = result[["open", "high", "low", "close", "volume"]] if all(c in result.columns for c in ["open", "high", "low", "close", "volume"]) else result
+        else:
+            final_output = result
+
+        if use_cache and final_output is not None:
             MarketDataProvider._CANDLE_CACHE[cache_key] = (
                 time.time(),
-                result.copy() if hasattr(result, "copy") else [dict(x) for x in result],
+                final_output.copy() if hasattr(final_output, "copy") else [dict(x) for x in final_output],
             )
-        return result
+        return final_output
 
     @staticmethod
     def _generate_synthetic_candles(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Dict[str, float]]:

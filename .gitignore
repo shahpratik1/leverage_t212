@@ -14,3 +14,6 @@ env/
 .t212_instruments_cache.json*
 .context/
 notifications.jsonl
+*.db
+*.db-*
+data/*.db*

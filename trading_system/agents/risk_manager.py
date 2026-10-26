@@ -362,21 +362,19 @@ class RiskManager:
         atr = metrics.get("atr", 0.0)
         realized_vol = metrics.get("realized_vol")
 
-        # Policy: if 5x exists or is passed, replace it with 3x (cap at MAX_LEVERAGE = 3)
+        # Policy: If 5x exists for this asset, prioritize 5x completely over 3x
         from trading_system.data.leveraged_universe import LeveragedUniverse
+        from trading_system.config import settings
         universe = LeveragedUniverse()
-        sanitized_t212_ticker = universe.replace_5x_ticker(trading212_ticker)
-        if sanitized_t212_ticker == trading212_ticker:
-            pair = universe.get_pair_for_underlying(ticker)
-            if pair:
-                replacement = universe.get_execution_ticker(ticker, direction, leverage=3)
-                if replacement:
-                    sanitized_t212_ticker = replacement
+        has_5x = universe.has_5x_leverage(ticker, direction)
+        enable_5x = getattr(settings, "ENABLE_5X_LEVERAGE", True)
 
-        raw_leverage = leverage if leverage is not None else (
-            5 if any(x in trading212_ticker for x in ("5l_EQ", "5Y", "5S", "5E", "5x", "5QQQ", "5SPY")) else 3
-        )
-        resolved_leverage = 3 if raw_leverage >= 5 else raw_leverage
+        if has_5x and enable_5x and (leverage is None or leverage >= 5):
+            resolved_leverage = 5
+            sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=5) or trading212_ticker
+        else:
+            resolved_leverage = 3
+            sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=3) or trading212_ticker
 
         stop_loss = self.calculate_stop_loss(entry_price, atr, direction=direction)
         stop_distance_pct = (
@@ -478,13 +476,9 @@ class RiskManager:
                 )
 
         from trading_system.config import settings
-        max_allowed_leverage = getattr(settings, "MAX_LEVERAGE", 3)
+        max_allowed_leverage = getattr(settings, "MAX_LEVERAGE", 5)
         if card.leverage > max_allowed_leverage:
             return False, f"Leverage {card.leverage}x exceeds maximum allowed cap of {max_allowed_leverage}x"
-
-        # Check for prohibited 5x execution tickers
-        if any(x in card.trading212_ticker for x in ("5l_EQ", "5Yl_EQ", "5Sl_EQ", "5El_EQ", "5x", "QQQ5", "SP5Y", "GLD5", "TLT5", "DAX5", "5UKX", "5SX5")):
-            return False, f"Prohibited 5x execution ticker detected: {card.trading212_ticker}"
 
         if card.position_notional > account_cash:
             return False, f"Insufficient free capital (${account_cash:.2f} < ${card.position_notional:.2f})"

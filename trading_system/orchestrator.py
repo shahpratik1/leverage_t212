@@ -412,10 +412,11 @@ class Orchestrator:
             )
             return None
 
-        # ── 1. Map to Leveraged Execution Ticker (3x) ──────
+        # ── 1. Map to Leveraged Execution Ticker (5x if available, else 3x) ──────
         if settings.USE_LEVERAGED_3X:
-            # Policy: if 5x exists, replace it with 3x
-            target_leverage = 3
+            # Policy: if 5x exists, prioritize 5x completely over 3x
+            has_5x = self.leveraged_universe.has_5x_leverage(underlying, direction)
+            target_leverage = 5 if (has_5x and getattr(settings, "ENABLE_5X_LEVERAGE", True)) else 3
             t212_ticker = self.leveraged_universe.get_execution_ticker(underlying, direction, leverage=target_leverage)
             if not t212_ticker:
                 logger.warning("No paired %dx %s ETP found for %s — using standard mapping", target_leverage, direction, underlying)
@@ -490,7 +491,7 @@ class Orchestrator:
                 debate_outcome=outcome,
                 account_equity=account_equity,
                 strategy_type=strategy_type,
-                leverage=3 if settings.USE_LEVERAGED_3X else 1,
+                leverage=target_leverage if settings.USE_LEVERAGED_3X else 1,
             )
 
             logger.info("Decision card generated:\n%s", self.risk_manager.format_decision_card(card))

@@ -1637,26 +1637,28 @@ class LeveragedUniverse:
     def get_available_leverage_multipliers(self, underlying: str) -> List[int]:
         """Return supported leverage multipliers for an asset.
 
-        Policy: If 5x exists on the asset, it is replaced with 3x, so available leverage is [3].
+        Policy: If 5x exists on the asset, it completely replaces 3x, so available leverage is [5].
+        Otherwise, standard 3x is supported [3].
         """
         pair = self.get_pair_for_underlying(underlying)
         if not pair:
             return [1]
-        return [3]
+        return [5] if pair.has_5x else [3]
 
     def get_execution_ticker(
         self,
         underlying: str,
         direction: str,
-        leverage: int = 3,
+        leverage: Optional[int] = None,
         preferred_currency: str = "EUR",
     ) -> Optional[str]:
         """Given an underlying symbol, direction ('LONG' or 'SHORT'), and desired leverage (3 or 5),
         return the appropriate Trading 212 execution ticker prioritizing EUR as first preference.
 
         Policy:
-        1. If 5x is requested or exists for this asset, it is replaced with 3x ETP.
-        2. If preferred_currency is specified (default 'EUR'), return that currency's ticker if available.
+        1. If 5x is available for this asset (pair.has_5x), return the 5x ETP (replacing 3x completely).
+        2. If 5x is not available, return the 3x ETP.
+        3. If preferred_currency is specified (default 'EUR'), return that currency's ticker if available.
         """
         pair = self.get_pair_for_underlying(underlying)
         if not pair:
@@ -1665,6 +1667,13 @@ class LeveragedUniverse:
         direction_upper = direction.upper()
         is_long = direction_upper in ("LONG", "BUY", "BULLISH")
         is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
+
+        # 5x Resolution: If pair has 5x and leverage is not explicitly forced to 3
+        if pair.has_5x and (leverage is None or leverage >= 5):
+            if is_long and pair.long_5x_ticker:
+                return pair.long_5x_ticker
+            elif is_short and pair.short_5x_ticker and pair.short_5x_ticker != "None":
+                return pair.short_5x_ticker
 
         # Check currency alternatives if non-default currency requested or to match preference
         sym = pair.underlying_symbol.upper()
@@ -1729,13 +1738,19 @@ class LeveragedUniverse:
         return "General Equity"
 
     def get_all_execution_tickers(self) -> List[str]:
-        """Return list of all active Trading 212 execution tickers (3x only per policy)."""
+        """Return list of all active Trading 212 execution tickers (prioritizing 5x when available, else 3x)."""
         tickers = []
         for p in self.pairs:
-            if p.long_3x_ticker:
-                tickers.append(p.long_3x_ticker)
-            if p.short_3x_ticker and p.short_3x_ticker != "None":
-                tickers.append(p.short_3x_ticker)
+            if p.has_5x:
+                if p.long_5x_ticker:
+                    tickers.append(p.long_5x_ticker)
+                if p.short_5x_ticker and p.short_5x_ticker != "None":
+                    tickers.append(p.short_5x_ticker)
+            else:
+                if p.long_3x_ticker:
+                    tickers.append(p.long_3x_ticker)
+                if p.short_3x_ticker and p.short_3x_ticker != "None":
+                    tickers.append(p.short_3x_ticker)
         return list(dict.fromkeys(tickers))
 
     def get_ticker_currency(self, ticker: str) -> str:

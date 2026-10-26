@@ -168,6 +168,78 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertIn("broker_status", payload)
         self.assertIn("pairs_watchlist", payload)
 
+    def test_fetch_live_broker_notifications(self):
+        """Verify historical orders from Trading 212 format into live notification stream."""
+        from trading_system.dashboard.server import fetch_live_broker_notifications
+        from trading_system.data.leveraged_universe import LeveragedUniverse
+
+        mock_client = MagicMock()
+        mock_client.get_historical_orders.return_value = {
+            "items": [
+                {
+                    "order": {
+                        "id": 57100172148,
+                        "type": "MARKET",
+                        "ticker": "IONQl1_EQ",
+                        "quantity": 1.0,
+                        "filledQuantity": 1.0,
+                        "status": "FILLED",
+                        "currency": "EUR",
+                        "side": "BUY",
+                        "createdAt": "2026-10-26T10:50:22.000Z",
+                    },
+                    "fill": {
+                        "id": 57100172150,
+                        "quantity": 1.0,
+                        "price": 1.678,
+                        "type": "TRADE",
+                        "filledAt": "2026-10-26T10:50:23.000Z",
+                        "walletImpact": {"currency": "EUR", "realisedProfitLoss": None},
+                    },
+                },
+                {
+                    "order": {
+                        "id": 57100160996,
+                        "type": "STOP",
+                        "ticker": "3LFEl_EQ",
+                        "quantity": -1.0,
+                        "filledQuantity": -1.0,
+                        "stopPrice": 25.72,
+                        "status": "FILLED",
+                        "currency": "EUR",
+                        "side": "SELL",
+                        "createdAt": "2026-10-26T08:05:49.000Z",
+                    },
+                    "fill": {
+                        "id": 57100172056,
+                        "quantity": -1.0,
+                        "price": 25.58,
+                        "type": "TRADE",
+                        "filledAt": "2026-10-26T10:42:36.000Z",
+                        "walletImpact": {"currency": "EUR", "realisedProfitLoss": -2.0},
+                    },
+                },
+            ]
+        }
+        universe = LeveragedUniverse()
+        events = fetch_live_broker_notifications(mock_client, universe, limit=10)
+        self.assertEqual(len(events), 2)
+
+        # Check Buy event
+        buy_ev = events[0]
+        self.assertEqual(buy_ev["event_type"], "BUY")
+        self.assertEqual(buy_ev["ticker"], "IONQl1_EQ")
+        self.assertEqual(buy_ev["price"], 1.678)
+        self.assertEqual(buy_ev["quantity"], 1.0)
+        self.assertIn("Live T212", buy_ev["rationale"])
+
+        # Check Stop Sell event with realized loss
+        sl_ev = events[1]
+        self.assertEqual(sl_ev["event_type"], "SL")
+        self.assertEqual(sl_ev["ticker"], "3LFEl_EQ")
+        self.assertEqual(sl_ev["price"], 25.58)
+        self.assertEqual(sl_ev["pnl"], -2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

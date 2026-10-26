@@ -181,6 +181,7 @@ class Settings:
     ENABLE_DESKTOP_NOTIFICATIONS: bool = True
     NOTIFICATIONS_LOG_PATH: str = "notifications.jsonl"
     ACTIVE_TRADES_PATH: str = "active_trades.json"
+    CANDLE_DB_PATH: str = "data/candles.db"
 
     # Embedded Dashboard Server
     ENABLE_EMBEDDED_DASHBOARD: bool = True
@@ -190,9 +191,9 @@ class Settings:
     USE_LEVERAGED_3X: bool = True
     ENABLE_CRYPTO_3X: bool = True
     ENABLE_COMMODITIES_3X: bool = True
-    ENABLE_5X_LEVERAGE: bool = False  # Policy: if 5x exists then replace it with 3x
-    PREFER_5X_LEVERAGE: bool = False
-    MAX_LEVERAGE: int = 3  # Maximum allowed leverage multiplier (strict 3x cap)
+    ENABLE_5X_LEVERAGE: bool = True  # Prioritize 5x leverage when available on Trading 212
+    PREFER_5X_LEVERAGE: bool = True
+    MAX_LEVERAGE: int = 5  # Allow up to 5x leverage when 5x ETP exists
     LOG_LEVEL: str = "INFO"
     TRADES_LOG_PATH: str = "trades.jsonl"
     UNIVERSE_SIZE: int = 100

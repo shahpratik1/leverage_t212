@@ -279,6 +279,37 @@ class Notifier:
         )
         self.dispatch(note)
 
+    def notify_stop_loss(
+        self,
+        ticker: str,
+        underlying: str,
+        price: float,
+        quantity: float,
+        realized_pnl: float = 0.0,
+        realized_pnl_pct: float = 0.0,
+        direction: str = "LONG",
+        is_tsl: bool = False,
+        details: str = "",
+    ) -> None:
+        """Send a Stop Loss / Position Closure notification."""
+        note = TradeNotification(
+            event_type="SL",
+            ticker=ticker,
+            underlying=underlying,
+            direction=direction,
+            price=price,
+            quantity=quantity,
+            stop_loss=price,
+            trailing_stop=price,
+            tp1=0.0,
+            tp2=0.0,
+            tp3=0.0,
+            pnl=realized_pnl,
+            pnl_pct=realized_pnl_pct,
+            rationale=details or f"Stop Loss triggered at ${price:.2f}. Position closed.",
+        )
+        self.dispatch(note)
+
     def notify_tsl(
         self,
         ticker: str,
