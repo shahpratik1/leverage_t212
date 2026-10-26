@@ -73,10 +73,6 @@ class CandleDatabase:
                         PRIMARY KEY (symbol, timeframe, date)
                     ) WITHOUT ROWID;
                 """)
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_symbol_tf_date
-                    ON candles (symbol, timeframe, date);
-                """)
 
     def get_latest_date(self, symbol: str, timeframe: str = "1d") -> Optional[str]:
         """Return the ISO date string of the most recent candle for (symbol, timeframe)."""
