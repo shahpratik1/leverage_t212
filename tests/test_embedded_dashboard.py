@@ -231,6 +231,8 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertEqual(buy_ev["ticker"], "IONQl1_EQ")
         self.assertEqual(buy_ev["price"], 1.678)
         self.assertEqual(buy_ev["quantity"], 1.0)
+        self.assertIsNone(buy_ev["pnl"])
+        self.assertIsNone(buy_ev["pnl_pct"])
         self.assertIn("Live T212", buy_ev["rationale"])
 
         # Check Stop Sell event with realized loss
@@ -238,7 +240,9 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertEqual(sl_ev["event_type"], "SL")
         self.assertEqual(sl_ev["ticker"], "3LFEl_EQ")
         self.assertEqual(sl_ev["price"], 25.58)
+        self.assertEqual(sl_ev["quantity"], 1.0)
         self.assertEqual(sl_ev["pnl"], -2.0)
+        self.assertEqual(sl_ev["pnl_pct"], -7.25)
 
 
 if __name__ == "__main__":

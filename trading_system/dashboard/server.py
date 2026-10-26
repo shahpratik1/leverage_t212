@@ -347,9 +347,34 @@ def fetch_live_broker_notifications(
             wallet_impact = fill.get("walletImpact", {}) or {}
             realized_pnl = wallet_impact.get("realisedProfitLoss")
             pnl_val = float(realized_pnl) if realized_pnl is not None else None
-            currency = wallet_impact.get("currency") or order.get("currency") or universe.get_ticker_currency(ticker)
+            net_val = float(wallet_impact.get("netValue") or 0.0)
 
-            pair = universe.get_pair_for_etp(ticker)
+            pnl_currency = wallet_impact.get("currency") or "EUR"
+            instrument_currency = (
+                order.get("instrument", {}).get("currency")
+                or (universe.get_ticker_currency(ticker) if universe else None)
+                or order.get("currency")
+                or "EUR"
+            )
+
+            pnl_pct_val: Optional[float] = None
+            if pnl_val is not None:
+                # If netValue is provided by broker, cost basis = netValue - realized_pnl
+                if net_val > 0:
+                    cost_basis = net_val - pnl_val
+                    if cost_basis > 0:
+                        pnl_pct_val = round((pnl_val / cost_basis) * 100.0, 2)
+                    else:
+                        pnl_pct_val = round((pnl_val / net_val) * 100.0, 2)
+                elif fill_px > 0 and fill_qty > 0:
+                    exit_notional = fill_px * fill_qty
+                    cost_basis = exit_notional - pnl_val
+                    if cost_basis > 0:
+                        pnl_pct_val = round((pnl_val / cost_basis) * 100.0, 2)
+                    else:
+                        pnl_pct_val = round((pnl_val / exit_notional) * 100.0, 2)
+
+            pair = universe.get_pair_for_etp(ticker) if universe else None
             underlying = pair.underlying_symbol if pair else ticker.replace("3", "").replace("5", "").split("_")[0]
 
             if o_side == "BUY":
@@ -383,10 +408,11 @@ def fetch_live_broker_notifications(
                 "trailing_stop": float(order.get("stopPrice") or 0.0),
                 "tp1": 0.0, "tp2": 0.0, "tp3": 0.0,
                 "pnl": pnl_val,
-                "pnl_pct": None,
+                "pnl_pct": pnl_pct_val,
                 "rationale": rationale,
                 "timestamp": ts_str,
-                "currency": currency,
+                "currency": instrument_currency,
+                "pnl_currency": pnl_currency,
                 "order_id": order_id,
             })
         return broker_events
@@ -1178,16 +1204,58 @@ def generate_html_dashboard(output_path: str) -> str:
           nSuffix = '';
         }}
 
+        const pnlCode = (n.pnl_currency || 'EUR').toUpperCase();
+        let pnlPrefix = '€';
+        let pnlSuffix = '';
+        if (pnlCode === 'USD') {{
+          pnlPrefix = '$';
+        }} else if (pnlCode === 'GBP') {{
+          pnlPrefix = '£';
+        }} else if (pnlCode === 'GBX') {{
+          pnlPrefix = '';
+          pnlSuffix = 'p';
+        }}
+
+        const qty = (n.quantity !== null && n.quantity !== undefined && Number(n.quantity) > 0)
+          ? Number(n.quantity)
+          : null;
         const pnl = (n.pnl !== null && n.pnl !== undefined) ? Number(n.pnl) : null;
-        const pnlPct = (n.pnl_pct !== null && n.pnl_pct !== undefined) ? Number(n.pnl_pct) : null;
-        let pnlText = '—';
+        let pnlPct = (n.pnl_pct !== null && n.pnl_pct !== undefined) ? Number(n.pnl_pct) : null;
+
+        // If pnlPct is not provided but pnl, price and quantity exist, calculate dynamically
+        if (pnl !== null && pnlPct === null && n.price && qty && Number(n.price) > 0) {{
+          const exitNotional = Number(n.price) * qty;
+          const costBasis = exitNotional - pnl;
+          if (costBasis > 0) {{
+            pnlPct = (pnl / costBasis) * 100.0;
+          }} else if (exitNotional > 0) {{
+            pnlPct = (pnl / exitNotional) * 100.0;
+          }}
+        }}
+
+        const qtyDisplay = qty !== null ? `${{qty.toFixed(2)}} shs` : '—';
+        let pnlDisplay = '';
         if (pnl !== null) {{
           const color = pnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
           const sign = pnl >= 0 ? '+' : '-';
-          pnlText = `<span class="${{color}} font-bold">${{sign}}${{nPrefix}}${{Math.abs(pnl).toFixed(2)}}${{nSuffix}} (${{pnlPct !== null ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) : '0.00'}}%)</span>`;
-        }} else if (n.quantity) {{
-          pnlText = `<span class="text-slate-400">${{Number(n.quantity).toFixed(2)}} shs</span>`;
+          const pctStr = pnlPct !== null
+            ? ` (${{pnlPct >= 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)`
+            : '';
+          pnlDisplay = `<span class="${{color}} font-bold text-[11px]">${{sign}}${{pnlPrefix}}${{Math.abs(pnl).toFixed(2)}}${{pnlSuffix}}${{pctStr}}</span>`;
+        }} else if (ev === 'BUY') {{
+          pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Open Entry</span>`;
+        }} else if (ev === 'SL' || ev === 'SELL') {{
+          pnlDisplay = `<span class="text-slate-400 text-[10px] font-sans">Closed</span>`;
+        }} else {{
+          pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Order Placed</span>`;
         }}
+
+        const pnlText = `
+          <div class="flex flex-col gap-0.5">
+            <span class="text-slate-200 font-semibold">${{qtyDisplay}}</span>
+            ${{pnlDisplay}}
+          </div>
+        `;
 
         const price = (n.price !== undefined && n.price !== null) ? `${{nPrefix}}${{Number(n.price).toFixed(2)}}${{nSuffix}}` : '—';
         const underlyingText = n.underlying ? `(${{n.underlying}})` : '';
