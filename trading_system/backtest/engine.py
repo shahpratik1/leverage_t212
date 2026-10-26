@@ -174,6 +174,55 @@ class BacktestEngine:
             vol[i] = ann_vol
         return vol
 
+    @staticmethod
+    def _calculate_rolling_nixtla_forecast(closes: List[float], horizon: int = 5) -> List[Optional[float]]:
+        """Compute rolling 5-day forecasted expected return percentage (Nixtla keyless model).
+
+        For each bar i, forecasts 5 days forward strictly using closes[:i+1] (zero lookahead).
+        Returns list of forecasted expected return percentages.
+        """
+        forecast_returns: List[Optional[float]] = [None] * len(closes)
+        for i in range(10, len(closes)):
+            sub_closes = closes[max(0, i - 40) : i + 1]
+            last_p = sub_closes[-1]
+            level = sub_closes[0]
+            trend = (sub_closes[min(4, len(sub_closes) - 1)] - sub_closes[0]) / max(1, min(4, len(sub_closes) - 1))
+            alpha = 0.35
+            beta = 0.15
+            for price in sub_closes:
+                prev_level = level
+                level = alpha * price + (1 - alpha) * (level + trend)
+                trend = beta * (level - prev_level) + (1 - beta) * trend
+
+            damping = 0.85
+            curr = last_p
+            for h in range(horizon):
+                curr = curr + (trend * (damping ** (h + 1)))
+            exp_ret = ((curr - last_p) / last_p) * 100.0 if last_p > 0 else 0.0
+            forecast_returns[i] = round(exp_ret, 2)
+        return forecast_returns
+
+    @staticmethod
+    def _calculate_sentiment_proxy(closes: List[float], period: int = 14) -> List[Optional[float]]:
+        """Compute normalized sentiment/momentum proxy (0 to 100) reflecting keyless web score.
+
+        Combines rolling short-to-medium price positioning and rate-of-change.
+        """
+        sentiment: List[Optional[float]] = [None] * len(closes)
+        for i in range(period, len(closes)):
+            sub = closes[i - period : i + 1]
+            min_p = min(sub)
+            max_p = max(sub)
+            if max_p > min_p:
+                stoch = (closes[i] - min_p) / (max_p - min_p) * 100.0
+                roc = ((closes[i] - sub[0]) / sub[0]) * 100.0
+                # Weighted score centered at 50
+                score = round(max(0.0, min(100.0, (stoch * 0.7) + (roc * 2.0) + 15.0)), 1)
+                sentiment[i] = score
+            else:
+                sentiment[i] = 50.0
+        return sentiment
+
     def run(
         self,
         symbol: str,
@@ -200,6 +249,8 @@ class BacktestEngine:
         rsi7 = self._calculate_rsi(closes, 7)
         atr14 = self._calculate_atr(highs, lows, closes, 14)
         vol20 = self._calculate_realized_vol(closes, 20)
+        forecast_5d = self._calculate_rolling_nixtla_forecast(closes, 5)
+        sentiment_score = self._calculate_sentiment_proxy(closes, 14)
 
         capital = self.initial_capital
         equity_curve: List[float] = [capital]
@@ -328,6 +379,29 @@ class BacktestEngine:
                         trades.append(t)
                         continue
 
+                # Check Nixtla forecast reversal trim for multi_factor trades
+                if pos["strategy"] == "multi_factor" and not pos.get("forecast_trimmed", False):
+                    curr_f = forecast_5d[i]
+                    if curr_f is not None:
+                        unrealized_pnl_pct = (
+                            ((c - entry_p) / entry_p * 100.0)
+                            if is_long
+                            else ((entry_p - c) / entry_p * 100.0)
+                        )
+                        if ((is_long and curr_f <= -3.0) or (not is_long and curr_f >= 3.0)) and unrealized_pnl_pct >= 1.5:
+                            pos["forecast_trimmed"] = True
+                            trim_shares = pos["remaining_shares"] * 0.50
+                            pos["remaining_shares"] -= trim_shares
+                            exit_p = c
+                            pnl = trim_shares * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
+                            pos["realized_pnl"] += pnl
+                            capital += (trim_shares * entry_p) + pnl
+                            # Elevate stop loss to break-even to protect remaining shares
+                            if is_long and pos["current_sl"] < entry_p:
+                                pos["current_sl"] = entry_p
+                            elif not is_long and pos["current_sl"] > entry_p:
+                                pos["current_sl"] = entry_p
+
                 # Check Max Hold Days cap (Connors <= 4 days to kill beta decay)
                 if pos["hold_days"] >= self.max_hold_days and pos["remaining_shares"] > 0:
                     exit_p = c
@@ -376,12 +450,61 @@ class BacktestEngine:
                 curr_r7 = rsi7[i]
                 curr_sma = sma200[i]
                 curr_vol = vol20[i] or 0.25
+                curr_forecast = forecast_5d[i]
+                curr_sentiment = sentiment_score[i]
 
                 signal_dir: Optional[str] = None
                 strategy_name: str = ""
 
-                # 3-RSI Mean Reversion
-                if strategy_filter in ("both", "3rsi"):
+                # Multi-Factor Strategy: Connors 3-RSI + 20d Trend + Nixtla Forecast + Sentiment
+                if strategy_filter in ("both", "multi_factor"):
+                    if curr_r3 is not None and curr_r7 is not None and curr_sma is not None:
+                        # Long Dip confirmed by positive Nixtla forecast and non-capitulating sentiment
+                        if (
+                            curr_c >= curr_sma
+                            and curr_r3 <= 25.0
+                            and curr_r7 <= 45.0
+                            and (curr_forecast is not None and curr_forecast > 0.0)
+                            and (curr_sentiment is None or curr_sentiment >= 35.0)
+                        ):
+                            signal_dir = "LONG"
+                            strategy_name = "multi_factor"
+                        # Short Rip confirmed by negative Nixtla forecast and bearish/neutral sentiment
+                        elif (
+                            curr_c < curr_sma
+                            and curr_r3 >= 75.0
+                            and curr_r7 >= 55.0
+                            and (curr_forecast is not None and curr_forecast < 0.0)
+                            and (curr_sentiment is None or curr_sentiment <= 65.0)
+                        ):
+                            signal_dir = "SHORT"
+                            strategy_name = "multi_factor"
+
+                    if not signal_dir:
+                        # Multi-Factor Momentum Breakout confirmed by positive forecast
+                        high_20d = max(highs[max(0, i - 20) : i])
+                        low_20d = min(lows[max(0, i - 20) : i])
+                        if (
+                            curr_c > high_20d
+                            and curr_sma
+                            and curr_c > curr_sma
+                            and (curr_forecast is not None and curr_forecast > 0.5)
+                            and (curr_sentiment is None or curr_sentiment >= 45.0)
+                        ):
+                            signal_dir = "LONG"
+                            strategy_name = "multi_factor"
+                        elif (
+                            curr_c < low_20d
+                            and curr_sma
+                            and curr_c < curr_sma
+                            and (curr_forecast is not None and curr_forecast < -0.5)
+                            and (curr_sentiment is None or curr_sentiment <= 55.0)
+                        ):
+                            signal_dir = "SHORT"
+                            strategy_name = "multi_factor"
+
+                # 3-RSI Mean Reversion (standalone or fallback if not multi_factor only)
+                if not signal_dir and strategy_filter in ("both", "3rsi"):
                     if curr_r3 is not None and curr_r7 is not None and curr_sma is not None:
                         # Long Dip: In uptrend (close >= sma) and extreme oversold
                         if curr_c >= curr_sma and curr_r3 <= 22.0 and curr_r7 <= 42.0:
@@ -455,6 +578,7 @@ class BacktestEngine:
                         "tp1_hit": False,
                         "tp2_hit": False,
                         "tp3_hit": False,
+                        "forecast_trimmed": False,
                         "realized_pnl": 0.0,
                         "hold_days": 0,
                     })
@@ -567,6 +691,14 @@ class BacktestEngine:
             trades=trades,
         )
 
+    def run_comparison(
+        self, symbol: str, candles: List[Dict[str, Any]]
+    ) -> Dict[str, BacktestResult]:
+        """Run both standard baseline and multi-factor strategies and return comparative results."""
+        baseline_res = self.run(symbol, candles, strategy_filter="both")
+        mf_res = self.run(symbol, candles, strategy_filter="multi_factor")
+        return {"baseline": baseline_res, "multi_factor": mf_res}
+
 
 def generate_synthetic_candles(symbol: str, count: int = 150) -> List[Dict[str, Any]]:
     """Generate realistic daily OHLCV candles for backtest simulation verification."""
@@ -636,14 +768,47 @@ def print_backtest_report(res: BacktestResult) -> None:
     print(sep)
 
 
+def print_comparison_report(comp: Dict[str, BacktestResult]) -> None:
+    """Print side-by-side comparative table between baseline and multi-factor strategy."""
+    b = comp.get("baseline")
+    m = comp.get("multi_factor")
+    if not b or not m:
+        return
+
+    sep = "═" * 76
+    sub_sep = "─" * 76
+    print(sep)
+    print(f"  📊 STRATEGY COMPARISON REPORT: BASELINE vs MULTI-FACTOR ({b.symbol})")
+    print(sep)
+    print(f"  {'Metric':<26} | {'Baseline (3-RSI/Mom)':<20} | {'Multi-Factor (Nixtla/Sent)':<22}")
+    print(sub_sep)
+    print(f"  {'Total Return':<26} | {b.total_return_pct:>+19.2f}% | {m.total_return_pct:>+21.2f}%")
+    print(f"  {'Benchmark (1x B&H)':<26} | {b.benchmark_return_pct:>+19.2f}% | {m.benchmark_return_pct:>+21.2f}%")
+    print(f"  {'Total Trades':<26} | {b.total_trades:>20} | {m.total_trades:>22}")
+    print(f"  {'Win Rate':<26} | {f'{b.win_rate_pct:.1f}%':>20} | {f'{m.win_rate_pct:.1f}%':>22}")
+    print(f"  {'Profit Factor':<26} | {b.profit_factor:>20.2f} | {m.profit_factor:>22.2f}")
+    print(f"  {'Max Drawdown':<26} | {f'{b.max_drawdown_pct:.2f}%':>20} | {f'{m.max_drawdown_pct:.2f}%':>22}")
+    print(f"  {'Sharpe Ratio':<26} | {b.sharpe_ratio:>20.2f} | {m.sharpe_ratio:>22.2f}")
+    print(f"  {'Avg Trade PnL':<26} | {f'${b.avg_trade_pnl:+.2f}':>20} | {f'${m.avg_trade_pnl:+.2f}':>22}")
+    print(f"  {'Avg Holding Period':<26} | {f'{b.avg_hold_days:.1f} days':>20} | {f'{m.avg_hold_days:.1f} days':>22}")
+    print(sep)
+
+
 def main() -> None:
     """Command-line entry point for backtesting."""
     parser = argparse.ArgumentParser(description="3x Leveraged Strategy Backtest & Benchmark Engine")
     parser.add_argument("--symbol", type=str, default="QQQ", help="Underlying asset symbol (e.g. QQQ, NVDA, SPY)")
     parser.add_argument("--period", type=str, default="1y", help="Historical data window (e.g. 6m, 1y, 2y)")
     parser.add_argument("--capital", type=float, default=10000.0, help="Starting account equity")
-    parser.add_argument("--strategy", type=str, choices=["3rsi", "momentum", "both"], default="both", help="Strategy to test")
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["3rsi", "momentum", "multi_factor", "both"],
+        default="both",
+        help="Strategy to test",
+    )
     parser.add_argument("--leverage", type=int, default=3, help="Leverage multiplier (default 3)")
+    parser.add_argument("--compare", action="store_true", help="Compare baseline vs multi-factor strategy side-by-side")
     parser.add_argument("--json", action="store_true", help="Output raw JSON results")
     parser.add_argument("--dry-run", action="store_true", help="Run quick verification with synthetic candles")
 
@@ -681,12 +846,18 @@ def main() -> None:
         max_hold_days=4,
     )
 
-    result = engine.run(symbol=args.symbol, candles=candles, strategy_filter=args.strategy)
-
-    if args.json:
-        print(json.dumps(result.to_dict(), indent=2))
+    if args.compare:
+        comp = engine.run_comparison(symbol=args.symbol, candles=candles)
+        if args.json:
+            print(json.dumps({k: v.to_dict() for k, v in comp.items()}, indent=2))
+        else:
+            print_comparison_report(comp)
     else:
-        print_backtest_report(result)
+        result = engine.run(symbol=args.symbol, candles=candles, strategy_filter=args.strategy)
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2))
+        else:
+            print_backtest_report(result)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 set -e
 
-PI_DEST="${1:-trading212-pi}"
+# Auto-discover reachable Raspberry Pi host if none provided
+if [ -n "$1" ]; then
+    PI_DEST="$1"
+else
+    echo "🔍 Probing for active Raspberry Pi host on local network..."
+    CANDIDATES=("shahpratik11@trading212-pi.local" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61" "trading212-pi")
+    FOUND=""
+    for cand in "${CANDIDATES[@]}"; do
+        if ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no "$cand" "true" 2>/dev/null; then
+            FOUND="$cand"
+            echo "✅ Reachable host detected: $FOUND"
+            break
+        fi
+    done
+    if [ -z "$FOUND" ]; then
+        echo "❌ Error: Could not connect to any Raspberry Pi host (${CANDIDATES[*]})."
+        echo "Please specify host manually: ./scripts/deploy_to_pi.sh user@<IP>"
+        exit 1
+    fi
+    PI_DEST="$FOUND"
+fi
 REMOTE_DIR="/home/shahpratik11/modest-bose"
 
 echo "========================================================"
@@ -59,5 +79,6 @@ EOF
 
 echo "========================================================"
 echo "🎉 Deployment Successful!"
-echo "Dashboard is live at: http://192.168.68.61:8080"
+DASH_HOST=$(echo "$PI_DEST" | sed 's/.*@//')
+echo "Dashboard is live at: http://${DASH_HOST}:8080"
 echo "========================================================"

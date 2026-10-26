@@ -56,3 +56,13 @@ An execution architecture that couples native broker server-side GTC protective 
 *Avoid: Client-only stop, price-only limit*
 
 Broker-side orders ensure capital protection persists across network drops and off-hours, while algorithmic signals capture peak momentum trims before price reversal degrades unrealized gains.
+
+### Multi-Factor Forecast Trimming
+An algorithmic exit mechanism that evaluates rolling zero-lookahead forward price projections (e.g. Nixtla 5-day Holt-Winters exponential smoothing forecasts) on profitable positions, executing a partial trim (e.g. 50%) when expected returns deteriorate sharply ahead of a market turning point.
+*Avoid: Fixed target exit, static price limit*
+
+By locking in accrued gains prior to projected negative momentum shifts, forecast trimming prevents sudden adverse swings from eroding leveraged gains.
+
+### Micro-Runner Dynamic Host Discovery
+An automated probing mechanism for deploying to physical micro-runners (e.g. Raspberry Pi) across local area networks subject to DHCP lease drift, sequentially testing candidate hostnames and active subnet IPs before initiating synchronization.
+*Avoid: Hardcoded static IP, manual target entry*

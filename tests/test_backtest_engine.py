@@ -125,6 +125,40 @@ class TestBacktestEngine(unittest.TestCase):
         self.assertEqual(first_trade.exit_reason, "TP3")
         self.assertGreater(first_trade.realized_pnl, 0.0)
 
+    def test_rolling_nixtla_forecast_and_sentiment_proxy(self):
+        """Verify rolling 5-day forecast and sentiment proxy mathematical integrity."""
+        closes = [100.0 + (i * 0.5) for i in range(50)]
+        forecasts = self.engine._calculate_rolling_nixtla_forecast(closes, horizon=5)
+        self.assertEqual(len(forecasts), 50)
+        # Rising price series should generate positive 5-day forecasted return
+        self.assertIsNotNone(forecasts[-1])
+        self.assertGreater(forecasts[-1], 0.0)
+
+        sentiments = self.engine._calculate_sentiment_proxy(closes, period=14)
+        self.assertEqual(len(sentiments), 50)
+        self.assertIsNotNone(sentiments[-1])
+        self.assertGreaterEqual(sentiments[-1], 0.0)
+        self.assertLessEqual(sentiments[-1], 100.0)
+
+    def test_multi_factor_strategy_simulation(self):
+        """Run backtest with multi_factor strategy filter and verify trade tagging."""
+        candles = generate_synthetic_candles("NVDA", count=160)
+        res = self.engine.run(symbol="NVDA", candles=candles, strategy_filter="multi_factor")
+        self.assertIsInstance(res, BacktestResult)
+        for t in res.trades:
+            self.assertEqual(t.strategy, "multi_factor")
+
+    def test_run_comparison(self):
+        """Verify run_comparison returns both baseline and multi_factor results."""
+        candles = generate_synthetic_candles("QQQ", count=150)
+        comp = self.engine.run_comparison(symbol="QQQ", candles=candles)
+        self.assertIn("baseline", comp)
+        self.assertIn("multi_factor", comp)
+        self.assertIsInstance(comp["baseline"], BacktestResult)
+        self.assertIsInstance(comp["multi_factor"], BacktestResult)
+        self.assertEqual(comp["baseline"].symbol, "QQQ")
+        self.assertEqual(comp["multi_factor"].symbol, "QQQ")
+
 
 if __name__ == "__main__":
     unittest.main()
