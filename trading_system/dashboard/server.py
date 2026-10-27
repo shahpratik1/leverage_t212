@@ -304,18 +304,33 @@ def load_recent_history(trades_log_path: str = "trades.jsonl", limit: int = 15) 
         return []
 
 
-def load_recent_notifications(log_path: str = "notifications.jsonl", limit: int = 25) -> List[Dict[str, Any]]:
-    """Load latest records from notifications alert log."""
+def load_recent_notifications(
+    log_path: str = "notifications.jsonl", limit: int = 25, universe: Any = None
+) -> List[Dict[str, Any]]:
+    """Load latest records from notifications alert log with authoritative direction and P&L normalization."""
     if not os.path.exists(log_path):
         return []
     try:
-        lines = []
+        records = []
         with open(log_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    lines.append(json.loads(line))
-        return lines[-limit:][::-1]
+                    try:
+                        record = json.loads(line)
+                        tk = record.get("ticker", "")
+                        if tk:
+                            auth_dir = universe.get_etp_direction(tk) if universe else get_etp_direction(tk)
+                            if auth_dir:
+                                record["direction"] = auth_dir
+                        # Ensure BUY open entries have no realized P&L so UI displays "Open Entry" instead of "0%"
+                        if record.get("event_type") == "BUY":
+                            record["pnl"] = None
+                            record["pnl_pct"] = None
+                        records.append(record)
+                    except Exception:
+                        continue
+        return records[-limit:][::-1]
     except Exception as exc:
         logger.warning("Failed to load notifications log: %s", exc)
         return []
@@ -349,6 +364,10 @@ def fetch_live_broker_notifications(
             fill_px = float(fill.get("price") or order.get("stopPrice") or 0.0)
             fill_qty = abs(float(fill.get("quantity") or order.get("filledQuantity") or 0.0))
 
+            # Filter out cancelled, rejected, or 0-quantity orders that never filled
+            if fill_qty <= 0.0 or (o_status and o_status not in ("FILLED", "EXECUTED")):
+                continue
+
             wallet_impact = fill.get("walletImpact", {}) or {}
             realized_pnl = wallet_impact.get("realisedProfitLoss")
             pnl_val = float(realized_pnl) if realized_pnl is not None else None
@@ -362,40 +381,49 @@ def fetch_live_broker_notifications(
                 or "EUR"
             )
 
-            pnl_pct_val: Optional[float] = None
-            if pnl_val is not None:
-                # If netValue is provided by broker, cost basis = netValue - realized_pnl
-                if net_val > 0:
-                    cost_basis = net_val - pnl_val
-                    if cost_basis > 0:
-                        pnl_pct_val = round((pnl_val / cost_basis) * 100.0, 2)
-                    else:
-                        pnl_pct_val = round((pnl_val / net_val) * 100.0, 2)
-                elif fill_px > 0 and fill_qty > 0:
-                    exit_notional = fill_px * fill_qty
-                    cost_basis = exit_notional - pnl_val
-                    if cost_basis > 0:
-                        pnl_pct_val = round((pnl_val / cost_basis) * 100.0, 2)
-                    else:
-                        pnl_pct_val = round((pnl_val / exit_notional) * 100.0, 2)
+            # Authoritative direction: Derived from the instrument (e.g. IONQl1_EQ is LONG, 3LFEl_EQ is LONG, 3USSm_EQ is SHORT)
+            direction = universe.get_etp_direction(ticker) if universe else get_etp_direction(ticker)
 
             pair = universe.get_pair_for_etp(ticker) if universe else None
             underlying = pair.underlying_symbol if pair else ticker.replace("3", "").replace("5", "").split("_")[0]
 
+            pnl_pct_val: Optional[float] = None
             if o_side == "BUY":
                 ev = "BUY"
-                direction = "LONG"
+                pnl_val = None
+                pnl_pct_val = None
                 rationale = f"Live T212 Market Fill #{fill_id or order_id}"
             else:
-                direction = "SHORT"
-                if "STOP" in o_type:
+                # SELL orders are exits (SL, TP, TSL, or manual sell)
+                if pnl_val is not None:
+                    # Cost basis = proceeds - realized_pnl
+                    if net_val > 0:
+                        cost_basis = net_val - pnl_val
+                        if cost_basis > 0:
+                            pnl_pct_val = round((pnl_val / cost_basis) * 100.0, 2)
+                        else:
+                            pnl_pct_val = round((pnl_val / net_val) * 100.0, 2)
+                    elif fill_px > 0 and fill_qty > 0:
+                        exit_notional = fill_px * fill_qty
+                        cost_basis = exit_notional - pnl_val
+                        if cost_basis > 0:
+                            pnl_pct_val = round((pnl_val / cost_basis) * 100.0, 2)
+                        else:
+                            pnl_pct_val = round((pnl_val / exit_notional) * 100.0, 2)
+
+                if "STOP" in o_type or "TRAILING" in o_type:
                     ev = "SL" if (pnl_val is not None and pnl_val < 0) else "TSL"
                     rationale = f"Live T212 Stop Order Executed #{order_id}"
                 elif "LIMIT" in o_type:
                     ev = "TP1" if (pnl_val is not None and pnl_val > 0) else "SELL"
                     rationale = f"Live T212 Limit Target Filled #{order_id}"
                 else:
-                    ev = "SELL"
+                    if pnl_val is not None and pnl_val < 0:
+                        ev = "SL"
+                    elif pnl_val is not None and pnl_val > 0:
+                        ev = "TP1"
+                    else:
+                        ev = "SELL"
                     rationale = f"Live T212 Exit Order Filled #{order_id}"
 
             ts_str = filled_at.replace("T", " ").replace(".000Z", " UTC").replace("Z", " UTC")
@@ -563,7 +591,9 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                     })
 
         history = load_recent_history(settings.TRADES_LOG_PATH)
-        recent_notifications = load_recent_notifications(settings.NOTIFICATIONS_LOG_PATH, limit=30)
+        recent_notifications = load_recent_notifications(
+            settings.NOTIFICATIONS_LOG_PATH, limit=30, universe=universe
+        )
 
         # Merge live broker order executions from Trading 212
         if client is not None:
@@ -572,7 +602,7 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                 seen_orders = set()
                 merged_events = []
                 for b_ev in broker_events:
-                    oid = b_ev.get("order_id")
+                    oid = str(b_ev.get("order_id") or "")
                     if oid:
                         seen_orders.add(oid)
                     merged_events.append(b_ev)
@@ -580,6 +610,11 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                     n_oid = str(n.get("order_id") or "")
                     if n_oid and n_oid in seen_orders:
                         continue
+                    tk = n.get("ticker", "")
+                    if tk:
+                        auth_dir = universe.get_etp_direction(tk) if universe else get_etp_direction(tk)
+                        if auth_dir:
+                            n["direction"] = auth_dir
                     merged_events.append(n)
                 # Sort chronologically descending
                 merged_events.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
@@ -1246,8 +1281,8 @@ def generate_html_dashboard(output_path: str) -> str:
           pnlSuffix = 'p';
         }}
 
-        const qty = (n.quantity !== null && n.quantity !== undefined && Number(n.quantity) > 0)
-          ? Number(n.quantity)
+        const qty = (n.quantity !== null && n.quantity !== undefined && Math.abs(Number(n.quantity)) > 0)
+          ? Math.abs(Number(n.quantity))
           : null;
         const pnl = (n.pnl !== null && n.pnl !== undefined) ? Number(n.pnl) : null;
         let pnlPct = (n.pnl_pct !== null && n.pnl_pct !== undefined) ? Number(n.pnl_pct) : null;
@@ -1265,16 +1300,16 @@ def generate_html_dashboard(output_path: str) -> str:
 
         const qtyDisplay = qty !== null ? `${{qty.toFixed(2)}} shs` : '—';
         let pnlDisplay = '';
-        if (pnl !== null) {{
-          const color = pnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
-          const sign = pnl >= 0 ? '+' : '-';
+        if (ev === 'BUY') {{
+          pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Open Entry</span>`;
+        }} else if (pnl !== null) {{
+          const color = pnl > 0 ? 'text-emerald-400' : (pnl < 0 ? 'text-rose-400' : 'text-slate-300');
+          const sign = pnl > 0 ? '+' : (pnl < 0 ? '-' : '');
           const pctStr = pnlPct !== null
-            ? ` (${{pnlPct >= 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)`
+            ? ` (${{pnlPct > 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)`
             : '';
           pnlDisplay = `<span class="${{color}} font-bold text-[11px]">${{sign}}${{pnlPrefix}}${{Math.abs(pnl).toFixed(2)}}${{pnlSuffix}}${{pctStr}}</span>`;
-        }} else if (ev === 'BUY') {{
-          pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Open Entry</span>`;
-        }} else if (ev === 'SL' || ev === 'SELL') {{
+        }} else if (ev === 'SL' || ev === 'SELL' || ev === 'TSL') {{
           pnlDisplay = `<span class="text-slate-400 text-[10px] font-sans">Closed</span>`;
         }} else {{
           pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Order Placed</span>`;
@@ -1289,6 +1324,10 @@ def generate_html_dashboard(output_path: str) -> str:
 
         const price = (n.price !== undefined && n.price !== null) ? `${{nPrefix}}${{Number(n.price).toFixed(2)}}${{nSuffix}}` : '—';
         const underlyingText = n.underlying ? `(${{n.underlying}})` : '';
+        const dir = (n.direction || 'LONG').toUpperCase();
+        const dirBadge = dir === 'SHORT'
+          ? '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black border bg-rose-500/10 text-rose-300 border-rose-500/30 ml-1">SHORT</span>'
+          : '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black border bg-emerald-500/10 text-emerald-300 border-emerald-500/30 ml-1">LONG</span>';
 
         row.innerHTML = `
           <td class="py-2.5 px-4">
@@ -1297,8 +1336,11 @@ def generate_html_dashboard(output_path: str) -> str:
             </span>
           </td>
           <td class="py-2.5 px-4 font-bold text-white">
-            ${{n.ticker || '—'}}
-            <span class="text-[11px] font-normal text-slate-400 font-sans ml-1">${{underlyingText}}</span>
+            <div class="flex items-center gap-1.5 flex-wrap">
+              <span>${{n.ticker || '—'}}</span>
+              ${{dirBadge}}
+              <span class="text-[11px] font-normal text-slate-400 font-sans">${{underlyingText}}</span>
+            </div>
           </td>
           <td class="py-2.5 px-4 font-mono text-slate-200">${{price}}</td>
           <td class="py-2.5 px-4 font-mono">${{pnlText}}</td>
