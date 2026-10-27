@@ -50,9 +50,6 @@ class DebateEngine:
         self.speculative_threshold = speculative_threshold
         self.gemini_api_key = gemini_api_key
 
-        # Lazy initialize AntigravityTradingAgent
-        self._agy_agent = None
-
     def run_debate(
         self,
         ticker: str,
@@ -93,26 +90,7 @@ class DebateEngine:
                 )
 
         # ── 2. Tier 2: Deep Arbiter Debate ──────────────────────────────────────
-        # Try Google Antigravity SDK Autonomous Multi-Agent Hierarchy first
-        try:
-            from trading_system.agents.antigravity_agent import AntigravityTradingAgent
-            if self._agy_agent is None:
-                self._agy_agent = AntigravityTradingAgent(gemini_api_key=self.gemini_api_key)
-            if self._agy_agent.is_available:
-                logger.info(
-                    "🤖 [Google Antigravity SDK] Launching Autonomous Multi-Agent deliberation for %s (Model: %s)",
-                    ticker, getattr(self._agy_agent, "model", "default")
-                )
-                agy_decision = self._agy_agent.deliberate(
-                    ticker=ticker,
-                    metrics=metrics,
-                    strategy_type=strategy_type,
-                )
-                return self._agy_agent.to_debate_outcome(agy_decision)
-        except Exception as agy_exc:
-            logger.debug("Antigravity SDK deliberation notice: %s", agy_exc)
-
-        # Legacy fallback if OpenAI API key and TradingAgents available
+        # Quantitative rule-based or TradingAgents LLM debate
         if not TRADING_AGENTS_AVAILABLE or not self.openai_api_key:
             return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
         

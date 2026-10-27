@@ -41,7 +41,6 @@ from trading_system.screener.laya_screener import LayaScreener, ScreenerResult
 from trading_system.agents.technical_agent import TechnicalAnalyst
 from trading_system.agents.fundamental_agent import FundamentalAnalyst
 from trading_system.agents.debate_engine import DebateEngine
-from trading_system.agents.antigravity_agent import AntigravityTradingAgent
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.agents.strategy_improvement_agent import StrategyImprovementAgent
 
@@ -128,7 +127,6 @@ class Orchestrator:
             debate_rounds=3,
             speculative_routing=settings.ENABLE_SPECULATIVE_ROUTING,
             speculative_threshold=settings.SPECULATIVE_CONFIDENCE_THRESHOLD,
-            gemini_api_key=settings.GEMINI_API_KEY,
         )
         self.parallel_ingestion_workers = settings.PARALLEL_INGESTION_WORKERS
         self.parallel_deliberation_workers = settings.PARALLEL_DELIBERATION_WORKERS
@@ -141,13 +139,6 @@ class Orchestrator:
             tp2_r=settings.TP2_R_MULTIPLE,
             tp3_r=settings.TP3_R_MULTIPLE,
             tsl_atr_multiplier=settings.TSL_ATR_MULTIPLIER,
-        )
-        self.antigravity_agent = AntigravityTradingAgent(
-            t212_client=self.t212,
-            notifier=self.notifier,
-            risk_manager=self.risk_manager,
-            gemini_api_key=settings.GEMINI_API_KEY,
-            model=settings.AGY_MODEL,
         )
 
         # ── 6. Active Position & Lifecycle Monitor ───────────────
@@ -352,7 +343,6 @@ class Orchestrator:
 
         logger.info("Screening %d assets for 3x Long/Short momentum (ADX >= %.1f)…",
                     len(universe_metrics), settings.MIN_ADX_TREND)
-        AntigravityTradingAgent.set_active_universe_metrics(universe_metrics)
 
         # Evaluate candidates with primary screener (supports 3-RSI and Momentum)
         candidates = self.screener.scan_universe(universe_metrics)
@@ -1142,7 +1132,6 @@ def main() -> None:
     parser.add_argument("--dashboard-port", type=int, default=settings.DASHBOARD_PORT, help=f"Port for embedded dashboard server (default: {settings.DASHBOARD_PORT})")
     parser.add_argument("--open-browser", action="store_true", help="Automatically open dashboard in default browser on startup")
     parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
-    parser.add_argument("--agentic", action="store_true", help="Enable Google Antigravity autonomous multi-agent reasoning system")
     parser.add_argument("--backtest", action="store_true", help="Run historical strategy backtest simulator and benchmark report")
     parser.add_argument("--backtest-symbol", type=str, default="QQQ", help="Underlying asset symbol to backtest (default: QQQ)")
     parser.add_argument("--backtest-period", type=str, default="1y", help="Historical backtest period (default: 1y)")

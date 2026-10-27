@@ -14,13 +14,6 @@ from trading_system.data.trading212_client import MarketDataProvider
 from trading_system.agents.fundamental_agent import FundamentalAnalyst
 from trading_system.agents.technical_agent import TechnicalAnalyst
 from trading_system.agents.debate_engine import DebateEngine
-from trading_system.agents.antigravity_agent import (
-    tool_get_finnhub_fundamentals,
-    tool_get_company_news,
-    tool_get_olostep_sentiment,
-    tool_get_nixtla_forecast,
-    tool_get_asset_intelligence,
-)
 
 
 class TestFinnhubProvider(unittest.TestCase):
@@ -364,28 +357,21 @@ class TestAgentIntegration(unittest.TestCase):
         self.assertIn("Olostep sentiment search is BULLISH", evidence_text)
         self.assertIn("Nixtla TimeGPT 5-day forecast is BULLISH", evidence_text)
 
-    def test_antigravity_agent_tools(self):
-        fh_json = tool_get_finnhub_fundamentals("NVDA")
-        fh_data = json.loads(fh_json)
-        self.assertIn(fh_data.get("status"), [None, "unavailable"])
+    def test_market_data_provider_enrichment(self):
+        fh_data = MarketDataProvider.get_company_fundamentals("NVDA")
+        if fh_data:
+            self.assertIn("valuation_summary", fh_data)
 
-        news_json = tool_get_company_news("NVDA", days=3)
-        news_data = json.loads(news_json)
-        self.assertIn("articles", news_data)
+        news_data = MarketDataProvider.get_company_news("NVDA", days=3, limit=5)
+        self.assertIsInstance(news_data, list)
 
-        olo_json = tool_get_olostep_sentiment("NVDA")
-        olo_data = json.loads(olo_json)
-        self.assertIn(olo_data.get("status"), [None, "unavailable"])
+        olo_data = MarketDataProvider.get_sentiment_search("NVDA")
+        if olo_data:
+            self.assertIn("sentiment_label", olo_data)
 
-        nxt_json = tool_get_nixtla_forecast("NVDA")
-        nxt_data = json.loads(nxt_json)
-        self.assertIn(nxt_data.get("status"), [None, "unavailable"])
-
-        intel_json = tool_get_asset_intelligence("NVDA")
-        intel_data = json.loads(intel_json)
-        self.assertIn("finnhub_valuation", intel_data)
-        self.assertIn("olostep_sentiment", intel_data)
-        self.assertIn("nixtla_5d_forecast", intel_data)
+        nxt_data = MarketDataProvider.get_5day_forecast("NVDA")
+        if nxt_data:
+            self.assertIn("directional_bias", nxt_data)
 
 
 if __name__ == "__main__":

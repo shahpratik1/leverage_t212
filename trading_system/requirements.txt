@@ -9,8 +9,6 @@ yfinance>=0.2.30
 python-dotenv>=1.0.0
 pydantic>=2.0.0
 
-# ── Google Antigravity Agentic Framework ─────────────────────────
-google-antigravity>=0.1.0
 
 # ── Optional Multi-Agent / LLM Framework (enabled when API keys set) ──
 # openai>=1.0.0

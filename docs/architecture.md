@@ -173,7 +173,7 @@ The market data layer is decoupled into specialized providers with a persistent 
   * **Tier 2 Deep Dialectic Debate**: Contested setups trigger multi-agent consensus deliberation:
     * **`technical_agent.py`**: Analyzes multi-timeframe RSIs, Bollinger Bands, ATR volatility, volume spikes, and support/resistance structure.
     * **`fundamental_agent.py`**: Evaluates corporate fundamentals, Finnhub sentiment, Olostep headlines, and 48-hour earnings blackout proximity.
-    * **`antigravity_agent.py`**: Bridges into the Google Antigravity Agentic SDK, executing reasoning traces and multi-perspective risk audits.
+    * **`debate_engine.py`**: Synthesizes technical and fundamental signals through deterministic dialectic synthesis to establish consensus conviction.
 * **`trading_system/agents/strategy_improvement_agent.py`**:
   * Autonomous meta-learning agent inspecting `trades.jsonl` performance.
   * Detects pipeline starvation (e.g. 3 consecutive zero-signal cycles during low-volatility regimes) and suggests adaptive parameter tuning (e.g., broadening RSI3 threshold from 22 to 25 or lowering ADX gate to 18).
