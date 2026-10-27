@@ -80,5 +80,6 @@ EOF
 echo "========================================================"
 echo "🎉 Deployment Successful!"
 DASH_HOST=$(echo "$PI_DEST" | sed 's/.*@//')
-echo "Dashboard is live at: http://${DASH_HOST}:8080"
+echo "Permanent URL (never changes): http://trading212-pi.local:8080"
+echo "Direct IP URL:               http://${DASH_HOST}:8080"
 echo "========================================================"
