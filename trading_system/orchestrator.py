@@ -661,15 +661,18 @@ class Orchestrator:
                 if entry_order.fill_price > 0:
                     fill_price = entry_order.fill_price
                 else:
-                    try:
+                    for retry_idx in range(3):
                         time.sleep(1.0)
-                        positions_fresh = self.t212.get_portfolio(force_refresh=True)
-                        for p in positions_fresh:
-                            if p.ticker == card.trading212_ticker and p.average_price > 0:
-                                fill_price = p.average_price
+                        try:
+                            positions_fresh = self.t212.get_portfolio(force_refresh=True)
+                            for p in positions_fresh:
+                                if p.ticker == card.trading212_ticker and p.average_price > 0:
+                                    fill_price = p.average_price
+                                    break
+                            if fill_price and fill_price > 0:
                                 break
-                    except Exception as port_exc:
-                        logger.debug("Could not retrieve post-order portfolio fill price: %s", port_exc)
+                        except Exception as port_exc:
+                            logger.debug("Could not retrieve post-order portfolio fill price (attempt %d): %s", retry_idx + 1, port_exc)
 
                 # Secondary safeguard against scale contamination if fill_price is still missing
                 if not fill_price or fill_price <= 0:

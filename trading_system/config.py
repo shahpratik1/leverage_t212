@@ -181,9 +181,9 @@ class Settings:
     USE_LEVERAGED_3X: bool = True
     ENABLE_CRYPTO_3X: bool = True
     ENABLE_COMMODITIES_3X: bool = True
-    ENABLE_5X_LEVERAGE: bool = True  # Prioritize 5x leverage when available on Trading 212
-    PREFER_5X_LEVERAGE: bool = True
-    MAX_LEVERAGE: int = 5  # Allow up to 5x leverage when 5x ETP exists
+    ENABLE_5X_LEVERAGE: bool = False  # 5x replaced with 3x per user requirements
+    PREFER_5X_LEVERAGE: bool = False
+    MAX_LEVERAGE: int = 3  # Maximum leverage capped at 3x
     LOG_LEVEL: str = "INFO"
     TRADES_LOG_PATH: str = "trades.jsonl"
     UNIVERSE_SIZE: int = 100
@@ -258,6 +258,8 @@ class Settings:
         env_5x = os.environ.get("ENABLE_5X_LEVERAGE")
         if env_5x is not None:
             self.ENABLE_5X_LEVERAGE = env_5x.strip().lower() in ("1", "true", "yes", "t")
+
+        self.MAX_LEVERAGE = 5 if self.ENABLE_5X_LEVERAGE else 3
 
         env_prefer_5x = os.environ.get("PREFER_5X_LEVERAGE")
         if env_prefer_5x is not None:

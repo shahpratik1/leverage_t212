@@ -1567,8 +1567,11 @@ class LeveragedUniverse:
         for p in self.pairs:
             if p.long_5x_ticker and p.long_3x_ticker:
                 self._5x_to_3x_map[p.long_5x_ticker] = p.long_3x_ticker
-            if p.short_5x_ticker and p.short_5x_ticker != "None" and p.short_3x_ticker and p.short_3x_ticker != "None":
-                self._5x_to_3x_map[p.short_5x_ticker] = p.short_3x_ticker
+            if p.short_5x_ticker and p.short_5x_ticker != "None":
+                if p.short_3x_ticker and p.short_3x_ticker != "None":
+                    self._5x_to_3x_map[p.short_5x_ticker] = p.short_3x_ticker
+                else:
+                    self._5x_to_3x_map[p.short_5x_ticker] = "None"
 
         # Additional institutional 5x mappings (supporting legacy USD/GBX 5x ticker lookups)
         legacy_5x = {
@@ -1579,8 +1582,10 @@ class LeveragedUniverse:
             "SDAXl_EQ": "3DESl_EQ",
             "5SX5l_EQ": "3EULl_EQ",
             "GLD5l_EQ": "3GLEl_EQ",
+            "TLT5d_EQ": "3TYLm_EQ",
             "TLT5l_EQ": "3TYLm_EQ",
             "TL5Sl_EQ": "3TYLm_EQ",
+            "5STLd_EQ": "None",
             "MAG7l_EQ": "MAG7m_EQ",
         }
         for k, v in legacy_5x.items():
@@ -1669,8 +1674,10 @@ class LeveragedUniverse:
         is_long = direction_upper in ("LONG", "BUY", "BULLISH")
         is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
 
-        # 5x Resolution: If pair has 5x and leverage is not explicitly forced to 3
-        if pair.has_5x and (leverage is None or leverage >= 5):
+        # 5x Resolution: only if explicitly enabled in configuration AND requested with leverage >= 5
+        from trading_system.config import settings
+        allow_5x = getattr(settings, "ENABLE_5X_LEVERAGE", False)
+        if allow_5x and pair.has_5x and leverage is not None and leverage >= 5:
             if is_long and pair.long_5x_ticker:
                 return pair.long_5x_ticker
             elif is_short and pair.short_5x_ticker and pair.short_5x_ticker != "None":
@@ -1739,10 +1746,12 @@ class LeveragedUniverse:
         return "General Equity"
 
     def get_all_execution_tickers(self) -> List[str]:
-        """Return list of all active Trading 212 execution tickers (prioritizing 5x when available, else 3x)."""
+        """Return list of all active Trading 212 execution tickers (respecting 5x leverage settings)."""
+        from trading_system.config import settings
+        allow_5x = getattr(settings, "ENABLE_5X_LEVERAGE", False)
         tickers = []
         for p in self.pairs:
-            if p.has_5x:
+            if allow_5x and p.has_5x:
                 if p.long_5x_ticker:
                     tickers.append(p.long_5x_ticker)
                 if p.short_5x_ticker and p.short_5x_ticker != "None":

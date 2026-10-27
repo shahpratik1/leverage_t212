@@ -254,6 +254,79 @@ class TestBrokerNativeStops(unittest.TestCase):
         self.assertEqual(pnl_loss, -10.0)
         self.assertEqual(pnl_loss_pct, -6.67)
 
+    def test_place_broker_stop_refuses_inverted_stop_price_and_auto_heals(self):
+        """place_broker_stop refuses to submit a stop price >= current price for spot holdings, preventing instant fill."""
+        from trading_system.data.trading212_client import Position
+        pos = TrackedPosition(
+            ticker="QQQSm_EQ",
+            underlying="QQQ",
+            direction="SHORT",
+            entry_price=14.50,
+            original_quantity=10.0,
+            remaining_quantity=10.0,
+            stop_loss=83.48,  # contaminated inverted stop
+            trailing_stop_loss=83.48,
+            highest_price=14.50,
+            lowest_price=14.50,
+            tp1=15.50,
+            tp2=16.00,
+            tp3=16.50,
+            atr=0.15,
+        )
+        self.monitor.positions["QQQSm_EQ"] = pos
+        self.monitor.dry_run = False
+
+        # Mock broker portfolio returning live price of 14.50
+        mock_bp = MagicMock(spec=Position)
+        mock_bp.ticker = "QQQSm_EQ"
+        mock_bp.current_price = 14.50
+        mock_bp.average_price = 14.50
+        self.mock_t212.get_portfolio.return_value = [mock_bp]
+        self.mock_t212.place_stop_order.return_value = MagicMock(id="order_healed_123")
+
+        order_id = self.monitor.place_broker_stop(pos, stop_price=83.48)
+
+        # Order must have been submitted with healed stop price < 14.50, never 83.48!
+        self.assertEqual(order_id, "order_healed_123")
+        self.mock_t212.place_stop_order.assert_called_once()
+        call_kwargs = self.mock_t212.place_stop_order.call_args[1]
+        submitted_stop_price = call_kwargs["stop_price"]
+        self.assertLess(submitted_stop_price, 14.50, f"Submitted stop price {submitted_stop_price} must be strictly < 14.50")
+
+    def test_reconcile_with_broker_registers_loss_cooldown_on_external_close(self):
+        """When a position is closed externally (e.g. broker stop hit), reconciliation registers cooldown to stop whipsaws."""
+        pos = TrackedPosition(
+            ticker="QQQ3m_EQ",
+            underlying="QQQ",
+            direction="LONG",
+            entry_price=100.0,
+            original_quantity=5.0,
+            remaining_quantity=5.0,
+            stop_loss=95.0,
+            trailing_stop_loss=95.0,
+            highest_price=100.0,
+            lowest_price=100.0,
+            tp1=105.0,
+            tp2=110.0,
+            tp3=115.0,
+            atr=1.5,
+        )
+        self.monitor.positions["QQQ3m_EQ"] = pos
+        self.monitor.dry_run = False
+
+        # Mock broker portfolio empty (position closed externally)
+        self.mock_t212.get_portfolio.return_value = []
+        self.mock_t212.get_orders.return_value = []
+
+        summary = self.monitor.reconcile_with_broker()
+        self.assertIn("QQQ3m_EQ", summary["closed_externally"])
+
+        # RiskManager must now have cooldown registered for QQQ / QQQ3m_EQ
+        in_cooldown_etp, _ = self.monitor.risk_manager.is_in_loss_cooldown("QQQ3m_EQ")
+        in_cooldown_und, _ = self.monitor.risk_manager.is_in_loss_cooldown("QQQ")
+        self.assertTrue(in_cooldown_etp)
+        self.assertTrue(in_cooldown_und)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -155,11 +155,11 @@ class PositionMonitor:
         if dir_str == "LONG":
             return False
 
-        # If explicitly configured as a short with TP1 < entry (e.g. synthetic CFD short in unit tests)
-        if tp1 > 0 and entry > 0 and tp1 < entry:
+        # If explicitly configured as a short contract with inverse profit structure (TP1 < entry and SL >= entry)
+        if tp1 > 0 and entry > 0 and tp1 < entry and (getattr(pos_or_ticker, "stop_loss", 0.0) or 0.0) >= entry:
             return True
 
-        # Otherwise, Trading 212 Invest spot equities & ETPs trade long
+        # Trading 212 Invest spot equities & ETPs trade long (rising ETP price is profit)
         if (
             ticker.endswith("_EQ")
             or ticker.endswith(".L")
@@ -367,6 +367,25 @@ class PositionMonitor:
         price = stop_price if stop_price is not None else pos.trailing_stop_loss
         if pos.remaining_quantity <= 0 or price <= 0:
             return None
+
+        # Invariant check: for spot holdings, Stop Loss must be strictly below current market price
+        is_cfd_short = self.is_true_short_contract(pos)
+        if not is_cfd_short:
+            cur_price = pos.current_price or pos.highest_price or pos.entry_price
+            if cur_price > 0 and price >= cur_price:
+                logger.error(
+                    "INVARIANT VIOLATION: Stop price %.4f >= current price %.4f for spot holding %s! "
+                    "Refusing to submit inverted broker stop order to prevent instant market liquidation. Healing stop...",
+                    price, cur_price, pos.ticker,
+                )
+                self._heal_stale_stop(pos)
+                price = pos.trailing_stop_loss
+                if price >= cur_price:
+                    logger.critical(
+                        "Stop healing could not place stop below current price for %s (price=%.4f, cur=%.4f). Aborting stop order.",
+                        pos.ticker, price, cur_price,
+                    )
+                    return None
 
         # Cancel previous broker stop order if one was already placed
         if pos.broker_stop_order_id:
@@ -773,6 +792,12 @@ class PositionMonitor:
                     pos.last_update_time = datetime.now(timezone.utc).isoformat()
                     self.cancel_all_broker_orders(pos)
                     summary["closed_externally"].append(ticker)
+
+                    # Register anti-churn loss cooldown on RiskManager to prevent immediate whipsaw re-entry
+                    if hasattr(self.risk_manager, "register_loss_exit"):
+                        from trading_system.config import settings
+                        cooldown = getattr(settings, "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0)
+                        self.risk_manager.register_loss_exit(pos.ticker, pos.underlying, cooldown_seconds=cooldown)
 
                     # Dispatch notification
                     if hasattr(self.notifier, "notify_stop_loss"):
@@ -1324,6 +1349,7 @@ class PositionMonitor:
                         self._save_state()
 
             pos.last_update_time = datetime.now(timezone.utc).isoformat()
+            pos.current_price = current_price
 
             # Track peak price
             if current_price > pos.highest_price:
@@ -1332,11 +1358,7 @@ class PositionMonitor:
                 pos.lowest_price = current_price
 
             # Check exits in priority order
-            is_short = (pos.tp1 < pos.entry_price) if (pos.tp1 > 0 and pos.entry_price > 0) else (
-                pos.direction.upper() == "SHORT" and not (
-                    pos.ticker.endswith("_EQ") or pos.ticker.endswith(".L") or pos.direction.upper().endswith("_ETP")
-                )
-            )
+            is_short = self.is_true_short_contract(pos)
 
             # 1. Stop Loss & Trailing Stop Loss
             if is_short:
