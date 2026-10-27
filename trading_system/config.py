@@ -89,7 +89,7 @@ class Settings:
     PARALLEL_INGESTION_WORKERS: int = 24
     PARALLEL_DELIBERATION_WORKERS: int = 8
     ENABLE_SPECULATIVE_ROUTING: bool = True
-    SPECULATIVE_CONFIDENCE_THRESHOLD: float = 0.75
+    SPECULATIVE_CONFIDENCE_THRESHOLD: float = 0.70
 
     # Market Data API keys
     POLYGON_API_KEY: str = ""
@@ -105,8 +105,8 @@ class Settings:
     NIXTLA_FORECAST_HORIZON: int = 5
 
     # Risk parameters
-    MAX_RISK_PER_TRADE: float = 0.005  # 0.5% of equity
-    MAX_POSITION_PCT: float = 0.05  # 5% of equity max
+    MAX_RISK_PER_TRADE: float = 0.015  # 1.5% of equity per trade (increased from 0.5% for fuller sizing)
+    MAX_POSITION_PCT: float = 0.20  # 20% of equity max per position (increased from 5% for meaningful portfolio size)
     ATR_SL_MULTIPLIER: float = 2.2
     MIN_SL_PCT: float = 0.005  # 0.5% minimum stop distance
     TP1_R_MULTIPLE: float = 1.0
@@ -117,17 +117,17 @@ class Settings:
     # Screener parameters
     SCREENER_MIN_SETUP_SCORE: str = "favorable"
     SCREENER_MAX_CATALYST_RISK: float = 0.25
-    SCREENER_TOP_N: int = 10
-    MIN_ADX_TREND: float = 20.0  # Trend strength gate for 3x leverage
+    SCREENER_TOP_N: int = 15
+    MIN_ADX_TREND: float = 18.0  # Trend strength gate for 3x leverage (relaxed from 20.0 to catch trends earlier)
 
     # 3-RSI Mean Reversion Strategy (High Win-Rate Institutional Dip Buying)
     ENABLE_3RSI_MEAN_REVERSION: bool = True
-    RSI3_OVERSOLD: float = 15.0      # Extreme oversold trigger (Connors / 3-RSI)
-    RSI3_OVERBOUGHT: float = 85.0    # Extreme overbought trigger for inverse short
-    RSI7_OVERSOLD: float = 35.0      # Medium-term momentum confirmation
-    RSI7_OVERBOUGHT: float = 60.0
-    RSI14_OVERSOLD: float = 48.0     # Macro trend pullback confirmation
-    RSI14_OVERBOUGHT: float = 52.0
+    RSI3_OVERSOLD: float = 28.0      # Broadened oversold trigger for shallow bull dips (was 15.0)
+    RSI3_OVERBOUGHT: float = 80.0    # Extreme overbought trigger for inverse short
+    RSI7_OVERSOLD: float = 45.0      # Medium-term momentum confirmation (was 35.0)
+    RSI7_OVERBOUGHT: float = 55.0
+    RSI14_OVERSOLD: float = 50.0     # Macro trend pullback confirmation
+    RSI14_OVERBOUGHT: float = 50.0
     MR_MAX_HOLD_DAYS: int = 4        # Fast mean reversion holding period (eliminates beta decay)
 
     # Trailing Stop Loss & Schmitt Hysteresis Ratcheting
@@ -146,13 +146,13 @@ class Settings:
 
     # Advanced Risk & Safety Gates
     ENFORCE_SPREAD_GATE: bool = True
-    MAX_BID_ASK_SPREAD_PCT: float = 0.0035    # 0.35% max relative spread
+    MAX_BID_ASK_SPREAD_PCT: float = 0.0150    # 1.50% max relative spread (adapted for European 3x leveraged ETPs)
     MAX_SPREAD_TO_STOP_RATIO: float = 0.50    # Spread must not exceed 50% of the stop loss distance
     TRADE_LOSS_COOLDOWN_SECONDS: float = 3600.0  # 1 hour cooldown after a stop-out to prevent churn/re-entry whipsaw
     MIN_HOLD_SECONDS: float = 120.0           # 2 minutes minimum hold time to absorb entry bid-ask bounce
     ENFORCE_CORRELATION_LIMITS: bool = True
-    MAX_SECTOR_POSITIONS: int = 2             # Max concurrent positions per sector cluster
-    MAX_PORTFOLIO_BETA_HEAT: float = 3.0      # Max aggregate portfolio beta exposure
+    MAX_SECTOR_POSITIONS: int = 4             # Max concurrent positions per sector cluster (increased from 2)
+    MAX_PORTFOLIO_BETA_HEAT: float = 6.0      # Max aggregate portfolio beta exposure (increased from 3.0 to allow 4-6 concurrent 3x positions)
     ENFORCE_DAILY_CIRCUIT_BREAKER: bool = True
     DAILY_MAX_DRAWDOWN_PCT: float = 0.02      # 2.0% max daily portfolio drawdown
 
@@ -282,6 +282,27 @@ class Settings:
                 self.WATCHLIST = [s.strip() for s in env_watchlist.split(",") if s.strip()]
 
         # Advanced Risk & Safety Gates env loading
+        env_max_pos = os.environ.get("MAX_POSITION_PCT")
+        if env_max_pos:
+            try:
+                self.MAX_POSITION_PCT = float(env_max_pos.strip())
+            except ValueError:
+                pass
+
+        env_max_risk = os.environ.get("MAX_RISK_PER_TRADE")
+        if env_max_risk:
+            try:
+                self.MAX_RISK_PER_TRADE = float(env_max_risk.strip())
+            except ValueError:
+                pass
+
+        env_spec_thresh = os.environ.get("SPECULATIVE_CONFIDENCE_THRESHOLD")
+        if env_spec_thresh:
+            try:
+                self.SPECULATIVE_CONFIDENCE_THRESHOLD = float(env_spec_thresh.strip())
+            except ValueError:
+                pass
+
         env_spread_gate = os.environ.get("ENFORCE_SPREAD_GATE")
         if env_spread_gate is not None:
             self.ENFORCE_SPREAD_GATE = env_spread_gate.strip().lower() in ("1", "true", "yes", "t")

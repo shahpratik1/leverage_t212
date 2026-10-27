@@ -171,9 +171,13 @@ class DebateEngine:
         high_20d = float(metrics.get("high_20d", close))
 
         # Check for 3-RSI Mean Reversion Pattern (85%+ Win-Rate Edge)
-        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= 22.0):
-            if close > sma200 and rsi3 <= 22.0:
-                conviction = 0.94 if rsi3 <= 18.0 else 0.88
+        from trading_system.config import settings
+        rsi3_thresh = getattr(settings, "RSI3_OVERSOLD", 28.0)
+        adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
+
+        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= rsi3_thresh):
+            if close > sma200 and rsi3 <= rsi3_thresh:
+                conviction = 0.94 if rsi3 <= 20.0 else 0.88
                 target_p = sma5 if sma5 > close else close * 1.05
                 return DebateOutcome(
                     ticker=ticker,
@@ -183,7 +187,7 @@ class DebateEngine:
                         side="bull",
                         thesis="Institutional 3-RSI mean-reversion dip buying with 85%+ win rate expectation.",
                         key_evidence=[
-                            f"RSI(3)={rsi3:.1f} indicates extreme short-term liquidity flush inside secular bull trend.",
+                            f"RSI(3)={rsi3:.1f} indicates short-term liquidity flush inside secular bull trend.",
                             f"Price ({close:.2f}) remains safely above 200 SMA ({sma200:.2f}).",
                             f"Immediate mean-reversion magnet: 5-Day SMA at {sma5:.2f} (+{((sma5 - close) / close) * 100:.1f}%).",
                             "Larry Connors 3-RSI model historically demonstrates 85%+ win rate across large-cap pullbacks.",
@@ -222,29 +226,29 @@ class DebateEngine:
         else:
             bear_ev.append(f"20 EMA ({ema20:.2f}) < 50 EMA ({ema50:.2f}), short-term moving average compression.")
 
-        if rsi14 >= 52.0:
+        if rsi14 >= 50.0:
             bull_ev.append(f"RSI(14) at {rsi14:.1f} confirms active upward momentum.")
         elif rsi14 <= 45.0:
             bear_ev.append(f"RSI(14) at {rsi14:.1f} indicates negative momentum pressure.")
 
-        if adx >= 24.0:
+        if adx >= adx_trend_min:
             bull_ev.append(f"ADX at {adx:.1f} confirms decisive directional trend strength.")
         else:
             bear_ev.append(f"ADX at {adx:.1f} reflects weak/range-bound trend.")
 
-        if high_20d > 0 and close >= high_20d * 0.985:
-            bull_ev.append(f"Price is pressing 20-day high ({high_20d:.2f}), breakout in progress.")
+        if high_20d > 0 and close >= high_20d * 0.950:
+            bull_ev.append(f"Price is pressing within 5% of 20-day high ({high_20d:.2f}), breakout expansion active.")
 
         n_bull = len(bull_ev)
         n_bear = len(bear_ev)
         total = n_bull + n_bear
 
-        if n_bull >= 4 and n_bear <= 1:
-            conviction = 0.86
+        if n_bull >= 3 and n_bear <= 1:
+            conviction = 0.86 if n_bull >= 4 else 0.78
             consensus = "BUY_ENTRY"
             winner = "bull"
-        elif n_bear >= 4 and n_bull <= 1:
-            conviction = 0.84
+        elif n_bear >= 3 and n_bull <= 1:
+            conviction = 0.84 if n_bear >= 4 else 0.76
             consensus = "SELL_ENTRY"
             winner = "bear"
         else:
@@ -304,11 +308,15 @@ class DebateEngine:
         high_20d = metrics.get('high_20d', 0)
         sma5 = metrics.get('sma5', close)
         
+        from trading_system.config import settings
+        rsi3_thresh = getattr(settings, "RSI3_OVERSOLD", 28.0)
+        adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
+
         # 3-RSI check
-        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= 22.0):
-            bull_evidence.append(f"Extreme 3-RSI oversold condition (RSI3={rsi3:.1f} <= 22.0) with price above 200 SMA.")
+        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= rsi3_thresh):
+            bull_evidence.append(f"Short-term 3-RSI pullback (RSI3={rsi3:.1f} <= {rsi3_thresh:.1f}) with price above 200 SMA.")
             bull_evidence.append(f"5-day SMA at {sma5:.2f} provides strong magnetic reversion target.")
-        elif rsi14 > 50:
+        elif rsi14 >= 50:
             bull_evidence.append(f"RSI(14) at {rsi14:.1f} is above 50, indicating bullish momentum.")
         else:
             bear_evidence.append(f"RSI(14) at {rsi14:.1f} is below 50, indicating bearish momentum.")
@@ -323,7 +331,7 @@ class DebateEngine:
         else:
             bear_evidence.append(f"Price ({close:.2f}) < 200 SMA ({sma200:.2f}), long-term downtrend.")
 
-        if adx > 25:
+        if adx >= adx_trend_min:
             bull_evidence.append(f"ADX at {adx:.1f} indicates strong trend velocity.")
         else:
             bear_evidence.append(f"ADX at {adx:.1f} indicates low directional momentum.")

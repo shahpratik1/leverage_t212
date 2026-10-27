@@ -74,8 +74,8 @@ class RiskManager:
 
     def __init__(
         self,
-        max_risk_per_trade: float = 0.005,      # 0.5% equity risk default
-        max_position_pct: float = 0.05,         # 5% max equity notional
+        max_risk_per_trade: Optional[float] = None,
+        max_position_pct: Optional[float] = None,
         atr_sl_multiplier: float = 1.5,
         min_sl_pct: float = 0.005,              # 0.5% minimum stop distance
         tp1_r: float = 1.0,
@@ -95,8 +95,9 @@ class RiskManager:
         enforce_daily_circuit_breaker: Optional[bool] = None,
         daily_max_drawdown_pct: Optional[float] = None,
     ):
-        self.max_risk_per_trade = max_risk_per_trade
-        self.max_position_pct = max_position_pct
+        from trading_system.config import settings
+        self.max_risk_per_trade = getattr(settings, "MAX_RISK_PER_TRADE", 0.015) if max_risk_per_trade is None else max_risk_per_trade
+        self.max_position_pct = getattr(settings, "MAX_POSITION_PCT", 0.20) if max_position_pct is None else max_position_pct
         self.atr_sl_multiplier = atr_sl_multiplier
         self.min_sl_pct = min_sl_pct
         self.tp1_r = tp1_r
@@ -110,12 +111,11 @@ class RiskManager:
         self.target_annual_volatility = target_annual_volatility
 
         # Advanced Risk & Safety Gates
-        from trading_system.config import settings
         self.enforce_spread_gate = getattr(settings, "ENFORCE_SPREAD_GATE", True) if enforce_spread_gate is None else enforce_spread_gate
-        self.max_bid_ask_spread_pct = getattr(settings, "MAX_BID_ASK_SPREAD_PCT", 0.0035) if max_bid_ask_spread_pct is None else max_bid_ask_spread_pct
+        self.max_bid_ask_spread_pct = getattr(settings, "MAX_BID_ASK_SPREAD_PCT", 0.0150) if max_bid_ask_spread_pct is None else max_bid_ask_spread_pct
         self.enforce_correlation_limits = getattr(settings, "ENFORCE_CORRELATION_LIMITS", True) if enforce_correlation_limits is None else enforce_correlation_limits
-        self.max_sector_positions = getattr(settings, "MAX_SECTOR_POSITIONS", 2) if max_sector_positions is None else max_sector_positions
-        self.max_portfolio_beta_heat = getattr(settings, "MAX_PORTFOLIO_BETA_HEAT", 3.0) if max_portfolio_beta_heat is None else max_portfolio_beta_heat
+        self.max_sector_positions = getattr(settings, "MAX_SECTOR_POSITIONS", 4) if max_sector_positions is None else max_sector_positions
+        self.max_portfolio_beta_heat = getattr(settings, "MAX_PORTFOLIO_BETA_HEAT", 6.0) if max_portfolio_beta_heat is None else max_portfolio_beta_heat
         self.enforce_daily_circuit_breaker = getattr(settings, "ENFORCE_DAILY_CIRCUIT_BREAKER", True) if enforce_daily_circuit_breaker is None else enforce_daily_circuit_breaker
         self.daily_max_drawdown_pct = getattr(settings, "DAILY_MAX_DRAWDOWN_PCT", 0.02) if daily_max_drawdown_pct is None else daily_max_drawdown_pct
         self.trade_loss_cooldown_seconds = getattr(settings, "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0)

@@ -217,8 +217,13 @@ class LayaScreener:
         )
         base_catalyst_risk = 0.90 if is_earnings_blackout else 0.05
 
-        # Bullish Dip: Macro bull (close > sma200), extreme short-term liquidation (rsi3 <= 22, rsi7 <= 42)
-        if close > sma200 and rsi3 <= 22.0 and rsi7 <= 42.0:
+        # Bullish Dip: Macro bull (close > sma200), short-term pullback (rsi3 <= 28, rsi7 <= 45)
+        from trading_system.config import settings
+        rsi3_oversold = getattr(settings, "RSI3_OVERSOLD", 28.0)
+        rsi7_oversold = getattr(settings, "RSI7_OVERSOLD", 45.0)
+        adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
+
+        if close > sma200 and rsi3 <= rsi3_oversold and rsi7 <= rsi7_oversold:
             return ScreenerResult(
                 ticker=ticker,
                 bias="bullish",
@@ -231,8 +236,8 @@ class LayaScreener:
                 metrics=metrics,
                 state_document=state,
             )
-        # Bearish Overbought: Macro bear (close < sma200), short-squeeze exhaustion (rsi3 >= 78, rsi7 >= 58)
-        elif close < sma200 and rsi3 >= 78.0 and rsi7 >= 58.0:
+        # Bearish Overbought: Macro bear (close < sma200), short-squeeze exhaustion (rsi3 >= 78, rsi7 >= 55)
+        elif close < sma200 and rsi3 >= 78.0 and rsi7 >= 55.0:
             return ScreenerResult(
                 ticker=ticker,
                 bias="bearish",
@@ -248,12 +253,12 @@ class LayaScreener:
 
         # ── 2. Rule-based evaluation fallback when Laya engine is unavailable ──
         if self.router is None:
-            if close > sma200 and ema20 > ema50 and rsi14 > 50.0:
+            if close > sma200 and ema20 > ema50 and rsi14 >= 50.0:
                 bias = "bullish"
-                setup_score = "exceptional" if (rsi14 > 58.0 and adx >= 25.0) else "favorable"
+                setup_score = "exceptional" if (rsi14 > 55.0 and adx >= adx_trend_min) else "favorable"
             elif close < sma200 and ema20 < ema50 and rsi14 < 48.0:
                 bias = "bearish"
-                setup_score = "exceptional" if (rsi14 < 40.0 and adx >= 25.0) else "favorable"
+                setup_score = "exceptional" if (rsi14 < 42.0 and adx >= adx_trend_min) else "favorable"
             else:
                 bias = "neutral"
                 setup_score = "mediocre"
