@@ -187,6 +187,72 @@ class TestBrokerNativeStops(unittest.TestCase):
         # TP1 must be above entry for a LONG position
         self.assertGreater(pos.tp1, pos.entry_price)
 
+    def test_heal_stale_stop_inverse_etp_places_stop_below_market_price(self):
+        """For an inverse ETP (e.g. 5STLd_EQ with direction=SHORT), healed stop must be BELOW live price.
+
+        Placing a stop price above market price on held shares creates an immediate market fill
+        on Trading 212, triggering instant liquidated losses.
+        """
+        from trading_system.data.trading212_client import Position
+        pos = TrackedPosition(
+            ticker="5STLd_EQ",
+            underlying="TLT",
+            direction="SHORT",
+            entry_price=15.10,
+            original_quantity=1.0,
+            remaining_quantity=1.0,
+            stop_loss=83.48,  # stale contaminated stop
+            trailing_stop_loss=83.48,
+            highest_price=15.10,
+            lowest_price=15.10,
+            tp1=15.60,
+            tp2=16.00,
+            tp3=16.40,
+            atr=0.15,
+        )
+        self.monitor.positions["5STLd_EQ"] = pos
+        self.monitor.dry_run = False
+
+        # Mock broker portfolio returning live price of 15.08
+        mock_bp = MagicMock(spec=Position)
+        mock_bp.ticker = "5STLd_EQ"
+        mock_bp.current_price = 15.08
+        mock_bp.average_price = 15.10
+        self.mock_t212.get_portfolio.return_value = [mock_bp]
+
+        self.monitor._heal_stale_stop(pos)
+
+        # The new stop MUST be strictly below live_price (15.08)
+        self.assertLess(pos.stop_loss, 15.08, f"Healed stop {pos.stop_loss} must be below live price 15.08")
+        self.assertLess(pos.trailing_stop_loss, 15.08)
+
+    def test_inverse_etp_pnl_calculation_is_not_inverted(self):
+        """For an inverse ETP (e.g. 5STLd_EQ), holding shares means when price rises, P&L is positive."""
+        pos = TrackedPosition(
+            ticker="5STLd_EQ",
+            underlying="TLT",
+            direction="SHORT",
+            entry_price=15.00,
+            original_quantity=10.0,
+            remaining_quantity=10.0,
+            stop_loss=14.50,
+            trailing_stop_loss=14.50,
+            highest_price=15.00,
+            lowest_price=15.00,
+            tp1=15.50,
+            tp2=16.00,
+            tp3=16.50,
+            atr=0.15,
+        )
+        # Price increases from 15.00 to 16.00 (+1.00 per share)
+        pnl, pnl_pct = self.monitor._calculate_pnl(pos, price=16.00, quantity=10.0)
+        self.assertEqual(pnl, 10.0)
+        self.assertEqual(pnl_pct, 6.67)
+
+        # Price decreases from 15.00 to 14.00 (-1.00 per share)
+        pnl_loss, pnl_loss_pct = self.monitor._calculate_pnl(pos, price=14.00, quantity=10.0)
+        self.assertEqual(pnl_loss, -10.0)
+        self.assertEqual(pnl_loss_pct, -6.67)
 
 
 if __name__ == "__main__":

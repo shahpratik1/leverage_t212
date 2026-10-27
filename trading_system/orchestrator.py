@@ -680,6 +680,16 @@ class Orchestrator:
                                 break
                     except Exception as port_exc:
                         logger.debug("Could not retrieve post-order portfolio fill price: %s", port_exc)
+
+                # Secondary safeguard against scale contamination if fill_price is still missing
+                if not fill_price or fill_price <= 0:
+                    try:
+                        quote = MarketDataProvider.get_quote(card.trading212_ticker)
+                        live_px = quote.get("price") or quote.get("close")
+                        if live_px and float(live_px) > 0:
+                            fill_price = float(live_px)
+                    except Exception as quote_exc:
+                        logger.debug("Could not retrieve live quote for %s: %s", card.trading212_ticker, quote_exc)
             except Trading212Error as exc:
                 logger.error("Execution failed for %s: %s", card.trading212_ticker, exc)
                 self._log_trade(card, executed=False, reason=str(exc))
@@ -706,31 +716,18 @@ class Orchestrator:
         notif_tp1 = pos.tp1
         notif_tp2 = pos.tp2
         notif_tp3 = pos.tp3
-        if card.direction == "LONG":
-            self.notifier.notify_buy(
-                ticker=card.trading212_ticker,
-                underlying=card.ticker,
-                price=notif_price,
-                quantity=card.position_size_shares,
-                sl=notif_sl,
-                tp1=notif_tp1,
-                tp2=notif_tp2,
-                tp3=notif_tp3,
-                rationale=card.rationale,
-            )
-        else:
-            self.notifier.notify_sell(
-                ticker=card.trading212_ticker,
-                underlying=card.ticker,
-                price=notif_price,
-                quantity=card.position_size_shares,
-                sl=notif_sl,
-                tp1=notif_tp1,
-                tp2=notif_tp2,
-                tp3=notif_tp3,
-                is_short_entry=True,
-                rationale=card.rationale,
-            )
+        self.notifier.notify_buy(
+            ticker=card.trading212_ticker,
+            underlying=card.ticker,
+            price=notif_price,
+            quantity=card.position_size_shares,
+            sl=notif_sl,
+            tp1=notif_tp1,
+            tp2=notif_tp2,
+            tp3=notif_tp3,
+            direction=card.direction,
+            rationale=card.rationale,
+        )
 
         self._log_trade(card, executed=True, reason="Entry order placed", entry_order_id=order_id)
         return True

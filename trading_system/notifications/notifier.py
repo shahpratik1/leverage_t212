@@ -102,13 +102,19 @@ class Notifier:
         tp2: float,
         tp3: float,
         rationale: str = "",
+        direction: str = "LONG",
     ) -> None:
-        """Send a BUY / LONG Entry notification."""
+        """Send a BUY / Entry notification (for both Long and Inverse ETP entries)."""
+        default_rationale = (
+            "System detected 3x Bearish breakdown momentum"
+            if direction.upper() == "SHORT"
+            else "System detected 3x Bullish breakout momentum (ADX > 25, 20 EMA > 50 EMA)"
+        )
         note = TradeNotification(
             event_type="BUY",
             ticker=ticker,
             underlying=underlying,
-            direction="LONG",
+            direction=direction,
             price=price,
             quantity=quantity,
             stop_loss=sl,
@@ -116,7 +122,7 @@ class Notifier:
             tp1=tp1,
             tp2=tp2,
             tp3=tp3,
-            rationale=rationale or "System detected 3x Bullish breakout momentum (ADX > 25, 20 EMA > 50 EMA)",
+            rationale=rationale or default_rationale,
         )
         self.dispatch(note)
 

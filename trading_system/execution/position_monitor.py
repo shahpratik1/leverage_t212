@@ -132,6 +132,46 @@ class PositionMonitor:
     # ─────────────────────────────────────────────────────────────
     # Exit Levels & Target Calculations
     # ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def is_true_short_contract(pos_or_ticker: Any, direction: str = "") -> bool:
+        """Return True only if position is a margin/CFD short where falling price is profit.
+
+        For all Trading 212 Invest assets (including 3x and 5x inverse ETPs like 5STLd_EQ),
+        shares are held long, so rising ETP price is profit and Stop Loss must be BELOW live price.
+        """
+        if pos_or_ticker is None:
+            return False
+        if isinstance(pos_or_ticker, str):
+            ticker = pos_or_ticker.upper()
+            dir_str = direction.upper()
+            tp1 = 0.0
+            entry = 0.0
+        else:
+            ticker = (getattr(pos_or_ticker, "ticker", "") or "").upper()
+            dir_str = (getattr(pos_or_ticker, "direction", "") or "").upper()
+            tp1 = getattr(pos_or_ticker, "tp1", 0.0) or 0.0
+            entry = getattr(pos_or_ticker, "entry_price", 0.0) or 0.0
+
+        if dir_str == "LONG":
+            return False
+
+        # If explicitly configured as a short with TP1 < entry (e.g. synthetic CFD short in unit tests)
+        if tp1 > 0 and entry > 0 and tp1 < entry:
+            return True
+
+        # Otherwise, Trading 212 Invest spot equities & ETPs trade long
+        if (
+            ticker.endswith("_EQ")
+            or ticker.endswith(".L")
+            or "_ETP" in ticker
+            or dir_str.endswith("_ETP")
+            or ticker.startswith("3")
+            or ticker.startswith("5")
+        ):
+            return False
+
+        return dir_str == "SHORT"
+
     def calculate_exit_levels(
         self,
         entry_price: float,
@@ -154,13 +194,7 @@ class PositionMonitor:
             TP2 = Entry +/- 2.0R (+2x SL distance)
             TP3 = Entry +/- 3.0R (+3x SL distance)
         """
-        is_short = (
-            direction.upper() == "SHORT"
-            and not (
-                (ticker and (ticker.endswith("_EQ") or ticker.endswith(".L")))
-                or direction.upper().endswith("_ETP")
-            )
-        )
+        is_short = self.is_true_short_contract(ticker or "", direction=direction)
         entry = max(0.01, entry_price)
 
         # Resolve leverage multiplier (defaults to 3.0 for ETPs, 5.0 for 5x, 1.0 for ordinary)
@@ -236,14 +270,7 @@ class PositionMonitor:
         """Register a newly opened trade for active lifecycle tracking."""
         # On Trading 212 Invest/Stocks, all leveraged ETPs (both 3x Long and 3x Inverse Short)
         # are spot instruments bought long; an increasing ETP price represents profit.
-        is_cfd_short = (
-            card.direction.upper() == "SHORT"
-            and not (
-                card.trading212_ticker.endswith("_EQ")
-                or card.trading212_ticker.endswith(".L")
-                or card.direction.upper().endswith("_ETP")
-            )
-        )
+        is_cfd_short = self.is_true_short_contract(card.trading212_ticker, direction=card.direction)
 
         # Derive relative price proportions from DecisionCard
         stop_dist_pct = abs(card.entry_price - card.stop_loss) / card.entry_price if card.entry_price > 0 else 0.05
@@ -251,6 +278,17 @@ class PositionMonitor:
         tp2_dist_pct = abs(card.take_profit_2 - card.entry_price) / card.entry_price if card.entry_price > 0 else 0.10
         tp3_dist_pct = abs(card.take_profit_3 - card.entry_price) / card.entry_price if card.entry_price > 0 else 0.15
         atr_pct = (atr / card.entry_price) if (atr > 0 and card.entry_price > 0) else 0.02
+
+        if not fill_price or fill_price <= 0:
+            # Prevent underlying price scale contamination (e.g. TLT $81.68 vs 5STL €15.11)
+            if card.trading212_ticker and card.trading212_ticker != card.ticker:
+                try:
+                    quote = MarketDataProvider.get_quote(card.trading212_ticker)
+                    live_q = quote.get("price") or quote.get("close")
+                    if live_q and float(live_q) > 0:
+                        fill_price = float(live_q)
+                except Exception:
+                    pass
 
         if fill_price and fill_price > 0:
             entry_price = round(fill_price, 4)
@@ -269,11 +307,20 @@ class PositionMonitor:
             calibrated_atr = round(entry_price * atr_pct, 4)
         else:
             entry_price = card.entry_price
-            stop_loss = card.stop_loss
-            trailing_stop_loss = card.trailing_stop_loss or card.stop_loss
-            tp1 = card.take_profit_1
-            tp2 = card.take_profit_2
-            tp3 = card.take_profit_3
+            # If not CFD short and card stop loss is >= entry price (underlying inverted scale), recalculate
+            if not is_cfd_short and card.stop_loss >= card.entry_price > 0:
+                levels = self.calculate_exit_levels(entry_price=entry_price, direction=card.direction, ticker=card.trading212_ticker)
+                stop_loss = levels["stop_loss"]
+                trailing_stop_loss = levels["trailing_stop_loss"]
+                tp1 = levels["tp1"]
+                tp2 = levels["tp2"]
+                tp3 = levels["tp3"]
+            else:
+                stop_loss = card.stop_loss
+                trailing_stop_loss = card.trailing_stop_loss or card.stop_loss
+                tp1 = card.take_profit_1
+                tp2 = card.take_profit_2
+                tp3 = card.take_profit_3
             calibrated_atr = atr or (card.entry_price * 0.02)
 
         raw_earnings = earnings_in_days if earnings_in_days is not None else getattr(card, "earnings_in_days", None)
@@ -403,10 +450,10 @@ class PositionMonitor:
             if not atr_pct or atr_pct <= 0:
                 atr_pct = 0.02
             # Compute fresh stop: 2.5× ATR away from current price in the protective direction
-            if pos.direction == "LONG":
-                new_sl = round(live_price * (1.0 - atr_pct * 2.5), 4)
-            else:
+            if self.is_true_short_contract(pos):
                 new_sl = round(live_price * (1.0 + atr_pct * 2.5), 4)
+            else:
+                new_sl = round(live_price * (1.0 - atr_pct * 2.5), 4)
             logger.warning(
                 "_heal_stale_stop %s: old_sl=%.4f → new_sl=%.4f (live_price=%.4f, atr_pct=%.4f)",
                 pos.ticker, pos.stop_loss, new_sl, live_price, atr_pct,
@@ -596,7 +643,7 @@ class PositionMonitor:
             if pos.is_closed or pos.remaining_quantity <= 0 or pos.entry_price <= 0:
                 continue
 
-            is_short = (pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"))
+            is_short = self.is_true_short_contract(pos)
             peak = pos.lowest_price if is_short else pos.highest_price
 
             # Sanity guard: Peak cannot exceed 2.0x entry or be <0.2x entry on ETPs (indicates underlying scale contamination)
@@ -1364,7 +1411,7 @@ class PositionMonitor:
                 if escape_cleared:
                     pos.tp1_armed_hysteresis = False
                     pos.tp1_stop_elevated = True
-                    if pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"):
+                    if self.is_true_short_contract(pos):
                         pos.trailing_stop_loss = min(pos.trailing_stop_loss, pos.tp1) if pos.trailing_stop_loss > 0 else pos.tp1
                         pos.stop_loss = min(pos.stop_loss, pos.tp1) if pos.stop_loss > 0 else pos.tp1
                     else:
@@ -1479,7 +1526,7 @@ class PositionMonitor:
             if cur_px <= 0 or pos.entry_price <= 0:
                 continue
 
-            is_short = (pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"))
+            is_short = self.is_true_short_contract(pos)
             pnl_pct = ((pos.entry_price - cur_px) / pos.entry_price * 100.0) if is_short else ((cur_px - pos.entry_price) / pos.entry_price * 100.0)
 
             # 1. Connors 3-RSI Mean Reversion Overbought Profit-Taking (LONG)
@@ -1593,11 +1640,7 @@ class PositionMonitor:
     @staticmethod
     def _calculate_pnl(pos: TrackedPosition, price: float, quantity: float) -> Tuple[float, float]:
         """Compute realized P&L amount and percentage accounting for direction."""
-        is_short = (pos.tp1 < pos.entry_price) if (pos.tp1 > 0 and pos.entry_price > 0) else (
-            pos.direction.upper() == "SHORT" and not (
-                pos.ticker.endswith("_EQ") or pos.ticker.endswith(".L") or pos.direction.upper().endswith("_ETP")
-            )
-        )
+        is_short = PositionMonitor.is_true_short_contract(pos)
         if is_short:
             diff = pos.entry_price - price
         else:
@@ -1678,7 +1721,7 @@ class PositionMonitor:
         pos.remaining_quantity = max(0.0, pos.remaining_quantity - actual_trim)
 
         # Ratchet trailing stop to TP1
-        if pos.direction.upper() == "SHORT" and not pos.direction.upper().endswith("_ETP"):
+        if self.is_true_short_contract(pos):
             pos.trailing_stop_loss = min(pos.trailing_stop_loss, pos.tp1) if pos.trailing_stop_loss > 0 else pos.tp1
             pos.stop_loss = min(pos.stop_loss, pos.tp1) if pos.stop_loss > 0 else pos.tp1
         else:
@@ -1871,14 +1914,21 @@ class PositionMonitor:
                             pos.ticker, pos.direction, authoritative_dir,
                         )
                         pos.direction = authoritative_dir
-                        if pos.direction == "LONG" and pos.stop_loss >= pos.entry_price > 0:
-                            levels = self.calculate_exit_levels(entry_price=pos.entry_price, direction="LONG", ticker=pos.ticker)
-                            pos.stop_loss = levels["stop_loss"]
-                            pos.trailing_stop_loss = levels["trailing_stop_loss"]
-                            pos.tp1 = levels["tp1"]
-                            pos.tp2 = levels["tp2"]
-                            pos.tp3 = levels["tp3"]
                         state_updated = True
+
+                    # Auto-heal inverted stop loss for any spot ETP / equity holding
+                    if not self.is_true_short_contract(pos) and pos.stop_loss >= pos.entry_price > 0:
+                        levels = self.calculate_exit_levels(entry_price=pos.entry_price, direction=pos.direction, ticker=pos.ticker)
+                        pos.stop_loss = levels["stop_loss"]
+                        pos.trailing_stop_loss = levels["trailing_stop_loss"]
+                        pos.tp1 = levels["tp1"]
+                        pos.tp2 = levels["tp2"]
+                        pos.tp3 = levels["tp3"]
+                        state_updated = True
+                        logger.warning(
+                            "Auto-healed inverted stop loss for spot holding %s: sl=%.4f >= entry=%.4f. Recalibrated SL to %.4f",
+                            pos.ticker, pos.stop_loss, pos.entry_price, levels["stop_loss"],
+                        )
 
                     # Auto-heal underlying scale contamination (e.g. tp1 computed on underlying index)
                     if pos.entry_price > 0 and pos.tp1 > 3.0 * pos.entry_price:
