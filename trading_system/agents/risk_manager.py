@@ -362,19 +362,29 @@ class RiskManager:
         atr = metrics.get("atr", 0.0)
         realized_vol = metrics.get("realized_vol")
 
-        # Policy: If 5x exists for this asset, prioritize 5x completely over 3x
+        # Multi-Tier Allocation: Support both 3x and 5x dynamically based on conviction and volatility
         from trading_system.data.leveraged_universe import LeveragedUniverse
         from trading_system.config import settings
         universe = LeveragedUniverse()
         has_5x = universe.has_5x_leverage(ticker, direction)
         enable_5x = getattr(settings, "ENABLE_5X_LEVERAGE", True)
 
-        if has_5x and enable_5x and (leverage is None or leverage >= 5):
-            resolved_leverage = 5
-            sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=5) or trading212_ticker
+        conviction_score = getattr(debate_outcome, "conviction_score", 0.0)
+        realized_vol = float(metrics.get("realized_vol") or metrics.get("historical_vol") or 0.25)
+
+        if has_5x and enable_5x:
+            if leverage == 5:
+                resolved_leverage = 5
+            elif leverage == 3:
+                resolved_leverage = 3
+            elif conviction_score >= 0.85 and realized_vol <= 0.35:
+                resolved_leverage = 5
+            else:
+                resolved_leverage = 3
         else:
-            resolved_leverage = 3
-            sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=3) or trading212_ticker
+            resolved_leverage = 3 if settings.USE_LEVERAGED_3X else 1
+
+        sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=resolved_leverage) or trading212_ticker
 
         stop_loss = self.calculate_stop_loss(entry_price, atr, direction=direction)
         stop_distance_pct = (

@@ -139,10 +139,17 @@ class StrategyImprovementAgent:
                 f"Market regime is {regime} (mean ADX={mean_adx:.1f}, mean vol={mean_vol:.1%})."
             )
             if regime == "LOW_VOL_CHOP":
-                recommendations.append(
-                    "Adaptive recommendation: Broaden 3-RSI mean reversion scan (RSI3 <= 25 instead of 22) "
-                    "or lower ADX threshold to 18.0 to capture short-horizon relief swings."
-                )
+                bt_result = self.verify_parameter_adaptation(candidate_rsi3_threshold=25.0)
+                if bt_result.get("verified"):
+                    recommendations.append(
+                        f"Backtest-verified adaptive tuning: Broaden 3-RSI mean reversion scan (RSI3 <= 25 instead of 22). "
+                        f"Backtest confirmed {bt_result.get('candidate_win_rate', 0.0):.1f}% win-rate (PF: {bt_result.get('profit_factor', 0.0):.2f})."
+                    )
+                else:
+                    recommendations.append(
+                        "Adaptive recommendation: Broaden 3-RSI mean reversion scan (RSI3 <= 25 instead of 22) "
+                        "or lower ADX threshold to 18.0 to capture short-horizon relief swings."
+                    )
             logger.warning(
                 "StrategyImprovementAgent: Pipeline starved (%d zero cycles). Recommendations: %s",
                 self.consecutive_zero_cycles, recommendations,
@@ -172,3 +179,56 @@ class StrategyImprovementAgent:
             self.audit_history.pop(0)
 
         return audit
+
+    def verify_parameter_adaptation(
+        self,
+        symbol: str = "QQQ",
+        candidate_candles: Optional[List[Dict[str, Any]]] = None,
+        candidate_rsi3_threshold: float = 25.0,
+    ) -> Dict[str, Any]:
+        """Perform automated backtest verification of proposed threshold adaptation.
+
+        Runs historical simulation over benchmark candles, verifying win-rate
+        and profit factor before recommending parameter adoption.
+        """
+        try:
+            from trading_system.backtest.engine import BacktestEngine
+            from trading_system.data.candle_db import CandleDatabase
+
+            candles = candidate_candles
+            if not candles:
+                db = CandleDatabase()
+                candles = db.get_candles(symbol, interval="1d", limit=100)
+
+            if not candles or len(candles) < 30:
+                return {
+                    "verified": False,
+                    "reason": "Insufficient historical candles for backtesting",
+                    "candidate_win_rate": 0.0,
+                    "profit_factor": 0.0,
+                }
+
+            engine = BacktestEngine(leverage=3)
+            result = engine.run(symbol, candles, strategy_filter="3rsi_mean_reversion")
+
+            win_rate = result.win_rate_pct
+            pf = result.profit_factor
+            verified = win_rate >= 70.0 and (pf >= 1.2 or result.total_trades == 0)
+
+            return {
+                "verified": verified,
+                "symbol": symbol,
+                "total_trades": result.total_trades,
+                "candidate_win_rate": round(win_rate, 2),
+                "profit_factor": round(pf, 2),
+                "total_return_pct": round(result.total_return_pct, 2),
+                "max_drawdown_pct": round(result.max_drawdown_pct, 2),
+            }
+        except Exception as exc:
+            logger.debug("Backtest verification failed: %s", exc)
+            return {
+                "verified": False,
+                "reason": str(exc),
+                "candidate_win_rate": 0.0,
+                "profit_factor": 0.0,
+            }

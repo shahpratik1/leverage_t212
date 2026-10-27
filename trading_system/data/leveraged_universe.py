@@ -1637,13 +1637,14 @@ class LeveragedUniverse:
     def get_available_leverage_multipliers(self, underlying: str) -> List[int]:
         """Return supported leverage multipliers for an asset.
 
-        Policy: If 5x exists on the asset, it completely replaces 3x, so available leverage is [5].
+        Multi-Tier Policy: If 5x exists on the asset, both [3, 5] multipliers are supported
+        to enable simultaneous tiered allocation based on conviction and volatility.
         Otherwise, standard 3x is supported [3].
         """
         pair = self.get_pair_for_underlying(underlying)
         if not pair:
             return [1]
-        return [5] if pair.has_5x else [3]
+        return [3, 5] if pair.has_5x else [3]
 
     def get_execution_ticker(
         self,
@@ -1655,9 +1656,9 @@ class LeveragedUniverse:
         """Given an underlying symbol, direction ('LONG' or 'SHORT'), and desired leverage (3 or 5),
         return the appropriate Trading 212 execution ticker prioritizing EUR as first preference.
 
-        Policy:
-        1. If 5x is available for this asset (pair.has_5x), return the 5x ETP (replacing 3x completely).
-        2. If 5x is not available, return the 3x ETP.
+        Multi-Tier Allocation:
+        1. If leverage == 5 (or leverage is None on a 5x asset), return the 5x ETP.
+        2. If leverage == 3, return the 3x ETP (even if 5x exists on the asset).
         3. If preferred_currency is specified (default 'EUR'), return that currency's ticker if available.
         """
         pair = self.get_pair_for_underlying(underlying)

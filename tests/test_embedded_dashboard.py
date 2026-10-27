@@ -167,6 +167,7 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertIn("active_signals", payload)
         self.assertIn("broker_status", payload)
         self.assertIn("pairs_watchlist", payload)
+        self.assertIn("equity_history", payload)
 
     def test_fetch_live_broker_notifications(self):
         """Verify historical orders from Trading 212 format into live notification stream."""

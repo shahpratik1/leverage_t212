@@ -228,6 +228,7 @@ def load_active_signals(
                 "underlying": underlying,
                 "name": asset_name,
                 "direction": direction,
+                "leverage": int(pos.get("leverage") or (5 if "5" in ticker else 3)),
                 "strategy_type": strategy_type,
                 "rsi3": rsi3,
                 "rsi7": rsi7,
@@ -526,6 +527,7 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                         "underlying": underlying,
                         "name": underlying_name,
                         "direction": direction,
+                        "leverage": 5 if ("5" in b_ticker) else 3,
                         "strategy_type": "broker_placed",
                         "rsi3": None, "rsi7": None, "rsi14": None, "sma5": None,
                         "win_rate_exp": "85%",
@@ -585,6 +587,23 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
 
         active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
 
+        # Construct session equity curve from trade history and current open P&L
+        base_equity = 10000.0
+        equity_points = [{"time": "Start", "equity": base_equity}]
+        running_equity = base_equity
+        chronological_events = [e for e in recent_notifications if e.get("pnl") is not None]
+        chronological_events.reverse()
+        for ev in chronological_events:
+            pnl_val = float(ev.get("pnl") or 0.0)
+            running_equity += pnl_val
+            t_str = str(ev.get("timestamp") or "")[-12:-4] or "Trade"
+            equity_points.append({"time": t_str, "equity": round(running_equity, 2)})
+
+        total_open_pnl = sum(float(s.get("pnl_amount") or 0.0) for s in active_signals)
+        live_equity = round(running_equity + total_open_pnl, 2)
+        now_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        equity_points.append({"time": now_time, "equity": live_equity})
+
         res = {
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "mode": "MANUAL_SIGNALS_MODE",
@@ -593,6 +612,8 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
             "recent_notifications": recent_notifications,
             "pairs_watchlist": pairs,
             "history": history,
+            "equity_history": equity_points,
+            "current_equity": live_equity,
             "broker_status": {
                 "broker_name": "Trading 212 Demo",
                 "is_connected": True,
@@ -916,8 +937,12 @@ def generate_html_dashboard(output_path: str) -> str:
 
       signals.forEach(s => {{
         const isLong = s.direction === 'LONG';
+        const lev = s.leverage || (s.ticker && s.ticker.includes('5') ? 5 : 3);
+        const levBadge = lev === 5
+          ? '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">5x Institutional</span>'
+          : '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">3x Daily</span>';
         const badgeColor = isLong ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-        const actionText = isLong ? '🟢 BUY / LONG (3x)' : '🔴 SELL / SHORT (3x)';
+        const actionText = isLong ? `🟢 BUY / LONG (${{lev}}x)` : `🔴 SELL / SHORT (${{lev}}x)`;
         const code = (s.currency_code || '').toUpperCase();
         const sTk = (s.ticker || '').toUpperCase();
         let currPrefix = '';
@@ -985,8 +1010,9 @@ def generate_html_dashboard(output_path: str) -> str:
                 <div class="flex items-center gap-2">
                   <span class="text-lg font-black text-white tracking-wide">${{s.name || s.underlying}}</span>
                   <span class="text-xs font-mono text-slate-400 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">${{s.ticker}}</span>
+                  ${{levBadge}}
                 </div>
-                <div class="text-xs text-slate-400 mt-0.5">3x Leveraged ETP &bull; ${{currBadge}}</div>
+                <div class="text-xs text-slate-400 mt-0.5">${{lev}}x Leveraged ETP &bull; ${{currBadge}}</div>
               </div>
 
               <span class="px-2.5 py-1 rounded-md text-xs font-black uppercase tracking-wider border ${{badgeColor}}">

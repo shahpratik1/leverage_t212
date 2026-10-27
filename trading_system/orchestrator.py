@@ -412,13 +412,17 @@ class Orchestrator:
             )
             return None
 
-        # ── 1. Map to Leveraged Execution Ticker (5x if available, else 3x) ──────
+        # ── 1. Map to Leveraged Execution Ticker (Multi-Tier 5x & 3x Allocation) ──
         direction_upper = direction.upper()
         is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
         if settings.USE_LEVERAGED_3X:
-            # Policy: if 5x exists, prioritize 5x completely over 3x
             has_5x = self.leveraged_universe.has_5x_leverage(underlying, direction)
-            target_leverage = 5 if (has_5x and getattr(settings, "ENABLE_5X_LEVERAGE", True)) else 3
+            realized_vol = float(metrics.get("realized_vol") or metrics.get("historical_vol") or 0.25)
+            confidence = float(getattr(candidate, "overall_confidence", 0.0) or 0.0)
+            if has_5x and getattr(settings, "ENABLE_5X_LEVERAGE", True):
+                target_leverage = 5 if (confidence >= 0.85 and realized_vol <= 0.35) else 3
+            else:
+                target_leverage = 3
             t212_ticker = self.leveraged_universe.get_execution_ticker(underlying, direction, leverage=target_leverage)
             if not t212_ticker:
                 if is_short:

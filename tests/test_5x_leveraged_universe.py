@@ -22,8 +22,11 @@ class Test5xLeveragedUniverse(unittest.TestCase):
             pair = self.universe.get_pair_for_underlying(symbol)
             self.assertIsNotNone(pair, f"Missing pair for {symbol}")
             self.assertTrue(pair.has_5x, f"Expected has_5x=True for {symbol}")
-            # Policy: if 5x exists, available leverage multiplier is [5] (prioritizing 5x)
-            self.assertEqual(self.universe.get_available_leverage_multipliers(symbol), [5])
+            # Policy: if 5x exists, available leverage multipliers are [3, 5] (supporting multi-tier allocation)
+            self.assertEqual(self.universe.get_available_leverage_multipliers(symbol), [3, 5])
+            # Multi-tier resolution: requesting 3x on a 5x asset returns the 3x ETP
+            self.assertIsNotNone(self.universe.get_execution_ticker(symbol, "LONG", leverage=3))
+            self.assertIsNotNone(self.universe.get_execution_ticker(symbol, "LONG", leverage=5))
 
     def test_single_stocks_capped_at_3x(self):
         """Single equities remain 3x due to European UCITS concentration regulations."""

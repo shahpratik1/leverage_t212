@@ -76,6 +76,29 @@ class TestStrategyImprovementAgent(unittest.TestCase):
         self.assertEqual(audit.regime, "LOW_VOL_CHOP")
         self.assertGreater(len(audit.recommendations), 0)
 
+    def test_verify_parameter_adaptation(self) -> None:
+        """Verify StrategyImprovementAgent can run automated backtest verification."""
+        candles = []
+        for i in range(40):
+            d_str = f"2026-01-{i+1:02d}" if i < 31 else f"2026-02-{i-30:02d}"
+            candles.append({
+                "date": d_str,
+                "open": 100.0 + i * 0.5,
+                "high": 102.0 + i * 0.5,
+                "low": 99.0 + i * 0.5,
+                "close": 101.0 + i * 0.5,
+                "volume": 1000000.0,
+            })
+        result = self.agent.verify_parameter_adaptation(
+            symbol="QQQ",
+            candidate_candles=candles,
+            candidate_rsi3_threshold=25.0,
+        )
+        self.assertIn("verified", result)
+        self.assertIn("candidate_win_rate", result)
+        self.assertEqual(result["symbol"], "QQQ")
+
+
 
 if __name__ == "__main__":
     unittest.main()
