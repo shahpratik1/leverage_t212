@@ -953,7 +953,7 @@ class Orchestrator:
     # ─────────────────────────────────────────────────────────────
     # Continuous Loop with Active-Trade Driven Architecture
     # ─────────────────────────────────────────────────────────────
-    def run_loop(self, scan_interval_minutes: int = 60, monitor_interval_seconds: int = 30) -> None:
+    def run_loop(self, scan_interval_minutes: int = 5, monitor_interval_seconds: int = 30) -> None:
         """Run continuous engine loop.
 
         Prioritizes Active Trade Management on high-frequency intervals:
@@ -1128,7 +1128,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="3x Leveraged Long/Short Quantitative Trading Engine")
     parser.add_argument("--once", action="store_true", help="Run a single scan & execution cycle and exit")
-    parser.add_argument("--interval", type=int, default=60, help="Minutes between full universe scans (default: 60)")
+    parser.add_argument("--interval", type=int, default=5, help="Minutes between full universe scans (default: 5)")
     parser.add_argument("--monitor-interval", type=int, default=30, help="Seconds between position monitor ticks (default: 30)")
     parser.add_argument("--dry-run", action="store_true", help="Run in paper-trade mode without real order execution")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the embedded local signals dashboard web server")

@@ -67,6 +67,9 @@ ssh "$PI_DEST" << 'EOF'
   else
       echo "Updating Python dependencies..."
       ./venv/bin/pip install -r trading_system/requirements.txt
+      echo "Updating systemd service configuration..."
+      sudo cp scripts/trading-bot.service /etc/systemd/system/trading-bot.service
+      sudo systemctl daemon-reload
       echo "Restarting trading-bot service..."
       sudo systemctl restart trading-bot
       sudo systemctl status trading-bot --no-pager

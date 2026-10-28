@@ -278,7 +278,7 @@ The trading engine runs 24/7 autonomously on a dedicated local hardware runner:
 * **Hardware Host**: Raspberry Pi 5 (`192.168.68.50`, hostname `trading212-pi`).
 * **Operating System**: Debian GNU/Linux 13 (Trixie/Linux 6.18 arm64).
 * **System Daemon**: Managed via Linux `systemd` service (`trading-bot.service`):
-  * Command: `/home/shahpratik11/modest-bose/venv/bin/python3 -m trading_system.orchestrator --interval 15 --monitor-interval 10 --dashboard-port 8080`
+  * Command: `/home/shahpratik11/modest-bose/venv/bin/python3 -m trading_system.orchestrator --interval 5 --monitor-interval 10 --dashboard-port 8080`
   * Auto-restarts on unexpected termination (`Restart=always`, `RestartSec=5`).
 * **Automated Deployment Pipeline**:
   * `scripts/deploy_to_pi.sh`: Single-command deployment syncing codebase via `rsync`, updating dependencies, and performing zero-downtime service restart.
