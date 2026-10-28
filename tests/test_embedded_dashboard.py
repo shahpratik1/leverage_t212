@@ -299,6 +299,17 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertIsNone(card)
         orch.shutdown()
 
+    def test_equity_curve_and_sparkline_rendered_in_dashboard(self):
+        """Verify generated dashboard HTML contains the Equity Curve sparkline card and renderEquityChart logic."""
+        test_html = Path(self.temp_dir.name) / "test_equity_dashboard.html"
+        generated_path = generate_html_dashboard(str(test_html))
+        self.assertTrue(Path(generated_path).exists())
+
+        html_text = Path(generated_path).read_text(encoding="utf-8")
+        self.assertIn("equity-chart-svg", html_text)
+        self.assertIn("equity-val-current", html_text)
+        self.assertIn("renderEquityChart", html_text)
+        self.assertIn("equity_history", html_text)
 
 
 if __name__ == "__main__":

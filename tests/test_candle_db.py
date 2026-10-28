@@ -91,6 +91,18 @@ class TestCandleDatabase(unittest.TestCase):
         self.assertEqual(self.db.get_candle_count("AAPL", "1d"), 0)
         self.assertEqual(self.db.get_candle_count("AAPL", "1h"), 1)
 
+    def test_reset_instance_and_connection_tracking(self):
+        """Verify get_instance, connection tracking in _all_conns, and reset_instance cleanly closing connections."""
+        instance = CandleDatabase.get_instance(self.db_path)
+        self.assertIsNotNone(instance)
+        # Query via instance to open connection
+        _ = instance.get_candle_count("SPY", "1d")
+        self.assertGreaterEqual(len(instance._all_conns), 1)
+
+        CandleDatabase.reset_instance()
+        self.assertIsNone(CandleDatabase._instance)
+        self.assertEqual(len(instance._all_conns), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

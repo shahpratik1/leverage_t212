@@ -8,6 +8,7 @@ Provides fast, incremental caching of daily and hourly OHLCV candles to:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import sqlite3
@@ -35,6 +36,8 @@ class CandleDatabase:
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self._init_lock = threading.Lock()
         self._local = threading.local()
+        self._all_conns: List[sqlite3.Connection] = []
+        self._conn_lock = threading.Lock()
         self._init_db()
 
     @classmethod
@@ -43,7 +46,21 @@ class CandleDatabase:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = cls(db_path)
+                atexit.register(cls._cleanup_at_exit)
             return cls._instance
+
+    @classmethod
+    def _cleanup_at_exit(cls) -> None:
+        """Atexit hook to release singleton connections."""
+        cls.reset_instance()
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Close and reset singleton instance."""
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance.close()
+                cls._instance = None
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local SQLite connection with WAL mode enabled."""
@@ -53,6 +70,8 @@ class CandleDatabase:
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA busy_timeout=15000;")
             self._local.conn = conn
+            with self._conn_lock:
+                self._all_conns.append(conn)
         return self._local.conn
 
     def _init_db(self) -> None:
@@ -213,10 +232,22 @@ class CandleDatabase:
                 conn.execute("DELETE FROM candles WHERE symbol = ?", (sym,))
 
     def close(self) -> None:
-        """Close thread-local connection."""
+        """Close thread-local and tracked connections."""
         if hasattr(self._local, "conn") and self._local.conn is not None:
             try:
                 self._local.conn.close()
             except Exception:
                 pass
             self._local.conn = None
+
+        if hasattr(self, "_conn_lock") and hasattr(self, "_all_conns"):
+            with self._conn_lock:
+                for conn in self._all_conns:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                self._all_conns.clear()
+
+    def __del__(self) -> None:
+        self.close()

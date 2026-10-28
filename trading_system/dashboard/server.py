@@ -762,6 +762,42 @@ def generate_html_dashboard(output_path: str) -> str:
     </div>
   </div>
 
+  <!-- Live Equity Trajectory Sparkline Card -->
+  <div class="max-w-7xl mx-auto mb-8 bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+      <div>
+        <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold flex items-center gap-2">
+          <span>📈 Portfolio Equity Curve &amp; Session Trajectory</span>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Live Closed + MTM</span>
+        </div>
+        <div class="flex items-baseline gap-3 mt-1">
+          <span id="equity-val-current" class="text-2xl sm:text-3xl font-black text-white font-mono">${data.get('current_equity', 10000.0):.2f}</span>
+          <span id="equity-val-delta" class="text-sm font-bold text-slate-400 font-mono">+0.00 (+0.00%)</span>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-4 text-xs font-mono text-slate-400">
+        <div>Session Start: <span id="equity-val-start" class="text-slate-200 font-bold">$10,000.00</span></div>
+        <div>Session High: <span id="equity-val-high" class="text-emerald-300 font-bold">—</span></div>
+        <div>Session Low: <span id="equity-val-low" class="text-rose-300 font-bold">—</span></div>
+      </div>
+    </div>
+    <div class="w-full h-24 sm:h-28 relative pt-2">
+      <svg id="equity-chart-svg" class="w-full h-full overflow-visible" preserveAspectRatio="none" viewBox="0 0 800 100">
+        <defs>
+          <linearGradient id="equity-gradient-emerald" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#10b981" stop-opacity="0.35" />
+            <stop offset="100%" stop-color="#10b981" stop-opacity="0.0" />
+          </linearGradient>
+          <linearGradient id="equity-gradient-rose" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#f43f5e" stop-opacity="0.35" />
+            <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.0" />
+          </linearGradient>
+        </defs>
+        <g id="equity-chart-group"></g>
+      </svg>
+    </div>
+  </div>
+
   <!-- Main Container -->
   <main class="max-w-7xl mx-auto space-y-8">
 
@@ -909,6 +945,11 @@ def generate_html_dashboard(output_path: str) -> str:
       if (data.recent_notifications) {{
         INITIAL_DATA.recent_notifications = data.recent_notifications;
         renderAlertsTable();
+      }}
+      if (data.equity_history || data.current_equity !== undefined) {{
+        if (data.equity_history) INITIAL_DATA.equity_history = data.equity_history;
+        if (data.current_equity !== undefined) INITIAL_DATA.current_equity = data.current_equity;
+        renderEquityChart(INITIAL_DATA.equity_history, INITIAL_DATA.current_equity);
       }}
       if (data.pairs_watchlist && (!INITIAL_DATA.pairs_watchlist || INITIAL_DATA.pairs_watchlist.length === 0)) {{
         INITIAL_DATA.pairs_watchlist = data.pairs_watchlist;
@@ -1353,6 +1394,66 @@ def generate_html_dashboard(output_path: str) -> str:
       }});
     }}
 
+    function renderEquityChart(history, currentEquity) {{
+      const g = document.getElementById('equity-chart-group');
+      if (!g) return;
+      const points = (history && history.length > 0)
+        ? history
+        : [{{time: 'Start', equity: 10000.0}}, {{time: 'Now', equity: Number(currentEquity || 10000.0)}}];
+
+      const equities = points.map(p => Number(p.equity || 10000.0));
+      const startEq = equities[0] || 10000.0;
+      const currEq = (currentEquity !== undefined && currentEquity !== null) ? Number(currentEquity) : (equities[equities.length - 1] || startEq);
+      const minEq = Math.min(...equities, currEq);
+      const maxEq = Math.max(...equities, currEq);
+      const delta = currEq - startEq;
+      const deltaPct = startEq > 0 ? (delta / startEq) * 100 : 0.0;
+      const isPositive = delta >= 0;
+
+      const curEl = document.getElementById('equity-val-current');
+      if (curEl) curEl.innerText = '$' + currEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      const deltaEl = document.getElementById('equity-val-delta');
+      if (deltaEl) {{
+        deltaEl.innerText = (isPositive ? '+' : '') + '$' + Math.abs(delta).toFixed(2) + ' (' + (isPositive ? '+' : '') + deltaPct.toFixed(2) + '%)';
+        deltaEl.className = 'text-sm font-bold font-mono ' + (isPositive ? 'text-emerald-400' : 'text-rose-400');
+      }}
+      const startEl = document.getElementById('equity-val-start');
+      if (startEl) startEl.innerText = '$' + startEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      const highEl = document.getElementById('equity-val-high');
+      if (highEl) highEl.innerText = '$' + maxEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      const lowEl = document.getElementById('equity-val-low');
+      if (lowEl) lowEl.innerText = '$' + minEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+
+      const W = 800;
+      const H = 100;
+      const padY = 12;
+      const range = (maxEq - minEq) || 1.0;
+
+      const coords = points.map((p, idx) => {{
+        const x = points.length === 1 ? W / 2 : (idx / (points.length - 1)) * W;
+        const norm = (Number(p.equity || startEq) - minEq) / range;
+        const y = H - padY - (norm * (H - 2 * padY));
+        return {{x: Number(x.toFixed(1)), y: Number(y.toFixed(1)), equity: p.equity, time: p.time}};
+      }});
+
+      const lineD = coords.reduce((acc, pt, i) => acc + (i === 0 ? `M ${{pt.x}} ${{pt.y}}` : ` L ${{pt.x}} ${{pt.y}}`), '');
+      const areaD = lineD + ` L ${{W}} ${{H}} L 0 ${{H}} Z`;
+      const strokeColor = isPositive ? '#10b981' : '#f43f5e';
+      const gradId = isPositive ? 'url(#equity-gradient-emerald)' : 'url(#equity-gradient-rose)';
+
+      let circles = '';
+      coords.forEach(pt => {{
+        circles += `<circle cx="${{pt.x}}" cy="${{pt.y}}" r="3.5" fill="${{strokeColor}}" stroke="#0f172a" stroke-width="1.5"><title>${{pt.time}}: $${{Number(pt.equity).toFixed(2)}}</title></circle>`;
+      }});
+
+      g.innerHTML = `
+        <line x1="0" y1="${{H}}" x2="${{W}}" y2="${{H}}" stroke="#334155" stroke-width="1" stroke-dasharray="4" />
+        <path d="${{areaD}}" fill="${{gradId}}" />
+        <path d="${{lineD}}" fill="none" stroke="${{strokeColor}}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+        ${{circles}}
+      `;
+    }}
+
     // Real-time zero-latency SSE telemetry stream (push updates)
     function initSSE() {{
       if (typeof EventSource !== "undefined") {{
@@ -1372,6 +1473,7 @@ def generate_html_dashboard(output_path: str) -> str:
     renderSignals('ALL');
     renderPairsTable();
     renderAlertsTable();
+    renderEquityChart(INITIAL_DATA.equity_history, INITIAL_DATA.current_equity);
     initSSE();
 
     // Instant zero-click sync on page load and every 3.5s
