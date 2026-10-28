@@ -79,6 +79,8 @@ EOF
 echo "========================================================"
 echo "🎉 Deployment Successful!"
 DASH_HOST=$(echo "$PI_DEST" | sed 's/.*@//')
-echo "Permanent URL (never changes): http://trading212-pi.local:8080"
 echo "Direct IP URL:               http://${DASH_HOST}:8080"
+echo "Hostname URL:                http://trading212-pi:8080"
+echo "Fritz!Box Router URL:        http://trading212-pi.fritz.box:8080"
+echo "mDNS Bonjour URL:            http://trading212-pi.local:8080"
 echo "========================================================"
