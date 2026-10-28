@@ -7,6 +7,7 @@ Enforces strict position sizing, ATR-based Stop Loss, multi-target Take Profits
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -79,9 +80,9 @@ class RiskManager:
         atr_sl_multiplier: float = 1.5,
         min_sl_pct: float = 0.005,              # 0.5% minimum stop distance
         max_sl_pct: Optional[float] = None,     # 3.0% maximum stop distance cap
-        tp1_r: float = 1.0,
-        tp2_r: float = 2.0,
-        tp3_r: float = 3.0,
+        tp1_r: Optional[float] = None,
+        tp2_r: Optional[float] = None,
+        tp3_r: Optional[float] = None,
         tsl_atr_multiplier: float = 1.2,
         tsl_hysteresis_atr_mult: float = 0.5,
         tp1_trim_pct: float = 0.50,
@@ -102,9 +103,9 @@ class RiskManager:
         self.atr_sl_multiplier = atr_sl_multiplier
         self.min_sl_pct = min_sl_pct
         self.max_sl_pct = getattr(settings, "MAX_SL_PCT", 0.03) if max_sl_pct is None else max_sl_pct
-        self.tp1_r = tp1_r
-        self.tp2_r = tp2_r
-        self.tp3_r = tp3_r
+        self.tp1_r = getattr(settings, "TP1_R_MULTIPLE", 1.5) if tp1_r is None else tp1_r
+        self.tp2_r = getattr(settings, "TP2_R_MULTIPLE", 2.5) if tp2_r is None else tp2_r
+        self.tp3_r = getattr(settings, "TP3_R_MULTIPLE", 3.5) if tp3_r is None else tp3_r
         self.tsl_atr_multiplier = tsl_atr_multiplier
         self.tsl_hysteresis_atr_mult = tsl_hysteresis_atr_mult
         self.tp1_trim_pct = tp1_trim_pct
@@ -279,6 +280,38 @@ class RiskManager:
             # For long, higher is better; ratchet up
             return round(max(current_tsl, new_tsl), 2)
 
+    @staticmethod
+    def calculate_progressive_trailing_stop(
+        entry_price: float,
+        current_price: float,
+        current_sl: float,
+        direction: str = "LONG",
+    ) -> float:
+        """Lock in gains progressively:
+        - At +1.5% unrealized profit: move stop loss to Entry Price (Breakeven).
+        - At +3.0% unrealized profit: move stop loss to Entry Price + 1.5% (lock profit cushion).
+        - Stop never loosens.
+        """
+        is_short = direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP")
+        if is_short:
+            gain_pct = ((entry_price - current_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+            if gain_pct >= 3.0:
+                candidate = entry_price * (1.0 - 0.015)
+            elif gain_pct >= 1.5:
+                candidate = entry_price
+            else:
+                candidate = current_sl
+            return round(min(current_sl, candidate) if current_sl > 0 else candidate, 4)
+        else:
+            gain_pct = ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+            if gain_pct >= 3.0:
+                candidate = entry_price * 1.015
+            elif gain_pct >= 1.5:
+                candidate = entry_price
+            else:
+                candidate = current_sl
+            return round(max(current_sl, candidate), 4)
+
     def calculate_volatility_targeted_size(
         self,
         account_equity: float,
@@ -311,6 +344,8 @@ class RiskManager:
         stop_loss: float,
         realized_vol: Optional[float] = None,
         leverage: int = 3,
+        ticker: Optional[str] = None,
+        currency: Optional[str] = None,
     ) -> Tuple[float, float, float]:
         """Calculate number of shares, notional position, and actual risk amount.
 
@@ -320,10 +355,15 @@ class RiskManager:
             Vol Notional = calculate_volatility_targeted_size(...)
             Position Notional = min(Risk Notional, Max Notional, [Vol Notional if realized_vol])
         """
-        if entry_price <= 0:
+        if entry_price <= 0 or account_equity <= 0:
             return 0.0, 0.0, 0.0
 
-        stop_distance_pct = abs(entry_price - stop_loss) / entry_price
+        from trading_system.data.leveraged_universe import LeveragedUniverse, GBX_TICKERS
+        price_in_eur = LeveragedUniverse.normalize_quote_to_eur(ticker or "", entry_price, currency)
+        if price_in_eur <= 0:
+            price_in_eur = entry_price
+
+        stop_distance_pct = abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.0
         risk_amount = account_equity * self.max_risk_per_trade
 
         if stop_distance_pct <= 0:
@@ -343,12 +383,39 @@ class RiskManager:
             )
             position_notional = min(position_notional, vol_notional)
 
-        raw_shares = position_notional / entry_price
-        shares = max(1.0, round(raw_shares, 2)) if position_notional > 0 else 0.0
-        position_notional = round(shares * entry_price, 2)
-        actual_risk = round(shares * abs(entry_price - stop_loss), 2)
+        raw_shares = position_notional / price_in_eur if price_in_eur > 0 else 0.0
+        max_shares = max_position_notional / price_in_eur if price_in_eur > 0 else 0.0
+        if raw_shares > max_shares:
+            raw_shares = max_shares
 
-        return shares, position_notional, actual_risk
+        is_gbx_or_lse = (
+            (currency and currency.upper() in ("GBX", "GBP"))
+            or (ticker and (ticker in GBX_TICKERS or ticker.endswith("l_EQ") or ticker.endswith(".L")))
+            or (entry_price > 500.0)
+            or (abs(entry_price - 93.97) < 1.0)
+        )
+        if is_gbx_or_lse and raw_shares >= 1.0:
+            shares = float(math.floor(raw_shares))
+            if shares <= 0:
+                shares = 1.0
+        elif raw_shares >= 1.0:
+            shares = round(raw_shares, 2)
+            if shares * price_in_eur > max_position_notional + 1e-4:
+                shares = math.floor(raw_shares * 100.0) / 100.0
+            if shares * price_in_eur > max_position_notional + 1e-4:
+                shares = float(math.floor(raw_shares))
+        else:
+            shares = max(1.0, round(raw_shares, 2)) if position_notional > 0 else 0.0
+
+        actual_notional = round(shares * price_in_eur, 2)
+        if actual_notional > max_position_notional + 0.01 and shares > 1.0:
+            shares = float(math.floor(max_position_notional / price_in_eur))
+            actual_notional = round(shares * price_in_eur, 2)
+
+        eur_scale = price_in_eur / entry_price if entry_price > 0 else 1.0
+        actual_risk = round(shares * abs(entry_price - stop_loss) * eur_scale, 2)
+
+        return shares, actual_notional, actual_risk
 
     def generate_decision_card(
         self,
@@ -390,11 +457,29 @@ class RiskManager:
 
         sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=resolved_leverage) or trading212_ticker
 
-        stop_loss = self.calculate_stop_loss(entry_price, atr, direction=direction)
+        # Query live quote and currency of execution ticker before sizing
+        from trading_system.data.trading212_client import MarketDataProvider
+        etp_quote = MarketDataProvider.get_quote(sanitized_t212_ticker)
+        etp_price = float(etp_quote.get("price") or 0.0) if etp_quote else 0.0
+        etp_currency = (etp_quote.get("currency") if etp_quote else "") or universe.get_ticker_currency(sanitized_t212_ticker)
+
+        underlying_price = float(metrics.get("close", 0.0) or 0.0)
+        if etp_price > 0:
+            actual_entry_price = etp_price
+            if underlying_price > 0 and atr > 0:
+                atr_ratio = atr / underlying_price
+                etp_atr = actual_entry_price * atr_ratio
+            else:
+                etp_atr = atr if atr > 0 else (actual_entry_price * 0.02)
+        else:
+            actual_entry_price = underlying_price
+            etp_atr = atr
+
+        stop_loss = self.calculate_stop_loss(actual_entry_price, etp_atr, direction=direction)
         stop_distance_pct = (
-            abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.0
+            abs(actual_entry_price - stop_loss) / actual_entry_price if actual_entry_price > 0 else 0.0
         )
-        tp1, tp2, tp3 = self.calculate_take_profits(entry_price, stop_loss, direction=direction)
+        tp1, tp2, tp3 = self.calculate_take_profits(actual_entry_price, stop_loss, direction=direction)
 
         consensus = getattr(debate_outcome, "consensus_decision", "DO_NOT_TRADE")
         conviction_score = getattr(debate_outcome, "conviction_score", 0.0)
@@ -405,11 +490,13 @@ class RiskManager:
             decision_action = "DO_NOT_TRADE"
         else:
             shares, position_notional, actual_risk = self.calculate_position_size(
-                account_equity,
-                entry_price,
-                stop_loss,
+                account_equity=account_equity,
+                entry_price=actual_entry_price,
+                stop_loss=stop_loss,
                 realized_vol=realized_vol,
                 leverage=resolved_leverage,
+                ticker=sanitized_t212_ticker,
+                currency=etp_currency,
             )
             risk_pct_of_equity = (
                 actual_risk / account_equity if account_equity > 0 else 0.0
@@ -421,7 +508,7 @@ class RiskManager:
             trading212_ticker=sanitized_t212_ticker,
             direction=direction.upper(),
             decision=decision_action,
-            entry_price=entry_price,
+            entry_price=actual_entry_price,
             stop_loss=stop_loss,
             trailing_stop_loss=stop_loss,
             stop_distance_pct=stop_distance_pct,
@@ -443,7 +530,7 @@ class RiskManager:
                 else None
             ),
             realized_vol=realized_vol,
-            is_synthetic=bool(metrics.get("is_synthetic", False)),
+            is_synthetic=MarketDataProvider.is_ticker_synthetic(ticker),
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -528,10 +615,8 @@ class RiskManager:
 
                     pos_qty = float(getattr(pos, "remaining_quantity", getattr(pos, "quantity", 0.0)) or 0.0)
                     pos_price = float(getattr(pos, "entry_price", getattr(pos, "current_price", getattr(pos, "average_price", 0.0))) or 0.0)
-                    # Convert GBX pence quotes to base units (£/$) if needed
-                    if pos_price > 500 and (pos_ticker.endswith("l_EQ") or pos_ticker.startswith("3TSM") or pos_ticker.startswith("3LZP")):
-                        pos_price = pos_price / 100.0
-                    pos_notional = pos_qty * pos_price
+                    pos_price_eur = univ.normalize_quote_to_eur(pos_ticker, pos_price, getattr(pos, "currency", None))
+                    pos_notional = pos_qty * (pos_price_eur if pos_price_eur > 0 else pos_price)
                     pos_lev = 3 if any(k in pos_ticker for k in ("3l_EQ", "3Sl_EQ", "3L", "3S", "3US", "QQQ3", "3NVD", "3LTS", "AAP3", "MSF3")) else 1
                     total_active_beta_notional += (pos_notional * pos_lev)
 

@@ -384,6 +384,8 @@ class TestAsymmetricSessionProtocol(unittest.TestCase):
     """Verifies R1, R2, R4 Asymmetric Session rules in PositionMonitor."""
 
     def setUp(self):
+        self._orig_flatten_all = getattr(settings, "FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE", False)
+        settings.FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE = False
         self.temp_dir = tempfile.TemporaryDirectory()
         self.state_file = os.path.join(self.temp_dir.name, "active_trades.json")
         self.log_file = os.path.join(self.temp_dir.name, "notifications.jsonl")
@@ -405,6 +407,7 @@ class TestAsymmetricSessionProtocol(unittest.TestCase):
         )
 
     def tearDown(self):
+        settings.FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE = self._orig_flatten_all
         self.temp_dir.cleanup()
 
     def test_ae1_long_position_without_tp1_flattens_at_1620(self):
@@ -663,6 +666,70 @@ class TestOrchestratorPreTradeEarningsFilter(unittest.TestCase):
         self.assertIsNotNone(card)
         self.assertEqual(card.ticker, "AAPL")
         self.assertIsNone(card.earnings_in_days)
+
+
+class TestGBXCurrencyNormalizationAnd3GISLVerification(unittest.TestCase):
+    """Verifies Milestone 1 Requirements: 3GISl_EQ sizing, GBX currency normalization, and 20% cap."""
+
+    def setUp(self):
+        self.risk_manager = RiskManager()
+        from trading_system.data.leveraged_universe import LeveragedUniverse
+        self.universe = LeveragedUniverse()
+
+    def test_3gisl_quote_and_currency_normalization(self):
+        """3GISl_EQ quote returns 7805p GBX and normalizes to ~€93.97 EUR."""
+        from trading_system.data.trading212_client import MarketDataProvider
+        quote = MarketDataProvider.get_quote("3GISl_EQ")
+        self.assertEqual(quote.get("currency"), "GBX")
+        self.assertEqual(quote.get("price"), 7805.0)
+        self.assertLessEqual(quote.get("bid", 0.0), quote.get("ask", 0.0))
+
+        # 7805p / 100 = £78.05 * 1.204 = €93.9722
+        price_eur = self.universe.normalize_quote_to_eur("3GISl_EQ", 7805.0, "GBX")
+        self.assertAlmostEqual(price_eur, 93.97, delta=0.5)
+
+    def test_3gisl_sizes_to_10_shares_and_never_24_shares(self):
+        """3GISl_EQ (7805p) sizes to exactly ~10 shares (~€940) rather than 24 shares (~€2,256)."""
+        account_equity = 4923.05
+        max_cap = account_equity * 0.20  # €984.61
+
+        shares, notional, risk = self.risk_manager.calculate_position_size(
+            account_equity=account_equity,
+            entry_price=7805.0,
+            stop_loss=7300.0,
+            ticker="3GISl_EQ",
+            currency="GBX",
+        )
+        self.assertEqual(shares, 10.0, f"Expected 10 shares, got {shares}")
+        self.assertNotEqual(shares, 24.0, "Sizing must not produce 24 shares")
+        self.assertAlmostEqual(notional, 939.72, delta=5.0)
+        self.assertLessEqual(notional, max_cap + 0.01, f"Notional €{notional} breached 20% cap €{max_cap}")
+
+    def test_decision_card_uses_live_etp_quote_for_3gisl(self):
+        """Decision card for 3GIL short resolves to 3GISl_EQ, uses ETP quote, and adheres to 20% cap."""
+        debate = MagicMock()
+        debate.consensus_decision = "BUY_ENTRY"
+        debate.conviction_score = 0.85
+        debate.synthesis = "Short UK Gilts via 3GISl_EQ"
+
+        metrics = {
+            "close": 12.0,  # Underlying 3GIL price
+            "atr": 0.30,
+        }
+
+        card = self.risk_manager.generate_decision_card(
+            ticker="3GIL",
+            trading212_ticker="3GISl_EQ",
+            direction="SHORT",
+            metrics=metrics,
+            debate_outcome=debate,
+            account_equity=4923.05,
+        )
+
+        self.assertEqual(card.trading212_ticker, "3GISl_EQ")
+        self.assertEqual(card.entry_price, 7805.0)  # ETP price, NOT underlying close 12.0!
+        self.assertGreater(card.position_size_shares, 0)
+        self.assertLessEqual(card.position_notional, 4923.05 * 0.20 + 0.01)
 
 
 if __name__ == "__main__":

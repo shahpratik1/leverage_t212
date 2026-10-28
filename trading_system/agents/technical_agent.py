@@ -18,6 +18,7 @@ class TechnicalAnalysis:
     summary: str
     confidence: float
     raw_analysis: Optional[str] = None
+    market_regime: str = "TRENDING_BREAKOUT"
 
 
 class TechnicalAnalyst:

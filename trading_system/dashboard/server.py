@@ -28,6 +28,7 @@ from trading_system.agents.risk_manager import RiskManager
 from trading_system.config import settings
 from trading_system.data.leveraged_universe import (
     CURATED_3X_PAIRS,
+    GBX_TICKERS,
     LeveragedUniverse,
     get_currency_display,
     get_etp_direction,
@@ -166,6 +167,15 @@ def load_active_signals(
                 pnl_pct = 0.0
                 pnl_amount = 0.0
 
+            # Convert native pnl_amount to EUR
+            pnl_amount_eur = pnl_amount
+            if curr == "GBX" or ticker in GBX_TICKERS or (curr == "GBP" and (entry > 500 or current_price > 500)):
+                pnl_amount_eur = (pnl_amount / 100.0) * 1.204
+            elif curr == "GBP":
+                pnl_amount_eur = pnl_amount * 1.204
+            elif curr == "USD":
+                pnl_amount_eur = pnl_amount / 1.08
+
             # Calculate risk & reward percentages
             risk_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0.0
             tp1_gain_pct = abs(tp1 - entry) / entry * 100 if entry > 0 else 0.0
@@ -242,6 +252,7 @@ def load_active_signals(
                 "current_price": round(current_price, 2),
                 "pnl_pct": round(pnl_pct, 2),
                 "pnl_amount": round(pnl_amount, 2),
+                "pnl_amount_eur": round(pnl_amount_eur, 2),
                 "currency_code": currency_code,
                 "currency_prefix": currency_prefix,
                 "currency_suffix": currency_suffix,
@@ -460,15 +471,15 @@ _DASHBOARD_DATA_LOCK = threading.Lock()
 _DASHBOARD_SHARED_CLIENT: Optional[Trading212Client] = None
 
 
-def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
+def build_dashboard_data(force: bool = False, client: Optional[Trading212Client] = None) -> Dict[str, Any]:
     """Compile comprehensive dashboard dataset with fast TTL caching to avoid API rate limits."""
     global _DASHBOARD_DATA_CACHE, _DASHBOARD_DATA_CACHE_TIME, _DASHBOARD_SHARED_CLIENT
     now = time.time()
-    if not force and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
+    if not force and client is None and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
         return _DASHBOARD_DATA_CACHE
 
     with _DASHBOARD_DATA_LOCK:
-        if not force and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
+        if not force and client is None and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
             return _DASHBOARD_DATA_CACHE
 
         universe = LeveragedUniverse()
@@ -494,9 +505,9 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
         portfolio_prices: Dict[str, float] = {}
         broker_positions_map: Optional[Dict[str, Any]] = None
         live_server_stops_count: Optional[int] = None
-        client: Optional[Trading212Client] = None
+        active_client = client
 
-        if settings.TRADING212_API_KEY:
+        if active_client is None and settings.TRADING212_API_KEY:
             try:
                 if _DASHBOARD_SHARED_CLIENT is None:
                     _DASHBOARD_SHARED_CLIENT = Trading212Client(
@@ -504,15 +515,28 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                         api_secret=settings.TRADING212_API_SECRET,
                         base_url=settings.api_base_url,
                     )
-                client = _DASHBOARD_SHARED_CLIENT
-                portfolio = client.get_portfolio(force_refresh=False)
+                active_client = _DASHBOARD_SHARED_CLIENT
+            except Exception as exc:
+                logger.debug("Failed to initialize Trading212Client for dashboard: %s", exc)
+
+        live_account_cash_total: Optional[float] = None
+        if active_client is not None:
+            try:
+                cash = active_client.get_account_cash()
+                if cash is not None and getattr(cash, "total", 0.0) > 0:
+                    live_account_cash_total = float(cash.total)
+            except Exception as cash_exc:
+                logger.debug("Failed to query live account cash for dashboard: %s", cash_exc)
+
+            try:
+                portfolio = active_client.get_portfolio(force_refresh=False)
                 broker_positions_map = {p.ticker: p for p in portfolio if getattr(p, "quantity", 0.0) > 0}
                 for p in portfolio:
                     if getattr(p, "current_price", 0.0) > 0:
                         portfolio_prices[p.ticker] = p.current_price
 
                 try:
-                    open_orders = client.get_orders(force_refresh=False)
+                    open_orders = active_client.get_orders(force_refresh=False)
                     live_server_stops_count = sum(
                         1 for o in open_orders
                         if "STOP" in str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
@@ -531,6 +555,31 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
             # Filter out phantom/closed local signals that no longer exist on broker
             active_signals = [s for s in active_signals if s.get("ticker") in live_broker_tickers]
 
+            # Sync PnL in EUR directly from authoritative broker position
+            for s in active_signals:
+                tk = s.get("ticker")
+                if tk in broker_positions_map:
+                    bp_obj = broker_positions_map[tk]
+                    if getattr(bp_obj, "ppl", None) is not None:
+                        s["pnl_amount_eur"] = round(float(bp_obj.ppl), 2)
+
+            # Clean up closed positions in active_trades.json so they don't linger on disk
+            try:
+                if os.path.exists(settings.ACTIVE_TRADES_PATH):
+                    with open(settings.ACTIVE_TRADES_PATH, "r", encoding="utf-8") as f:
+                        trades_data = json.load(f)
+                    changed = False
+                    for tk, p_entry in list(trades_data.items()):
+                        if tk not in live_broker_tickers and not p_entry.get("is_closed", False):
+                            p_entry["is_closed"] = True
+                            p_entry["remaining_quantity"] = 0.0
+                            changed = True
+                    if changed:
+                        with open(settings.ACTIVE_TRADES_PATH, "w", encoding="utf-8") as f:
+                            json.dump(trades_data, f, indent=2)
+            except Exception as clean_exc:
+                logger.debug("Failed to prune closed trades from active_trades.json: %s", clean_exc)
+
             # Adopt any broker positions not yet tracked in active_signals
             known_tickers = {s.get("ticker") for s in active_signals}
             for b_ticker, bp in broker_positions_map.items():
@@ -546,6 +595,7 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                     sl = round(max(0.01, avg_px - sl_dist), 2)
                     pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 else 0.0
                     pnl_amount = round((cur_px - avg_px) * bp.quantity, 2)
+                    pnl_amount_eur = round(float(getattr(bp, "ppl", 0.0) or 0.0), 2)
 
                     curr = universe.get_ticker_currency(b_ticker) if universe else get_ticker_currency(b_ticker)
                     currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
@@ -566,6 +616,7 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
                         "current_price": round(cur_px, 2),
                         "pnl_pct": round(pnl_pct, 2),
                         "pnl_amount": pnl_amount,
+                        "pnl_amount_eur": pnl_amount_eur,
                         "currency_code": currency_code,
                         "currency_prefix": currency_prefix,
                         "currency_suffix": currency_suffix,
@@ -623,7 +674,13 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
         active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
 
         # Construct session equity curve from trade history and current open P&L
-        base_equity = 10000.0
+        if live_account_cash_total is not None and live_account_cash_total > 0:
+            base_equity = round(live_account_cash_total, 2)
+            live_equity = round(live_account_cash_total, 2)
+        else:
+            base_equity = float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 4923.05) or 4923.05)
+            live_equity = base_equity
+
         equity_points = [{"time": "Start", "equity": base_equity}]
         running_equity = base_equity
         chronological_events = [e for e in recent_notifications if e.get("pnl") is not None]
@@ -634,8 +691,12 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
             t_str = str(ev.get("timestamp") or "")[-12:-4] or "Trade"
             equity_points.append({"time": t_str, "equity": round(running_equity, 2)})
 
-        total_open_pnl = sum(float(s.get("pnl_amount") or 0.0) for s in active_signals)
-        live_equity = round(running_equity + total_open_pnl, 2)
+        total_open_pnl = sum(float(s.get("pnl_amount_eur", s.get("pnl_amount", 0.0)) or 0.0) for s in active_signals)
+        if live_account_cash_total is not None and live_account_cash_total > 0:
+            live_equity = round(live_account_cash_total + total_open_pnl, 2)
+        else:
+            live_equity = round(running_equity + total_open_pnl, 2)
+
         now_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
         equity_points.append({"time": now_time, "equity": live_equity})
 
@@ -648,6 +709,9 @@ def build_dashboard_data(force: bool = False) -> Dict[str, Any]:
             "pairs_watchlist": pairs,
             "history": history,
             "equity_history": equity_points,
+            "equity_points": equity_points,
+            "base_equity": base_equity,
+            "starting_equity": base_equity,
             "current_equity": live_equity,
             "broker_status": {
                 "broker_name": "Trading 212 Demo",
@@ -771,12 +835,12 @@ def generate_html_dashboard(output_path: str) -> str:
           <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Live Closed + MTM</span>
         </div>
         <div class="flex items-baseline gap-3 mt-1">
-          <span id="equity-val-current" class="text-2xl sm:text-3xl font-black text-white font-mono">${data.get('current_equity', 10000.0):.2f}</span>
+          <span id="equity-val-current" class="text-2xl sm:text-3xl font-black text-white font-mono">€{data.get('current_equity', 4923.05):.2f}</span>
           <span id="equity-val-delta" class="text-sm font-bold text-slate-400 font-mono">+0.00 (+0.00%)</span>
         </div>
       </div>
       <div class="flex flex-wrap items-center gap-4 text-xs font-mono text-slate-400">
-        <div>Session Start: <span id="equity-val-start" class="text-slate-200 font-bold">$10,000.00</span></div>
+        <div>Session Start: <span id="equity-val-start" class="text-slate-200 font-bold">€{data.get('base_equity', 4923.05):,.2f}</span></div>
         <div>Session High: <span id="equity-val-high" class="text-emerald-300 font-bold">—</span></div>
         <div>Session Low: <span id="equity-val-low" class="text-rose-300 font-bold">—</span></div>
       </div>
@@ -1067,10 +1131,14 @@ def generate_html_dashboard(output_path: str) -> str:
         const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-300');
         const pnlSign = pnlPct > 0 ? '+' : (pnlPct < 0 ? '-' : '');
         const pnlAmount = s.pnl_amount !== undefined ? Number(s.pnl_amount) : 0.0;
+        const pnlAmountEur = s.pnl_amount_eur !== undefined ? Number(s.pnl_amount_eur) : (
+          s.currency_code === 'GBX' ? (pnlAmount / 100 * 1.204) : (s.currency_code === 'USD' ? (pnlAmount / 1.08) : pnlAmount)
+        );
         const remQty = s.remaining_quantity !== undefined ? Number(s.remaining_quantity) : Number(s.quantity || 1.0);
         const curPx = Number(s.current_price || s.entry_price || 0.0);
         const entryPx = Number(s.entry_price || 0.0);
         const posVal = (remQty * curPx).toFixed(2);
+        const posValEur = (s.currency_code === 'GBX' ? (Number(posVal) / 100 * 1.204) : (s.currency_code === 'USD' ? (Number(posVal) / 1.08) : Number(posVal))).toFixed(2);
 
         const card = document.createElement('div');
         card.className = "bg-slate-900 border border-slate-800 hover:border-slate-700 transition rounded-2xl p-5 shadow-lg flex flex-col justify-between relative overflow-hidden group";
@@ -1104,11 +1172,12 @@ def generate_html_dashboard(output_path: str) -> str:
                   <div class="text-xl font-black ${{pnlColor}} font-mono">
                     ${{pnlSign}}${{currPrefix}}${{Math.abs(pnlAmount).toFixed(2)}}${{currSuffix}} (${{pnlPct >= 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)
                   </div>
+                  ${{s.currency_code !== 'EUR' ? `<div class="text-xs ${{pnlColor}} font-mono font-semibold mt-0.5">≈ ${{pnlAmountEur >= 0 ? '+' : '-'}}€${{Math.abs(pnlAmountEur).toFixed(2)}}</div>` : ''}}
                 </div>
                 <div class="text-right">
                   <div class="text-[10px] text-slate-400 uppercase font-semibold">Holdings</div>
                   <div class="text-sm font-bold text-indigo-300 font-mono">${{remQty.toFixed(1)}} shares</div>
-                  <div class="text-[10px] text-slate-400 font-mono">Val: ${{currPrefix}}${{posVal}}${{currSuffix}}</div>
+                  <div class="text-[10px] text-slate-400 font-mono">Val: ${{currPrefix}}${{posVal}}${{currSuffix}}${{s.currency_code !== 'EUR' ? ` (≈ €${{posValEur}})` : ''}}</div>
                 </div>
               </div>
               <div class="mt-2.5 pt-2 border-t border-slate-800/60 flex items-center justify-between text-xs font-mono">
@@ -1399,10 +1468,10 @@ def generate_html_dashboard(output_path: str) -> str:
       if (!g) return;
       const points = (history && history.length > 0)
         ? history
-        : [{{time: 'Start', equity: 10000.0}}, {{time: 'Now', equity: Number(currentEquity || 10000.0)}}];
+        : [{{time: 'Start', equity: 4923.05}}, {{time: 'Now', equity: Number(currentEquity || 4923.05)}}];
 
-      const equities = points.map(p => Number(p.equity || 10000.0));
-      const startEq = equities[0] || 10000.0;
+      const equities = points.map(p => Number(p.equity || 4923.05));
+      const startEq = equities[0] || 4923.05;
       const currEq = (currentEquity !== undefined && currentEquity !== null) ? Number(currentEquity) : (equities[equities.length - 1] || startEq);
       const minEq = Math.min(...equities, currEq);
       const maxEq = Math.max(...equities, currEq);
@@ -1411,18 +1480,18 @@ def generate_html_dashboard(output_path: str) -> str:
       const isPositive = delta >= 0;
 
       const curEl = document.getElementById('equity-val-current');
-      if (curEl) curEl.innerText = '$' + currEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      if (curEl) curEl.innerText = '€' + currEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
       const deltaEl = document.getElementById('equity-val-delta');
       if (deltaEl) {{
-        deltaEl.innerText = (isPositive ? '+' : '') + '$' + Math.abs(delta).toFixed(2) + ' (' + (isPositive ? '+' : '') + deltaPct.toFixed(2) + '%)';
+        deltaEl.innerText = (isPositive ? '+' : '') + '€' + Math.abs(delta).toFixed(2) + ' (' + (isPositive ? '+' : '') + deltaPct.toFixed(2) + '%)';
         deltaEl.className = 'text-sm font-bold font-mono ' + (isPositive ? 'text-emerald-400' : 'text-rose-400');
       }}
       const startEl = document.getElementById('equity-val-start');
-      if (startEl) startEl.innerText = '$' + startEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      if (startEl) startEl.innerText = '€' + startEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
       const highEl = document.getElementById('equity-val-high');
-      if (highEl) highEl.innerText = '$' + maxEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      if (highEl) highEl.innerText = '€' + maxEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
       const lowEl = document.getElementById('equity-val-low');
-      if (lowEl) lowEl.innerText = '$' + minEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      if (lowEl) lowEl.innerText = '€' + minEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
 
       const W = 800;
       const H = 100;
@@ -1443,7 +1512,7 @@ def generate_html_dashboard(output_path: str) -> str:
 
       let circles = '';
       coords.forEach(pt => {{
-        circles += `<circle cx="${{pt.x}}" cy="${{pt.y}}" r="3.5" fill="${{strokeColor}}" stroke="#0f172a" stroke-width="1.5"><title>${{pt.time}}: $${{Number(pt.equity).toFixed(2)}}</title></circle>`;
+        circles += `<circle cx="${{pt.x}}" cy="${{pt.y}}" r="3.5" fill="${{strokeColor}}" stroke="#0f172a" stroke-width="1.5"><title>${{pt.time}}: €${{Number(pt.equity).toFixed(2)}}</title></circle>`;
       }});
 
       g.innerHTML = `

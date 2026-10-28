@@ -17,3 +17,4 @@ notifications.jsonl
 *.db
 *.db-*
 data/*.db*
+.agents/

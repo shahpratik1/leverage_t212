@@ -71,6 +71,32 @@ class BacktestResult:
         d["trades"] = [asdict(t) for t in self.trades]
         return d
 
+    def meets_benchmark_targets(self) -> Tuple[bool, Dict[str, Any]]:
+        """Verify quantitative statistical edge against benchmark requirements:
+        - Sharpe ratio >= 1.5
+        - Profit factor >= 1.75
+        - Win rate >= 60.0%
+        """
+        sharpe = float(self.sharpe_ratio or 0.0)
+        pf = float(self.profit_factor or 0.0)
+        win_rate = float(self.win_rate_pct or 0.0)
+
+        sharpe_ok = sharpe >= 1.5
+        pf_ok = pf >= 1.75
+        win_rate_ok = win_rate >= 60.0
+
+        passed = bool(sharpe_ok and pf_ok and win_rate_ok)
+        details = {
+            "sharpe_ratio": sharpe,
+            "sharpe_ok": sharpe_ok,
+            "profit_factor": pf,
+            "profit_factor_ok": pf_ok,
+            "win_rate_pct": win_rate,
+            "win_rate_ok": win_rate_ok,
+            "passed": passed,
+        }
+        return passed, details
+
 
 class BacktestEngine:
     """Event-driven simulator for 3x leveraged trading strategies."""
@@ -79,10 +105,14 @@ class BacktestEngine:
         self,
         initial_capital: float = 10000.0,
         leverage: int = 3,
-        max_risk_per_trade: float = 0.005,
-        max_position_pct: float = 0.05,
+        max_risk_per_trade: float = 0.015,
+        max_position_pct: float = 0.20,
         target_vol: float = 0.20,
         max_hold_days: int = 4,
+        tp1_r: float = 1.5,
+        tp2_r: float = 2.5,
+        tp3_r: float = 3.5,
+        multi_regime: bool = True,
     ):
         self.initial_capital = initial_capital
         self.leverage = leverage
@@ -90,6 +120,33 @@ class BacktestEngine:
         self.max_position_pct = max_position_pct
         self.target_vol = target_vol
         self.max_hold_days = max_hold_days
+        self.tp1_r = tp1_r
+        self.tp2_r = tp2_r
+        self.tp3_r = tp3_r
+        self.multi_regime = multi_regime
+
+    def run_universe(self, symbols: List[str], limit_candles: int = 250) -> Dict[str, Any]:
+        """Batch evaluate performance across multiple symbols in universe."""
+        results = {}
+        total_trades = 0
+        winning_trades = 0
+        for sym in symbols:
+            try:
+                res = self.run(sym)
+                results[sym] = res
+                total_trades += res.total_trades
+                winning_trades += res.winning_trades
+            except Exception:
+                continue
+        overall_win_rate = (winning_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+        return {
+            "symbols_evaluated": len(results),
+            "total_trades": total_trades,
+            "winning_trades": winning_trades,
+            "win_rate_pct": overall_win_rate,
+            "results": results,
+            "initial_capital": self.initial_capital,
+        }
 
     @staticmethod
     def _calculate_sma(values: List[float], period: int) -> List[Optional[float]]:

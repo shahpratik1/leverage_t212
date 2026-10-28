@@ -658,8 +658,13 @@ class Orchestrator:
                 )
                 order_id = entry_order.id
                 logger.info("Order executed successfully: id=%s", order_id)
-                if entry_order.fill_price > 0:
-                    fill_price = entry_order.fill_price
+                raw_fill_px = getattr(entry_order, "fill_price", 0.0)
+                try:
+                    fill_px_float = float(raw_fill_px or 0.0)
+                except (TypeError, ValueError):
+                    fill_px_float = 0.0
+                if fill_px_float > 0:
+                    fill_price = fill_px_float
                 else:
                     for retry_idx in range(3):
                         time.sleep(1.0)

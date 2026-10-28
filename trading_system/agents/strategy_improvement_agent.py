@@ -198,7 +198,7 @@ class StrategyImprovementAgent:
             candles = candidate_candles
             if not candles:
                 db = CandleDatabase()
-                candles = db.get_candles(symbol, interval="1d", limit=100)
+                candles = db.get_candles(symbol, timeframe="1d", limit=100)
 
             if not candles or len(candles) < 30:
                 return {

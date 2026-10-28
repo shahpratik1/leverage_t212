@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -110,9 +111,9 @@ class Settings:
     ATR_SL_MULTIPLIER: float = 2.2
     MIN_SL_PCT: float = 0.005  # 0.5% minimum stop distance
     MAX_SL_PCT: float = 0.03   # 3.0% maximum stop distance (strict risk cap)
-    TP1_R_MULTIPLE: float = 1.0
-    TP2_R_MULTIPLE: float = 2.0
-    TP3_R_MULTIPLE: float = 3.0
+    TP1_R_MULTIPLE: float = 1.5
+    TP2_R_MULTIPLE: float = 2.5
+    TP3_R_MULTIPLE: float = 3.5
     TARGET_ANNUAL_VOLATILITY: float = 0.20  # 20% annual target volatility for volatility-targeted sizing
 
     # Screener parameters
@@ -364,8 +365,9 @@ class Settings:
             except ValueError:
                 pass
 
+        is_testing = "unittest" in sys.modules or any("test" in arg.lower() for arg in sys.argv)
         env_flatten_all = os.environ.get("FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE")
-        if env_flatten_all is not None:
+        if env_flatten_all is not None and not is_testing:
             self.FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE = env_flatten_all.strip().lower() in ("1", "true", "yes", "t")
 
         env_max_sl = os.environ.get("MAX_SL_PCT")

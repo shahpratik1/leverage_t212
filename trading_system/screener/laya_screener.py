@@ -28,35 +28,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class ScreenerResult:
-    """Immutable result produced by :class:`LayaScreener` for a single asset.
-
-    Attributes:
-        ticker: Asset symbol (e.g. ``"AAPL"``).
-        bias: Directional classification — ``"bullish"``, ``"bearish"``,
-            or ``"neutral"``.
-        bias_confidence: Laya confidence score for the bias classification.
-        setup_score: Ordinal quality label — ``"unfavorable"``,
-            ``"mediocre"``, ``"favorable"``, or ``"exceptional"``.
-        setup_confidence: Laya confidence score for the setup classification.
-        catalyst_risk: Probability (0.0–1.0) that an upcoming catalyst
-            (e.g. earnings) will adversely affect the position.
-        overall_confidence: Aggregate confidence across all questions.
-        metrics: Original technical-indicator dict that was screened.
-        state_document: The formatted context string sent to Laya.
-    """
+    """Result produced by :class:`LayaScreener` or :class:`TechnicalFallbackScreener` for a single asset."""
 
     ticker: str
-    bias: str
-    bias_confidence: float
-    setup_score: str
-    setup_confidence: float
-    catalyst_risk: float
-    overall_confidence: float
+    bias: str = "bullish"
+    bias_confidence: float = 0.85
+    setup_score: str = "favorable"
+    setup_confidence: float = 0.85
+    catalyst_risk: float = 0.0
+    overall_confidence: float = 0.85
     strategy_type: str = "momentum"  # "momentum" or "3rsi_mean_reversion"
     metrics: Dict[str, Any] = field(default_factory=dict)
     state_document: str = ""
+    market_regime: str = "TRENDING_BREAKOUT"
+    # Optional compatibility attributes
+    close: float = 0.0
+    trend: str = "BULLISH"
+    adx: float = 25.0
+    rsi: float = 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +116,34 @@ class LayaScreener:
                 ),
             },
         }
+
+    # ------------------------------------------------------------------
+    # Market Regime Classifier
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def classify_regime(metrics: Dict[str, Any]) -> str:
+        """Classify market regime into CHOP_RANGE, TRENDING_BREAKOUT, or HIGH_VOL_ERRATIC.
+
+        Logic:
+        - HIGH_VOL_ERRATIC: Realized Vol > 65% or ATR spike ratio >= 1.5
+        - TRENDING_BREAKOUT: ADX >= 25.0 and EMA20 > EMA50
+        - CHOP_RANGE: Low ADX or range-bound moving averages
+        """
+        vol = float(metrics.get("realized_vol", 0.0) or 0.0)
+        atr_spike = float(metrics.get("atr_spike_ratio", metrics.get("atr_ratio", 1.0)) or 1.0)
+        if vol > 0.65 or atr_spike >= 1.5:
+            return "HIGH_VOL_ERRATIC"
+
+        adx = float(metrics.get("adx", 25.0) if metrics.get("adx") is not None else 25.0)
+        ema20 = float(metrics.get("ema20", 0.0) or 0.0)
+        ema50 = float(metrics.get("ema50", 0.0) or 0.0)
+        if adx >= 25.0 and (ema20 > ema50):
+            return "TRENDING_BREAKOUT"
+
+        return "CHOP_RANGE"
+
+    get_market_regime = classify_regime
 
     # ------------------------------------------------------------------
     # State-document formatting
@@ -494,6 +513,118 @@ class TechnicalFallbackScreener:
         self.top_n = top_n
         self.min_adx = min_adx
 
+    def evaluate_candidate(self, ticker: str, m: Dict[str, Any]) -> Optional[ScreenerResult]:
+        """Evaluate a single ticker candidate with multi-regime routing."""
+        if not m or not m.get("close"):
+            return None
+        regime = LayaScreener.classify_regime(m)
+        rsi: float = float(m.get("rsi", m.get("rsi14", 50.0)))
+        rsi3: float = float(m.get("rsi3", 50.0))
+        rsi7: float = float(m.get("rsi7", 50.0))
+        adx: float = float(m.get("adx", 0.0))
+        close: float = float(m.get("close", 0.0))
+        sma200: float = float(m.get("sma200", close))
+        ema20: float = float(m.get("ema20", close))
+        ema50: float = float(m.get("ema50", close))
+        macd: float = float(m.get("macd", 0.0) or 0.0)
+        macd_signal: float = float(m.get("macd_signal", 0.0) or 0.0)
+        atr: float = float(m.get("atr", 0.0))
+        donchian_high = float(m.get("donchian_high_20", m.get("high_20d", close)))
+        donchian_low = float(m.get("donchian_low_20", close))
+
+        if regime == "HIGH_VOL_ERRATIC":
+            return ScreenerResult(
+                ticker=ticker,
+                bias="neutral",
+                bias_confidence=0.0,
+                setup_score="unfavorable",
+                setup_confidence=0.0,
+                catalyst_risk=1.0,
+                overall_confidence=0.0,
+                strategy_type="capital_preservation",
+                metrics=m,
+                market_regime="HIGH_VOL_ERRATIC",
+                state_document=f"[HighVol] {ticker} Vol/ATR spike exceeds risk tolerance",
+            )
+
+        if regime == "CHOP_RANGE":
+            # Connors 3-RSI Mean Reversion
+            is_3rsi_bullish = (close >= sma200 or sma200 == close) and (rsi3 <= 28.0 or rsi7 <= 45.0)
+            is_3rsi_bearish = (close <= sma200 or sma200 == close) and (rsi3 >= 72.0 or rsi7 >= 55.0)
+            if is_3rsi_bullish:
+                return ScreenerResult(
+                    ticker=ticker,
+                    bias="bullish",
+                    bias_confidence=0.95,
+                    setup_score="exceptional",
+                    setup_confidence=0.95,
+                    catalyst_risk=0.05,
+                    overall_confidence=0.95,
+                    strategy_type="3rsi_mean_reversion",
+                    metrics=m,
+                    market_regime="CHOP_RANGE",
+                    state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f}",
+                )
+            elif is_3rsi_bearish:
+                return ScreenerResult(
+                    ticker=ticker,
+                    bias="bearish",
+                    bias_confidence=0.92,
+                    setup_score="exceptional",
+                    setup_confidence=0.92,
+                    catalyst_risk=0.05,
+                    overall_confidence=0.92,
+                    strategy_type="3rsi_mean_reversion",
+                    metrics=m,
+                    market_regime="CHOP_RANGE",
+                    state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f}",
+                )
+            return None
+
+        # TRENDING_BREAKOUT: Donchian 20d & EMA Momentum Breakouts
+        if adx < self.min_adx and not (close >= donchian_high):
+            return None
+
+        # Determine MACD or EMA trend confirmation
+        if macd != 0.0 or macd_signal != 0.0:
+            macd_bullish = macd > macd_signal
+            macd_bearish = macd < macd_signal
+        else:
+            macd_bullish = ema20 > ema50
+            macd_bearish = ema20 < ema50
+
+        # Donchian breakout confirmation
+        has_donchian = "donchian_high_20" in m or "high_20d" in m
+        dh = float(m.get("donchian_high_20", m.get("high_20d", 0.0)) or 0.0)
+        dl = float(m.get("donchian_low_20", 0.0) or 0.0)
+
+        donchian_breakout_bull = has_donchian and dh > 0 and close >= dh
+        donchian_breakout_bear = has_donchian and dl > 0 and close <= dl
+
+        bullish = (donchian_breakout_bull or (rsi < 68.0 and close > ema20)) and macd_bullish
+        bearish = (donchian_breakout_bear or (rsi > 32.0 and close < ema20)) and macd_bearish
+
+        if not bullish and not bearish:
+            return None
+
+        bias = "bullish" if bullish else "bearish"
+        setup_score = "exceptional" if adx > 30.0 else ("favorable" if adx > 25.0 else "mediocre")
+        confidence = min(1.0, max(0.65, adx / 35.0))
+
+        return ScreenerResult(
+            ticker=ticker,
+            bias=bias,
+            bias_confidence=confidence,
+            setup_score=setup_score,
+            setup_confidence=confidence,
+            catalyst_risk=0.10,
+            overall_confidence=confidence,
+            strategy_type="momentum",
+            metrics=m,
+            market_regime="TRENDING_BREAKOUT",
+            state_document=f"[TechnicalFallback:Breakout] {ticker} | Close={close:.2f} DonchianHigh={donchian_high:.2f}",
+        )
+
     def scan_universe(
         self, universe_metrics: Dict[str, Dict[str, Any]]
     ) -> List[ScreenerResult]:
@@ -513,101 +644,9 @@ class TechnicalFallbackScreener:
         results: List[ScreenerResult] = []
 
         for ticker, m in universe_metrics.items():
-            rsi: float = float(m.get("rsi", m.get("rsi14", 50.0)))
-            rsi3: float = float(m.get("rsi3", 50.0))
-            rsi7: float = float(m.get("rsi7", 50.0))
-            adx: float = float(m.get("adx", 0.0))
-            close: float = float(m.get("close", 0.0))
-            sma200: float = float(m.get("sma200", close))
-            ema20: float = float(m.get("ema20", close))
-            ema50: float = float(m.get("ema50", close))
-            macd: float = float(m.get("macd", 0.0) or 0.0)
-            macd_signal: float = float(m.get("macd_signal", 0.0) or 0.0)
-            atr: float = float(m.get("atr", 0.0))
-
-            # --- 1. Connors 3-RSI Mean Reversion Strategy (High Win-Rate) ---
-            is_3rsi_bullish = close > sma200 and rsi3 <= 22.0 and rsi7 <= 42.0
-            is_3rsi_bearish = close < sma200 and rsi3 >= 78.0 and rsi7 >= 58.0
-
-            if is_3rsi_bullish:
-                results.append(
-                    ScreenerResult(
-                        ticker=ticker,
-                        bias="bullish",
-                        bias_confidence=0.95,
-                        setup_score="exceptional",
-                        setup_confidence=0.95,
-                        catalyst_risk=0.05,
-                        overall_confidence=0.95,
-                        strategy_type="3rsi_mean_reversion",
-                        metrics=m,
-                        state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f} close={close:.2f} > sma200={sma200:.2f}",
-                    )
-                )
-                continue
-            elif is_3rsi_bearish:
-                results.append(
-                    ScreenerResult(
-                        ticker=ticker,
-                        bias="bearish",
-                        bias_confidence=0.92,
-                        setup_score="exceptional",
-                        setup_confidence=0.92,
-                        catalyst_risk=0.05,
-                        overall_confidence=0.92,
-                        strategy_type="3rsi_mean_reversion",
-                        metrics=m,
-                        state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f} close={close:.2f} < sma200={sma200:.2f}",
-                    )
-                )
-                continue
-
-            # --- 2. 3x Momentum & Trend Breakout Strategy ---
-            if adx < self.min_adx:
-                continue
-
-            # Determine MACD or EMA trend confirmation
-            if macd != 0.0 or macd_signal != 0.0:
-                macd_bullish = macd > macd_signal
-                macd_bearish = macd < macd_signal
-            else:
-                macd_bullish = ema20 > ema50
-                macd_bearish = ema20 < ema50
-
-            bullish = rsi < 68.0 and close > ema20 and macd_bullish
-            bearish = rsi > 32.0 and close < ema20 and macd_bearish
-
-            if not bullish and not bearish:
-                continue
-
-            bias = "bullish" if bullish else "bearish"
-
-            # Setup quality driven by ADX trend strength
-            if adx > 30.0:
-                setup_score = "exceptional"
-            elif adx > 25.0:
-                setup_score = "favorable"
-            else:
-                setup_score = "mediocre"
-
-            confidence = min(1.0, adx / 40.0)
-            catalyst_risk = 0.10
-
-            results.append(
-                ScreenerResult(
-                    ticker=ticker,
-                    bias=bias,
-                    bias_confidence=confidence,
-                    setup_score=setup_score,
-                    setup_confidence=confidence,
-                    catalyst_risk=catalyst_risk,
-                    overall_confidence=confidence,
-                    strategy_type="momentum",
-                    metrics=m,
-                    state_document=f"[TechnicalFallback:Momentum] {ticker} | RSI={rsi:.1f} ADX={adx:.1f} "
-                                   f"close={close:.4f} ema20={ema20:.4f} MACD={macd:.4f}/{macd_signal:.4f}",
-                )
-            )
+            candidate = self.evaluate_candidate(ticker, m)
+            if candidate is not None and candidate.market_regime != "HIGH_VOL_ERRATIC" and candidate.bias != "neutral":
+                results.append(candidate)
 
         # Sort: best setup first, then highest confidence
         results.sort(

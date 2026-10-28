@@ -1801,6 +1801,49 @@ class LeveragedUniverse:
 
         return "LONG"
 
+    @staticmethod
+    def normalize_quote_to_eur(ticker: str, price: float, currency: Optional[str] = None) -> float:
+        """Convert a quoted instrument price to base EUR currency.
+
+        - If quoted in GBX (pence), ticker in GBX_TICKERS, or price > 500 in GBP:
+          Divides by 100.0 to convert pence -> GBP, then multiplies by benchmark FX rate 1.204 (GBP->EUR).
+        - If quoted in USD: Converts using benchmark rate (1.0 / 1.085 ≈ 0.9217 EUR/USD).
+        - If quoted in EUR: Returns price unchanged.
+        """
+        if price <= 0:
+            return 0.0
+
+        c = (currency or "").upper().strip()
+        clean_ticker = (ticker or "").strip()
+        if not c and clean_ticker:
+            c = get_ticker_currency(clean_ticker)
+
+        # Check if the price is in British pence (GBX)
+        is_pence = (
+            c == "GBX"
+            or (clean_ticker and clean_ticker in GBX_TICKERS)
+            or (c == "GBP" and price > 500.0)
+            or (clean_ticker and clean_ticker.endswith(".L") and price > 500.0)
+        )
+
+        if is_pence:
+            price_gbp = price / 100.0
+            c = "GBP"
+        else:
+            price_gbp = price
+
+        benchmark_gbp_eur = 1.204
+        benchmark_eur_usd = 1.085
+
+        if c in ("GBP", "GBX"):
+            return round(price_gbp * benchmark_gbp_eur, 4)
+        elif c == "USD":
+            return round(price / benchmark_eur_usd, 4)
+        else:
+            if is_pence:
+                return round(price_gbp * benchmark_gbp_eur, 4)
+            return round(price, 4)
+
 
 # ── Authoritative Currency Resolution for Trading 212 Instruments ──────────────
 # Tickers trading in British Pence / Penny (GBX / p) on the London Stock Exchange
@@ -1931,4 +1974,10 @@ def get_etp_direction(etp_ticker: str) -> str:
     if _DEFAULT_UNIVERSE is None:
         _DEFAULT_UNIVERSE = LeveragedUniverse()
     return _DEFAULT_UNIVERSE.get_etp_direction(etp_ticker)
+
+
+def normalize_quote_to_eur(ticker: str, price: float, currency: Optional[str] = None) -> float:
+    """Module-level helper to convert a quoted instrument price to base EUR currency."""
+    return LeveragedUniverse.normalize_quote_to_eur(ticker, price, currency)
+
 
