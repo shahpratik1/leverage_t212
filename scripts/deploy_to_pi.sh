@@ -6,7 +6,7 @@ if [ -n "$1" ]; then
     PI_DEST="$1"
 else
     echo "🔍 Probing for active Raspberry Pi host on local network..."
-    CANDIDATES=("shahpratik11@trading212-pi.local" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61" "trading212-pi")
+    CANDIDATES=("shahpratik11@192.168.178.54" "trading212-pi" "shahpratik11@trading212-pi.local" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61")
     FOUND=""
     for cand in "${CANDIDATES[@]}"; do
         if ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no "$cand" "true" 2>/dev/null; then
@@ -31,17 +31,13 @@ echo "========================================================"
 # 1. Create remote directory if missing
 ssh "$PI_DEST" "mkdir -p $REMOTE_DIR"
 
-# 2. If .env does not exist on remote Pi, copy it over once
-if ! ssh "$PI_DEST" "[ -f $REMOTE_DIR/.env ]"; then
-    echo "Copying initial .env credentials to Pi..."
-    scp .env "$PI_DEST:$REMOTE_DIR/.env"
-fi
+# 2. Sync .env credentials and risk settings to Pi
+echo "Syncing .env configuration to Pi..."
+scp .env "$PI_DEST:$REMOTE_DIR/.env"
 
-# 3. If active_trades.json does not exist on remote Pi, copy current state
-if ! ssh "$PI_DEST" "[ -f $REMOTE_DIR/active_trades.json ]"; then
-    echo "Copying initial active_trades.json to Pi..."
-    scp active_trades.json "$PI_DEST:$REMOTE_DIR/active_trades.json"
-fi
+# 3. Sync recalibrated active_trades.json to Pi
+echo "Syncing recalibrated active_trades.json to Pi..."
+scp active_trades.json "$PI_DEST:$REMOTE_DIR/active_trades.json"
 
 # 4. Sync application code (excluding runtime state, logs, and git)
 echo "Syncing code files..."

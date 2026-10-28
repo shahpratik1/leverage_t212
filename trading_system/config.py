@@ -364,6 +364,17 @@ class Settings:
             except ValueError:
                 pass
 
+        env_flatten_all = os.environ.get("FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE")
+        if env_flatten_all is not None:
+            self.FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE = env_flatten_all.strip().lower() in ("1", "true", "yes", "t")
+
+        env_max_sl = os.environ.get("MAX_SL_PCT")
+        if env_max_sl:
+            try:
+                self.MAX_SL_PCT = float(env_max_sl.strip())
+            except ValueError:
+                pass
+
         if not self.PANIC_FLATTEN_TOKEN:
             self.PANIC_FLATTEN_TOKEN = os.environ.get("PANIC_FLATTEN_TOKEN", "")
 
