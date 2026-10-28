@@ -1124,12 +1124,18 @@ class PositionMonitor:
             current_minutes = now_utc.hour * 60 + now_utc.minute
             cutoff_minutes = cutoff_h * 60 + cutoff_m
 
-            # Active within 10-minute window: 16:20 UTC to 16:30 UTC
-            in_window = cutoff_minutes <= current_minutes < (cutoff_minutes + 10)
-            if not in_window:
+            # Active from cutoff time (16:20 UTC) until exchange close (16:30 UTC / 990 min)
+            # OR if running after exchange close / next morning before exchange open (480 min = 08:00 UTC)
+            # with any non-overnight-eligible positions still lingering.
+            is_cutoff_window = cutoff_minutes <= current_minutes < 990
+            has_unhedged_overnight = (current_minutes >= 990 or current_minutes < 480) and any(
+                not getattr(p, "is_overnight_eligible", False) for p in self.positions.values() if not p.is_closed
+            )
+
+            if not (is_cutoff_window or has_unhedged_overnight):
                 return []
 
-            if self._last_session_close_date == today_str:
+            if self._last_session_close_date == today_str and not has_unhedged_overnight:
                 return []
 
         logger.info(
@@ -1149,20 +1155,24 @@ class PositionMonitor:
             current_price = prices.get(ticker) or prices.get(pos.underlying) or pos.entry_price
 
             if pos.direction.upper() == "SHORT":
-                if settings.ENFORCE_INVERSE_INTRADAY_ONLY:
+                if settings.ENFORCE_INVERSE_INTRADAY_ONLY or getattr(settings, "FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE", False):
                     positions_to_close.append((pos, "INVERSE_INTRADAY_FLATTEN", current_price))
                     tickers_to_remove.append(ticker)
             elif pos.direction.upper() == "LONG":
-                if settings.ENFORCE_LONG_BREAKEVEN_OVERNIGHT:
-                    if not pos.tp1_hit:
-                        positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
-                        tickers_to_remove.append(ticker)
-                    elif (
+                flatten_all = getattr(settings, "FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE", False)
+                if flatten_all:
+                    positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
+                    tickers_to_remove.append(ticker)
+                elif settings.ENFORCE_LONG_BREAKEVEN_OVERNIGHT:
+                    if (
                         pos.earnings_in_days is not None
                         and isinstance(pos.earnings_in_days, (int, float))
                         and 0 <= pos.earnings_in_days <= (settings.EARNINGS_BLACKOUT_HOURS / 24.0)
                     ):
                         positions_to_close.append((pos, "EARNINGS_BLACKOUT_EXIT", current_price))
+                        tickers_to_remove.append(ticker)
+                    elif not pos.tp1_hit:
+                        positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
                         tickers_to_remove.append(ticker)
                     else:
                         pos.is_overnight_eligible = True

@@ -78,6 +78,7 @@ class RiskManager:
         max_position_pct: Optional[float] = None,
         atr_sl_multiplier: float = 1.5,
         min_sl_pct: float = 0.005,              # 0.5% minimum stop distance
+        max_sl_pct: Optional[float] = None,     # 3.0% maximum stop distance cap
         tp1_r: float = 1.0,
         tp2_r: float = 2.0,
         tp3_r: float = 3.0,
@@ -100,6 +101,7 @@ class RiskManager:
         self.max_position_pct = getattr(settings, "MAX_POSITION_PCT", 0.20) if max_position_pct is None else max_position_pct
         self.atr_sl_multiplier = atr_sl_multiplier
         self.min_sl_pct = min_sl_pct
+        self.max_sl_pct = getattr(settings, "MAX_SL_PCT", 0.03) if max_sl_pct is None else max_sl_pct
         self.tp1_r = tp1_r
         self.tp2_r = tp2_r
         self.tp3_r = tp3_r
@@ -200,13 +202,15 @@ class RiskManager:
         return False, 0.0
 
     def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG") -> float:
-        """Calculate stop loss based on ATR and minimum percentage distance.
+        """Calculate stop loss based on ATR, bounded between min_sl_pct and max_sl_pct.
 
-        For LONG:  SL = Entry - max(multiplier * ATR, Entry * min_sl_pct)
-        For SHORT (if CFD): SL = Entry + max(multiplier * ATR, Entry * min_sl_pct)
+        For LONG:  SL = Entry - clamp(multiplier * ATR, Entry * min_sl_pct, Entry * max_sl_pct)
+        For SHORT (if CFD): SL = Entry + clamp(multiplier * ATR, Entry * min_sl_pct, Entry * max_sl_pct)
         Note: When buying an Inverse 3x ETP, treat the ETP as a Long position with respect to its own price.
         """
-        sl_distance = max(self.atr_sl_multiplier * atr, entry_price * self.min_sl_pct)
+        raw_sl_distance = max(self.atr_sl_multiplier * atr, entry_price * self.min_sl_pct)
+        max_distance = entry_price * getattr(self, "max_sl_pct", 0.03)
+        sl_distance = min(raw_sl_distance, max_distance)
         if direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP"):
             stop_loss = entry_price + sl_distance
         else:

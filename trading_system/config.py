@@ -109,6 +109,7 @@ class Settings:
     MAX_POSITION_PCT: float = 0.20  # 20% of equity max per position (increased from 5% for meaningful portfolio size)
     ATR_SL_MULTIPLIER: float = 2.2
     MIN_SL_PCT: float = 0.005  # 0.5% minimum stop distance
+    MAX_SL_PCT: float = 0.03   # 3.0% maximum stop distance (strict risk cap)
     TP1_R_MULTIPLE: float = 1.0
     TP2_R_MULTIPLE: float = 2.0
     TP3_R_MULTIPLE: float = 3.0
@@ -140,7 +141,9 @@ class Settings:
     # Asymmetric Session Protocol & API Rate Quota Management
     SESSION_CLOSE_CUTOFF_UTC: str = "16:20"  # 10m before 16:30 LSE close
     ENFORCE_INVERSE_INTRADAY_ONLY: bool = True
+    FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE: bool = False  # Set True to force 100% intraday liquidation of all 3x/5x ETPs at 16:20 UTC
     ENFORCE_LONG_BREAKEVEN_OVERNIGHT: bool = True
+    MIN_OVERNIGHT_PROFIT_CUSHION_PCT: float = 0.025      # 2.5% minimum profit cushion if long swing overnight is allowed
     EARNINGS_BLACKOUT_HOURS: int = 24
     RATE_LIMIT_INTER_CALL_DELAY: float = 1.25  # seconds between Trading 212 API calls (strictly obeys 1 req/sec quota)
 
@@ -424,6 +427,10 @@ class Settings:
         if self.MIN_SL_PCT <= 0:
             raise ValueError(
                 f"MIN_SL_PCT must be positive, got {self.MIN_SL_PCT}"
+            )
+        if self.MAX_SL_PCT <= self.MIN_SL_PCT:
+            raise ValueError(
+                f"MAX_SL_PCT ({self.MAX_SL_PCT}) must be greater than MIN_SL_PCT ({self.MIN_SL_PCT})"
             )
         if not (self.TP1_R_MULTIPLE < self.TP2_R_MULTIPLE < self.TP3_R_MULTIPLE):
             raise ValueError(
