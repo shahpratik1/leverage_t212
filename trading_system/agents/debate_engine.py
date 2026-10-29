@@ -175,7 +175,7 @@ class DebateEngine:
         rsi3_thresh = getattr(settings, "RSI3_OVERSOLD", 28.0)
         adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
 
-        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= rsi3_thresh):
+        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= rsi3_thresh) or (close < sma200 and rsi3 >= 78.0):
             if close > sma200 and rsi3 <= rsi3_thresh:
                 conviction = 0.94 if rsi3 <= 20.0 else 0.88
                 target_p = sma5 if sma5 > close else close * 1.05
@@ -209,6 +209,49 @@ class DebateEngine:
                     ),
                     synthesis=f"Speculative Fast Router: Confirmed high-probability 3-RSI mean reversion entry on {ticker}. Short-term sellers exhausted above 200 SMA.",
                     conviction_score=conviction,
+                    debate_rounds=1,
+                )
+            elif close < sma200 and rsi3 >= 78.0 and rsi7 >= 55.0:
+                conviction = 0.92 if rsi3 >= 82.0 else 0.85
+                target_p = sma5 if sma5 < close else close * 0.95
+                return DebateOutcome(
+                    ticker=ticker,
+                    winning_side="bear",
+                    consensus_decision="SELL_ENTRY",
+                    bull_position=DebatePosition(
+                        side="bull",
+                        thesis="Short-term squeeze momentum could persist before rolling over.",
+                        key_evidence=[f"RSI(3)={rsi3:.1f} shows rapid short squeeze."],
+                        target_price=close * 1.04,
+                        risk_factors=["Major resistance at 200 SMA."],
+                        confidence=round(1.0 - conviction, 2),
+                    ),
+                    bear_position=DebatePosition(
+                        side="bear",
+                        thesis="Institutional 3-RSI overbought exhaustion short below 200 SMA.",
+                        key_evidence=[
+                            f"RSI(3)={rsi3:.1f} indicates severe overbought exhaustion inside macro downtrend.",
+                            f"Price ({close:.2f}) remains strictly below 200 SMA ({sma200:.2f}).",
+                            f"Immediate mean-reversion magnet: 5-Day SMA at {sma5:.2f} ({((sma5 - close) / close) * 100:.1f}%).",
+                            "Larry Connors 3-RSI short model historically demonstrates 80%+ win rate on overbought counter-trend rallies below 200 SMA.",
+                        ],
+                        target_price=target_p,
+                        risk_factors=["Upside squeeze through 200-day moving average."],
+                        confidence=conviction,
+                    ),
+                    synthesis=f"Speculative Fast Router: Confirmed high-probability 3-RSI bearish mean reversion entry on {ticker}. Exhaustion rally inside macro downtrend.",
+                    conviction_score=conviction,
+                    debate_rounds=1,
+                )
+            elif strategy_type == "3rsi_mean_reversion":
+                return DebateOutcome(
+                    ticker=ticker,
+                    winning_side="tie",
+                    consensus_decision="DO_NOT_TRADE",
+                    bull_position=DebatePosition(side="bull", thesis="Incomplete 3-RSI setup", key_evidence=[], target_price=close, risk_factors=[], confidence=0.5),
+                    bear_position=DebatePosition(side="bear", thesis="Incomplete 3-RSI setup", key_evidence=[], target_price=close, risk_factors=[], confidence=0.5),
+                    synthesis=f"Speculative Fast Router: {ticker} does not meet strict 3-RSI criteria (RSI3={rsi3:.1f}, SMA200={sma200:.2f}). Vetoed.",
+                    conviction_score=0.40,
                     debate_rounds=1,
                 )
 

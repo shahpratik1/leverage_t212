@@ -464,6 +464,7 @@ class RiskManager:
         etp_currency = (etp_quote.get("currency") if etp_quote else "") or universe.get_ticker_currency(sanitized_t212_ticker)
 
         underlying_price = float(metrics.get("close", 0.0) or 0.0)
+        is_derivative_etp = sanitized_t212_ticker.upper() != ticker.upper()
         if etp_price > 0:
             actual_entry_price = etp_price
             if underlying_price > 0 and atr > 0:
@@ -471,9 +472,41 @@ class RiskManager:
                 etp_atr = actual_entry_price * atr_ratio
             else:
                 etp_atr = atr if atr > 0 else (actual_entry_price * 0.02)
+        elif is_derivative_etp:
+            # Scale guard: Derivative/inverse ETP quote is missing; never fall back to underlying price
+            # as it creates catastrophic scale mismatches (e.g. ETH-USD $2310 vs ETH3EUR €5.70).
+            logger.warning(
+                "Scale guard veto: Quote unavailable for derivative ETP %s (underlying %s). Rejecting underlying price fallback.",
+                sanitized_t212_ticker, ticker
+            )
+            actual_entry_price = 0.0
+            etp_atr = 0.0
         else:
             actual_entry_price = underlying_price
             etp_atr = atr
+
+        if actual_entry_price <= 0.0:
+            return DecisionCard(
+                ticker=ticker,
+                trading212_ticker=sanitized_t212_ticker,
+                direction=direction.upper(),
+                decision="DO_NOT_TRADE",
+                entry_price=0.0,
+                stop_loss=0.0,
+                trailing_stop_loss=0.0,
+                stop_distance_pct=0.0,
+                take_profit_1=0.0,
+                take_profit_2=0.0,
+                take_profit_3=0.0,
+                position_size_shares=0.0,
+                position_notional=0.0,
+                risk_amount=0.0,
+                risk_pct_of_equity=0.0,
+                conviction_score=0.0,
+                rationale="Scale guard veto: Invalid or unresolvable ETP execution price.",
+                strategy_type=strategy_type,
+                leverage=resolved_leverage,
+            )
 
         stop_loss = self.calculate_stop_loss(actual_entry_price, etp_atr, direction=direction)
         stop_distance_pct = (
@@ -485,7 +518,24 @@ class RiskManager:
         conviction_score = getattr(debate_outcome, "conviction_score", 0.0)
         synthesis = getattr(debate_outcome, "synthesis", "No synthesis provided.")
 
-        if consensus in ("DO_NOT_TRADE", "EXIT"):
+        dir_upper = direction.upper()
+        is_long = dir_upper in ("LONG", "BUY", "BULLISH")
+        is_short = dir_upper in ("SHORT", "SELL", "BEARISH")
+
+        # Directional alignment gate: If debate specifically concluded the opposite direction won, veto entry!
+        # E.g. Candidate requested SHORT, but System 2 debate concluded BULL won (consensus=BUY_ENTRY).
+        winning_side = str(getattr(debate_outcome, "winning_side", "") or "").lower()
+        if isinstance(winning_side, str):
+            direction_mismatch = (is_short and winning_side == "bull") or (is_long and winning_side == "bear")
+        else:
+            direction_mismatch = False
+
+        if consensus in ("DO_NOT_TRADE", "EXIT") or direction_mismatch:
+            if direction_mismatch:
+                logger.warning(
+                    "Directional conflict veto for %s: candidate requested %s but debate winning side was %s (consensus=%s). Setting DO_NOT_TRADE.",
+                    ticker, direction, winning_side, consensus
+                )
             shares, position_notional, actual_risk, risk_pct_of_equity = 0.0, 0.0, 0.0, 0.0
             decision_action = "DO_NOT_TRADE"
         else:
@@ -501,7 +551,7 @@ class RiskManager:
             risk_pct_of_equity = (
                 actual_risk / account_equity if account_equity > 0 else 0.0
             )
-            decision_action = "BUY_ENTRY" if direction.upper() in ("LONG", "BUY") else "SELL_ENTRY"
+            decision_action = "BUY_ENTRY" if is_long else "SELL_ENTRY"
 
         return DecisionCard(
             ticker=ticker,

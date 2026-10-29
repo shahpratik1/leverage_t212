@@ -523,7 +523,7 @@ class TechnicalFallbackScreener:
         rsi7: float = float(m.get("rsi7", 50.0))
         adx: float = float(m.get("adx", 0.0))
         close: float = float(m.get("close", 0.0))
-        sma200: float = float(m.get("sma200", close))
+        sma200: float = float(m.get("sma200", 0.0) or 0.0)
         ema20: float = float(m.get("ema20", close))
         ema50: float = float(m.get("ema50", close))
         macd: float = float(m.get("macd", 0.0) or 0.0)
@@ -548,9 +548,11 @@ class TechnicalFallbackScreener:
             )
 
         if regime == "CHOP_RANGE":
-            # Connors 3-RSI Mean Reversion
-            is_3rsi_bullish = (close >= sma200 or sma200 == close) and (rsi3 <= 28.0 or rsi7 <= 45.0)
-            is_3rsi_bearish = (close <= sma200 or sma200 == close) and (rsi3 >= 72.0 or rsi7 >= 55.0)
+            # Connors 3-RSI Mean Reversion (Strict macro-aligned setups)
+            # Bullish: macro bull (close > sma200) with short-term pullback (rsi3 <= 28, rsi7 <= 45)
+            # Bearish: macro bear (close < sma200) with short-term exhaustion rally (rsi3 >= 78, rsi7 >= 55)
+            is_3rsi_bullish = close > sma200 and (rsi3 <= 28.0 and rsi7 <= 45.0)
+            is_3rsi_bearish = close < sma200 and (rsi3 >= 78.0 and rsi7 >= 55.0)
             if is_3rsi_bullish:
                 return ScreenerResult(
                     ticker=ticker,
@@ -601,8 +603,12 @@ class TechnicalFallbackScreener:
         donchian_breakout_bull = has_donchian and dh > 0 and close >= dh
         donchian_breakout_bear = has_donchian and dl > 0 and close <= dl
 
-        bullish = (donchian_breakout_bull or (rsi < 68.0 and close > ema20)) and macd_bullish
-        bearish = (donchian_breakout_bear or (rsi > 32.0 and close < ema20)) and macd_bearish
+        # Macro trend alignment rule: Never short above the 200 SMA in a bull market
+        macro_bull = (close >= sma200) if sma200 > 0 else True
+        macro_bear = (close < sma200) if sma200 > 0 else True
+
+        bullish = (donchian_breakout_bull or (rsi < 68.0 and close > ema20)) and macd_bullish and (macro_bull or donchian_breakout_bull)
+        bearish = (donchian_breakout_bear or (rsi > 32.0 and close < ema20)) and macd_bearish and macro_bear
 
         if not bullish and not bearish:
             return None
