@@ -118,12 +118,46 @@ class TestBacktestEngine(unittest.TestCase):
             "volume": 15000000,
         })
 
-        res = self.engine.run(symbol="TEST", candles=candles, strategy_filter="3rsi")
+        legacy_engine = BacktestEngine(
+            initial_capital=10000.0,
+            leverage=3,
+            max_risk_per_trade=0.005,
+            max_position_pct=0.05,
+            target_vol=0.20,
+            max_hold_days=4,
+            pure_tsl_mode=False,
+        )
+        res = legacy_engine.run(symbol="TEST", candles=candles, strategy_filter="3rsi")
         self.assertGreaterEqual(len(res.trades), 1)
         first_trade = res.trades[0]
         self.assertTrue(first_trade.tp1_hit)
         self.assertEqual(first_trade.exit_reason, "TP3")
         self.assertGreater(first_trade.realized_pnl, 0.0)
+
+    def test_pure_tsl_progression(self):
+        """Construct scenario where price rises into profit zone, ratchets TSL, and exits 100% on reversal."""
+        candles = []
+        for i in range(30):
+            p = 60.0 + i * (50.0 / 30.0)
+            candles.append({
+                "date": f"2025-01-{(i%28)+1:02d}",
+                "open": round(p - 0.5, 2),
+                "high": round(p + 1.0, 2),
+                "low": round(p - 1.0, 2),
+                "close": round(p, 2),
+                "volume": 5000000,
+            })
+        candles.append({"date": "2025-02-01", "open": 108.0, "high": 108.0, "low": 97.0, "close": 98.0, "volume": 10000000})
+        candles.append({"date": "2025-02-02", "open": 97.0, "high": 97.0, "low": 91.0, "close": 92.0, "volume": 10000000})
+        candles.append({"date": "2025-02-03", "open": 93.0, "high": 110.0, "low": 92.0, "close": 108.0, "volume": 15000000})
+        candles.append({"date": "2025-02-04", "open": 106.0, "high": 107.0, "low": 95.0, "close": 96.0, "volume": 15000000})
+
+        res = self.engine.run(symbol="TEST", candles=candles, strategy_filter="3rsi")
+        self.assertGreaterEqual(len(res.trades), 1)
+        first_trade = res.trades[0]
+        self.assertIn("TSL", first_trade.exit_reason)
+        self.assertGreater(first_trade.realized_pnl, 0.0)
+        self.assertFalse(first_trade.tp1_hit)
 
     def test_rolling_nixtla_forecast_and_sentiment_proxy(self):
         """Verify rolling 5-day forecast and sentiment proxy mathematical integrity."""

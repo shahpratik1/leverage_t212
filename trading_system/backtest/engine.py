@@ -16,6 +16,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from trading_system.config import settings
+except ImportError:
+    settings = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,6 +118,7 @@ class BacktestEngine:
         tp2_r: float = 2.5,
         tp3_r: float = 3.5,
         multi_regime: bool = True,
+        pure_tsl_mode: Optional[bool] = None,
     ):
         self.initial_capital = initial_capital
         self.leverage = leverage
@@ -124,6 +130,10 @@ class BacktestEngine:
         self.tp2_r = tp2_r
         self.tp3_r = tp3_r
         self.multi_regime = multi_regime
+        if pure_tsl_mode is None:
+            self.pure_tsl_mode = getattr(settings, "PURE_TSL_MODE", True) if settings else True
+        else:
+            self.pure_tsl_mode = pure_tsl_mode
 
     def run_universe(self, symbols: List[str], limit_candles: int = 250) -> Dict[str, Any]:
         """Batch evaluate performance across multiple symbols in universe."""
@@ -333,82 +343,22 @@ class BacktestEngine:
                 rem_shares = pos["remaining_shares"]
                 is_long = direction == "LONG"
 
-                # Check SL hit
-                sl_hit = (l <= stop_loss) if is_long else (h >= stop_loss)
-                if sl_hit:
-                    exit_p = stop_loss
-                    pnl_per_share = (exit_p - entry_p) if is_long else (entry_p - exit_p)
-                    # Scale PnL by 3x leverage
-                    trade_pnl = rem_shares * pnl_per_share * self.leverage
-                    pos["realized_pnl"] += trade_pnl
-                    capital += (rem_shares * entry_p) + trade_pnl
+                if self.pure_tsl_mode:
+                    pos["highest_price"] = max(pos.get("highest_price", h), h)
+                    pos["lowest_price"] = min(pos.get("lowest_price", l), l)
 
-                    reason = "SL" if not pos["tp1_hit"] else "TP1_SL_BE"
-                    t = SimulatedTrade(
-                        trade_id=pos["id"],
-                        symbol=symbol,
-                        direction=direction,
-                        strategy=pos["strategy"],
-                        entry_date=pos["entry_date"],
-                        entry_price=entry_p,
-                        exit_date=curr_date,
-                        exit_price=exit_p,
-                        shares=pos["total_shares"],
-                        notional=pos["notional"],
-                        initial_sl=pos["initial_sl"],
-                        tp1=pos["tp1"],
-                        tp2=pos["tp2"],
-                        tp3=pos["tp3"],
-                        realized_pnl=round(pos["realized_pnl"], 2),
-                        return_pct=round((pos["realized_pnl"] / pos["notional"]) * 100, 2) if pos["notional"] > 0 else 0.0,
-                        hold_days=pos["hold_days"],
-                        exit_reason=reason,
-                        tp1_hit=pos["tp1_hit"],
-                        tp2_hit=pos["tp2_hit"],
-                        tp3_hit=pos["tp3_hit"],
-                    )
-                    trades.append(t)
-                    continue
+                    # Check SL hit
+                    sl_hit = (l <= stop_loss) if is_long else (h >= stop_loss)
+                    if sl_hit:
+                        exit_p = stop_loss
+                        pnl_per_share = (exit_p - entry_p) if is_long else (entry_p - exit_p)
+                        trade_pnl = rem_shares * pnl_per_share * self.leverage
+                        pos["realized_pnl"] += trade_pnl
+                        capital += (rem_shares * entry_p) + trade_pnl
 
-                # Check TP1 hit (+1.0R): Banks 50%, moves SL to Break-Even
-                if not pos["tp1_hit"]:
-                    tp1_hit = (h >= pos["tp1"]) if is_long else (l <= pos["tp1"])
-                    if tp1_hit:
-                        pos["tp1_hit"] = True
-                        trim_shares = pos["total_shares"] * 0.50
-                        pos["remaining_shares"] -= trim_shares
-                        exit_p = pos["tp1"]
-                        pnl = trim_shares * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
-                        pos["realized_pnl"] += pnl
-                        capital += (trim_shares * entry_p) + pnl
-                        # Elevate stop to break-even
-                        pos["current_sl"] = entry_p
-
-                # Check TP2 hit (+2.0R): Banks 25%, ratchets stop to TP1
-                if pos["tp1_hit"] and not pos["tp2_hit"]:
-                    tp2_hit = (h >= pos["tp2"]) if is_long else (l <= pos["tp2"])
-                    if tp2_hit:
-                        pos["tp2_hit"] = True
-                        trim_shares = pos["total_shares"] * 0.25
-                        pos["remaining_shares"] -= trim_shares
-                        exit_p = pos["tp2"]
-                        pnl = trim_shares * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
-                        pos["realized_pnl"] += pnl
-                        capital += (trim_shares * entry_p) + pnl
-                        # Ratchet stop to TP1
-                        pos["current_sl"] = pos["tp1"]
-
-                # Check TP3 hit (+3.0R): Banks remaining 25%
-                if pos["tp2_hit"] and not pos["tp3_hit"]:
-                    tp3_hit = (h >= pos["tp3"]) if is_long else (l <= pos["tp3"])
-                    if tp3_hit:
-                        pos["tp3_hit"] = True
-                        rem = pos["remaining_shares"]
-                        pos["remaining_shares"] = 0.0
-                        exit_p = pos["tp3"]
-                        pnl = rem * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
-                        pos["realized_pnl"] += pnl
-                        capital += (rem * entry_p) + pnl
+                        reason = pos.get("tsl_status", "SL")
+                        if reason == "INITIAL":
+                            reason = "SL"
 
                         t = SimulatedTrade(
                             trade_id=pos["id"],
@@ -428,36 +378,177 @@ class BacktestEngine:
                             realized_pnl=round(pos["realized_pnl"], 2),
                             return_pct=round((pos["realized_pnl"] / pos["notional"]) * 100, 2) if pos["notional"] > 0 else 0.0,
                             hold_days=pos["hold_days"],
-                            exit_reason="TP3",
-                            tp1_hit=True,
-                            tp2_hit=True,
-                            tp3_hit=True,
+                            exit_reason=reason,
+                            tp1_hit=False,
+                            tp2_hit=False,
+                            tp3_hit=False,
                         )
                         trades.append(t)
                         continue
 
-                # Check Nixtla forecast reversal trim for multi_factor trades
-                if pos["strategy"] == "multi_factor" and not pos.get("forecast_trimmed", False):
-                    curr_f = forecast_5d[i]
-                    if curr_f is not None:
-                        unrealized_pnl_pct = (
-                            ((c - entry_p) / entry_p * 100.0)
-                            if is_long
-                            else ((entry_p - c) / entry_p * 100.0)
+                    # Progressive TSL ratchet
+                    curr_atr = atr14[i] if atr14 and i < len(atr14) and atr14[i] is not None and atr14[i] > 0 else (c * 0.02)
+                    if is_long:
+                        peak_gain_pct = (pos["highest_price"] - entry_p) / entry_p * 100.0
+                        if peak_gain_pct >= 3.0:
+                            cushion = entry_p * 1.015
+                            if cushion > pos["current_sl"]:
+                                pos["current_sl"] = cushion
+                                pos["tsl_status"] = "TSL_CUSHION"
+                        elif peak_gain_pct >= 1.5:
+                            if entry_p > pos["current_sl"]:
+                                pos["current_sl"] = entry_p
+                                pos["tsl_status"] = "TSL_BREAKEVEN"
+
+                        if peak_gain_pct >= 1.5 or pos["current_sl"] >= entry_p:
+                            dyn_tsl = pos["highest_price"] - (1.2 * curr_atr)
+                            if dyn_tsl > pos["current_sl"]:
+                                pos["current_sl"] = dyn_tsl
+                                pos["tsl_status"] = "TSL_DYNAMIC"
+                    else:
+                        trough_gain_pct = (entry_p - pos["lowest_price"]) / entry_p * 100.0
+                        if trough_gain_pct >= 3.0:
+                            cushion = entry_p * 0.985
+                            if cushion < pos["current_sl"]:
+                                pos["current_sl"] = cushion
+                                pos["tsl_status"] = "TSL_CUSHION"
+                        elif trough_gain_pct >= 1.5:
+                            if entry_p < pos["current_sl"]:
+                                pos["current_sl"] = entry_p
+                                pos["tsl_status"] = "TSL_BREAKEVEN"
+
+                        if trough_gain_pct >= 1.5 or pos["current_sl"] <= entry_p:
+                            dyn_tsl = pos["lowest_price"] + (1.2 * curr_atr)
+                            if dyn_tsl < pos["current_sl"]:
+                                pos["current_sl"] = dyn_tsl
+                                pos["tsl_status"] = "TSL_DYNAMIC"
+                else:
+                    # ── Legacy Milestone Profit Taking (TP1/TP2/TP3) ──
+                    # Check SL hit
+                    sl_hit = (l <= stop_loss) if is_long else (h >= stop_loss)
+                    if sl_hit:
+                        exit_p = stop_loss
+                        pnl_per_share = (exit_p - entry_p) if is_long else (entry_p - exit_p)
+                        # Scale PnL by 3x leverage
+                        trade_pnl = rem_shares * pnl_per_share * self.leverage
+                        pos["realized_pnl"] += trade_pnl
+                        capital += (rem_shares * entry_p) + trade_pnl
+
+                        reason = "SL" if not pos["tp1_hit"] else "TP1_SL_BE"
+                        t = SimulatedTrade(
+                            trade_id=pos["id"],
+                            symbol=symbol,
+                            direction=direction,
+                            strategy=pos["strategy"],
+                            entry_date=pos["entry_date"],
+                            entry_price=entry_p,
+                            exit_date=curr_date,
+                            exit_price=exit_p,
+                            shares=pos["total_shares"],
+                            notional=pos["notional"],
+                            initial_sl=pos["initial_sl"],
+                            tp1=pos["tp1"],
+                            tp2=pos["tp2"],
+                            tp3=pos["tp3"],
+                            realized_pnl=round(pos["realized_pnl"], 2),
+                            return_pct=round((pos["realized_pnl"] / pos["notional"]) * 100, 2) if pos["notional"] > 0 else 0.0,
+                            hold_days=pos["hold_days"],
+                            exit_reason=reason,
+                            tp1_hit=pos["tp1_hit"],
+                            tp2_hit=pos["tp2_hit"],
+                            tp3_hit=pos["tp3_hit"],
                         )
-                        if ((is_long and curr_f <= -3.0) or (not is_long and curr_f >= 3.0)) and unrealized_pnl_pct >= 1.5:
-                            pos["forecast_trimmed"] = True
-                            trim_shares = pos["remaining_shares"] * 0.50
+                        trades.append(t)
+                        continue
+
+                    # Check TP1 hit (+1.0R): Banks 50%, moves SL to Break-Even
+                    if not pos["tp1_hit"]:
+                        tp1_hit = (h >= pos["tp1"]) if is_long else (l <= pos["tp1"])
+                        if tp1_hit:
+                            pos["tp1_hit"] = True
+                            trim_shares = pos["total_shares"] * 0.50
                             pos["remaining_shares"] -= trim_shares
-                            exit_p = c
+                            exit_p = pos["tp1"]
                             pnl = trim_shares * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
                             pos["realized_pnl"] += pnl
                             capital += (trim_shares * entry_p) + pnl
-                            # Elevate stop loss to break-even to protect remaining shares
-                            if is_long and pos["current_sl"] < entry_p:
-                                pos["current_sl"] = entry_p
-                            elif not is_long and pos["current_sl"] > entry_p:
-                                pos["current_sl"] = entry_p
+                            # Elevate stop to break-even
+                            pos["current_sl"] = entry_p
+
+                    # Check TP2 hit (+2.0R): Banks 25%, ratchets stop to TP1
+                    if pos["tp1_hit"] and not pos["tp2_hit"]:
+                        tp2_hit = (h >= pos["tp2"]) if is_long else (l <= pos["tp2"])
+                        if tp2_hit:
+                            pos["tp2_hit"] = True
+                            trim_shares = pos["total_shares"] * 0.25
+                            pos["remaining_shares"] -= trim_shares
+                            exit_p = pos["tp2"]
+                            pnl = trim_shares * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
+                            pos["realized_pnl"] += pnl
+                            capital += (trim_shares * entry_p) + pnl
+                            # Ratchet stop to TP1
+                            pos["current_sl"] = pos["tp1"]
+
+                    # Check TP3 hit (+3.0R): Banks remaining 25%
+                    if pos["tp2_hit"] and not pos["tp3_hit"]:
+                        tp3_hit = (h >= pos["tp3"]) if is_long else (l <= pos["tp3"])
+                        if tp3_hit:
+                            pos["tp3_hit"] = True
+                            rem = pos["remaining_shares"]
+                            pos["remaining_shares"] = 0.0
+                            exit_p = pos["tp3"]
+                            pnl = rem * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
+                            pos["realized_pnl"] += pnl
+                            capital += (rem * entry_p) + pnl
+
+                            t = SimulatedTrade(
+                                trade_id=pos["id"],
+                                symbol=symbol,
+                                direction=direction,
+                                strategy=pos["strategy"],
+                                entry_date=pos["entry_date"],
+                                entry_price=entry_p,
+                                exit_date=curr_date,
+                                exit_price=exit_p,
+                                shares=pos["total_shares"],
+                                notional=pos["notional"],
+                                initial_sl=pos["initial_sl"],
+                                tp1=pos["tp1"],
+                                tp2=pos["tp2"],
+                                tp3=pos["tp3"],
+                                realized_pnl=round(pos["realized_pnl"], 2),
+                                return_pct=round((pos["realized_pnl"] / pos["notional"]) * 100, 2) if pos["notional"] > 0 else 0.0,
+                                hold_days=pos["hold_days"],
+                                exit_reason="TP3",
+                                tp1_hit=True,
+                                tp2_hit=True,
+                                tp3_hit=True,
+                            )
+                            trades.append(t)
+                            continue
+
+                    # Check Nixtla forecast reversal trim for multi_factor trades
+                    if pos["strategy"] == "multi_factor" and not pos.get("forecast_trimmed", False):
+                        curr_f = forecast_5d[i]
+                        if curr_f is not None:
+                            unrealized_pnl_pct = (
+                                ((c - entry_p) / entry_p * 100.0)
+                                if is_long
+                                else ((entry_p - c) / entry_p * 100.0)
+                            )
+                            if ((is_long and curr_f <= -3.0) or (not is_long and curr_f >= 3.0)) and unrealized_pnl_pct >= 1.5:
+                                pos["forecast_trimmed"] = True
+                                trim_shares = pos["remaining_shares"] * 0.50
+                                pos["remaining_shares"] -= trim_shares
+                                exit_p = c
+                                pnl = trim_shares * ((exit_p - entry_p) if is_long else (entry_p - exit_p)) * self.leverage
+                                pos["realized_pnl"] += pnl
+                                capital += (trim_shares * entry_p) + pnl
+                                # Elevate stop loss to break-even to protect remaining shares
+                                if is_long and pos["current_sl"] < entry_p:
+                                    pos["current_sl"] = entry_p
+                                elif not is_long and pos["current_sl"] > entry_p:
+                                    pos["current_sl"] = entry_p
 
                 # Check Max Hold Days cap (Connors <= 4 days to kill beta decay)
                 if pos["hold_days"] >= self.max_hold_days and pos["remaining_shares"] > 0:
@@ -629,6 +720,9 @@ class BacktestEngine:
                         "notional": actual_notional,
                         "initial_sl": initial_sl,
                         "current_sl": initial_sl,
+                        "highest_price": entry_p,
+                        "lowest_price": entry_p,
+                        "tsl_status": "INITIAL",
                         "tp1": tp1,
                         "tp2": tp2,
                         "tp3": tp3,
@@ -868,6 +962,8 @@ def main() -> None:
     parser.add_argument("--compare", action="store_true", help="Compare baseline vs multi-factor strategy side-by-side")
     parser.add_argument("--json", action="store_true", help="Output raw JSON results")
     parser.add_argument("--dry-run", action="store_true", help="Run quick verification with synthetic candles")
+    parser.add_argument("--pure-tsl", dest="pure_tsl", action="store_true", default=None, help="Enforce 100% Pure Trailing Stop Loss engine")
+    parser.add_argument("--legacy-tp", dest="pure_tsl", action="store_false", help="Use legacy TP1/TP2/TP3 milestone trims")
 
     args = parser.parse_args()
 
@@ -901,6 +997,7 @@ def main() -> None:
         max_position_pct=0.05,
         target_vol=0.20,
         max_hold_days=4,
+        pure_tsl_mode=args.pure_tsl,
     )
 
     if args.compare:
