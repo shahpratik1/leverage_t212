@@ -70,7 +70,7 @@ class StrategyImprovementAgent:
         """Record the candidate yield of a universe scan cycle and run health diagnostics.
 
         Args:
-            candidate_count: Number of qualifying candidates produced by System 1.
+            candidate_count: Number of qualifying candidates produced for System 2 deliberation.
             universe_metrics: Full dictionary of metrics across ingested assets.
 
         Returns:

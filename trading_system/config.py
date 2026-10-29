@@ -86,10 +86,10 @@ class Settings:
     LLM_DEEP_MODEL: str = "gpt-4o"
     LLM_QUICK_MODEL: str = "gpt-4o-mini"
 
-    # Parallel Concurrency & Intelligent Model Routing
+    # Parallel Concurrency & Deliberative Multi-Agent Architecture
     PARALLEL_INGESTION_WORKERS: int = 24
     PARALLEL_DELIBERATION_WORKERS: int = 8
-    ENABLE_SPECULATIVE_ROUTING: bool = True
+    ENABLE_SPECULATIVE_ROUTING: bool = False  # Pure System 2: Fast reflex screening bypass completely disabled
     SPECULATIVE_CONFIDENCE_THRESHOLD: float = 0.70
 
     # Market Data API keys

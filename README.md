@@ -8,7 +8,7 @@
 
 An institutional-grade algorithmic trading system designed specifically for **3x and 5x leveraged Exchange-Traded Products (ETPs)** on **Trading 212**. 
 
-The system pairs **System 1 (Laya Fast Reflex Screener, `<10ms` triage)** with **System 2 (TradingAgents Deliberative Engine)**, executing spot orders with crash-resilient native broker stops and a **100% Pure Trailing Stop Loss engine**.
+The system operates on a pure **System 2 Deliberative Multi-Agent Brain** (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter, RiskManager), executing spot orders with crash-resilient native broker stops and a **100% Pure Trailing Stop Loss engine**.
 
 ---
 
@@ -41,20 +41,17 @@ The system pairs **System 1 (Laya Fast Reflex Screener, `<10ms` triage)** with *
 
 ```mermaid
 flowchart TD
-    subgraph Data & Screener
+    subgraph Data & Candidate Pre-Filter
         U[Curated 3x/5x Pairs\n120+ Assets] -->|Parallel Workers| S[Ingestion Engine & Candle DB]
-        S --> L1[System 1: Laya Screener\nADX Multi-Regime Classification]
+        S --> L1[Candidate Pre-Filter\nADX Multi-Regime Classification]
     end
 
-    subgraph Deliberation Engine
-        L1 --> R{Speculative Router}
-        R -->|Conviction >= 0.75| REFLEX[Fast Reflex Tier 1\nInstant <10ms Signal]
-        R -->|Contested / Ambiguous| DEEP[System 2: Deep Debate\nTechnical + Fundamental Agents]
+    subgraph System 2: Deliberative Multi-Agent Brain
+        L1 --> DEEP[Deliberative Multi-Agent Debate\nTechnical + Fundamental + Dialectic Arbiter]
     end
 
     subgraph Risk & Sizing
-        REFLEX --> RISK[RiskManager\nVolatility Sizing / GBX Pence Normalization]
-        DEEP --> RISK
+        DEEP --> RISK[RiskManager\nVolatility Sizing / GBX Pence Normalization]
         RISK --> CARD[DecisionCard\nExact Entry, Initial SL, Pure TSL Protocol]
     end
 
@@ -145,7 +142,7 @@ python3 -m unittest discover tests
 
 ## 📚 In-Depth Documentation
 
-- [System Architecture Blueprint](docs/architecture.md): Deep dive into the two-tier cognitive model, speculative routing, and state persistence.
+- [System Architecture Blueprint](docs/architecture.md): Deep dive into the deliberative multi-agent cognitive architecture, pure TSL execution, and state persistence.
 - [Operating Manual & Trading 212 SOP](docs/operating-manual.md): Broker API permissions, rate limiting, OCO order emulation, 5x leverage rules, and manual execution SOP.
 - [Connors 3-RSI Strategy Guide](docs/strategy-3rsi.md): Mathematical formulations, parameter calibrations, volatility drag neutralization, and backtest autocorrelation findings.
 - [Domain Concepts Glossary](CONCEPTS.md): Project-wide vocabulary and terminology standards.

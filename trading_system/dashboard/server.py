@@ -738,7 +738,7 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                 "is_connected": True,
                 "active_server_stops": active_stops,
                 "active_positions_count": len(active_signals),
-                "execution_mode": "Hybrid (Native Server GTC Stop + Algorithmic Exits)",
+                "execution_mode": "System 2 Pure TSL (Native GTC Stop + Algorithmic Trail)",
                 "runner_status": "ONLINE (24/7 Raspberry Pi)",
                 "monitored_assets": len(CURATED_3X_PAIRS),
                 "eur_ratio": "82%",

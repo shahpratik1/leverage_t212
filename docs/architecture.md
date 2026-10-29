@@ -2,7 +2,7 @@
 
 > **Autonomous Multi-Agent Quantitative Trading System**  
 > Engineered for European & London-listed leveraged Exchange Traded Products (ETPs) on Trading 212.  
-> Combines **System 1 (<10ms Fast Reflex NLI Screening)** with **System 2 (Deliberative Multi-Agent Dialectic & Risk Management)**, backed by crash-resilient native broker execution, SQLite WAL candle caching, and 24/7 Raspberry Pi runner telemetry.
+> Powered by a pure **System 2 Deliberative Multi-Agent Brain & Meta-Learning** architecture (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter, RiskManager), backed by crash-resilient native broker execution, SQLite WAL candle caching, and 24/7 Raspberry Pi runner telemetry.
 
 ---
 
@@ -17,7 +17,7 @@ The platform monitors global equities, broad market indices, sovereign bonds, co
 | **Monitored Universe** | **120+ Curated Pairs** | 3x & 5x leverage covering Tech, Indices, FX, Bonds, Commodities, Frontier Tech |
 | **Currency Preference** | **82%+ EUR Natively** | EUR-first policy eliminating FX currency conversion fees for EU accounts |
 | **Ingestion Latency** | **<10ms Triage** | Parallel multi-worker async pipeline + local SQLite WAL candle database |
-| **Cognitive Framework** | **Dual-Speed Brain** | System 1 (Larry Connors 3-RSI / NLI) + System 2 (Multi-Agent Debate / Speculative Router) |
+| **Cognitive Framework** | **Deliberative Multi-Agent Brain** | Pure System 2 Multi-Agent Dialectic (Technical + Fundamental + Sentiment + Forecast) without speculative bypass |
 | **Risk Containment** | **7 Multi-Layer Gates** | Circuit breaker (-2% equity), 48h earnings blackout, spread filter, synthetic safety gate |
 | **Execution Safety** | **Crash-Proof Hybrid** | Native broker-side GTC Stops placed immediately at fill + single order 100% quantity protection |
 | **Target Lifecycle** | **100% Pure Trailing Stop Loss** | Progressive ratchets (+1.5% Breakeven, +3.0% Cushion, ATR Chandelier Trail) with 100% quantity ride (0% partial trims) |
@@ -43,18 +43,16 @@ flowchart TD
         CANDLE_DB[("SQLite WAL Cache\ndata/candles.db\n(Incremental Delta Sync)")]
     end
 
-    subgraph System 1: Fast Reflex Screening
-        UNIV["LeveragedUniverse\n(120+ 3x/5x Curated Pairs)"] --> PARALLEL["Parallel Ingestion Engine\n(12 Thread Workers)"]
+    subgraph Universe Ingestion & Pre-Filtering
+        UNIV["LeveragedUniverse\n(120+ 3x/5x Curated Pairs)"] --> PARALLEL["Parallel Ingestion Engine\n(24 Thread Workers)"]
         CANDLE_DB --> PARALLEL
         T212_API --> PARALLEL
-        PARALLEL --> SCREENER["LayaScreener\n(Larry Connors 3-RSI + ADX Momentum)"]
-        SCREENER --> NLI_TRIAGE["Fast ModernBERT/MiniLM NLI\n(<10ms Hypothesis Verification)"]
+        PARALLEL --> SCREENER["Candidate Pre-Filter\n(Larry Connors 3-RSI + ADX Momentum)"]
+        SCREENER --> CANDIDATES["Qualified Universe Candidates\n(Top N Ranked Setups)"]
     end
 
     subgraph System 2: Deliberative Multi-Agent Brain
-        NLI_TRIAGE --> SPEC_ROUTER{"Speculative Router\n(DebateEngine)"}
-        SPEC_ROUTER -->|Conviction >= 0.75| FAST_TIER["Fast Reflex Tier\n(Instant Execution Bypass)"]
-        SPEC_ROUTER -->|Contested / Ambiguous| DEEP_DEBATE["Dialectic Debate Tier\n(TradingAgents Graph)"]
+        CANDIDATES --> DEEP_DEBATE["Deliberative Multi-Agent Debate\n(DebateEngine / TradingAgents Graph)"]
         
         DEEP_DEBATE --> TECH_AGENT["TechnicalAnalyst\n(Multi-Timeframe RSI/SMA)"]
         DEEP_DEBATE --> FUND_AGENT["FundamentalAnalyst\n(Finnhub / Olostep / Nixtla)"]
@@ -64,14 +62,13 @@ flowchart TD
         OLO --> FUND_AGENT
         NIX --> FUND_AGENT
         
-        TECH_AGENT --> DEBATE_SYNTH["Dialectic Synthesis\n(Consensus & Conviction Score)"]
+        TECH_AGENT --> DEBATE_SYNTH["Dialectic Consensus Synthesis\n(Consensus Decision & Conviction Score)"]
         FUND_AGENT --> DEBATE_SYNTH
         AGY_AGENT --> DEBATE_SYNTH
     end
 
     subgraph Quantitative Risk Management
-        FAST_TIER --> RISK_MGR["RiskManager\n(0.5% Equity Risk / Kelly ATR Sizing)"]
-        DEBATE_SYNTH --> RISK_MGR
+        DEBATE_SYNTH --> RISK_MGR["RiskManager\n(0.5% Equity Risk / Kelly ATR Sizing)"]
         
         RISK_MGR --> GATES{"Pre-Trade Safety Gates\n- Daily Drawdown (-2.0%)\n- 48h Earnings Blackout\n- Bid-Ask Spread Gate (<0.35%)\n- ETP Direction Gate (No Long on Short)\n- Synthetic Data Gate"}
         GATES -->|Pass| CARD["DecisionCard\n(Validated Order Intent)"]
@@ -151,34 +148,33 @@ The market data layer is decoupled into specialized providers with a persistent 
 
 ---
 
-### 3.3 System 1: Fast Reflex Screening Engine
+### 3.3 Universe Candidate Pre-Filtering & Screening Layer
 
 * **`trading_system/screener/laya_screener.py`**:
-  * Runs concurrent multi-threaded scans across all universe assets every 60 seconds (12 parallel thread workers).
+  * Runs concurrent multi-threaded scans across all universe assets every 60 seconds (24 parallel thread workers).
   * **Larry Connors 3-RSI Mean Reversion Strategy**:
     * Macro Regime: Current Close $> \text{SMA}(200)$ (ensures structural uptrend).
-    * Multi-Timeframe Pullback: $\text{RSI}(3) \le 22.0$ and $\text{RSI}(7) \le 35.0$.
+    * Multi-Timeframe Pullback: $\text{RSI}(3) \le 28.0$ and $\text{RSI}(7) \le 45.0$.
     * Reversion Target: $\text{SMA}(5)$ (exit anticipated upon mean reversion).
     * Historical Win-Rate Expectation: **85%**.
   * **ADX Directional Trend Breakout Strategy**:
-    * Momentum Gate: $\text{ADX}(14) \ge 20.0$ to filter out low-volatility chop and avoid volatility drag on leveraged ETPs.
+    * Momentum Gate: $\text{ADX}(14) \ge 18.0$ to filter out low-volatility chop and avoid volatility drag on leveraged ETPs.
     * Trend Alignment: Price above $\text{EMA}(20)$ and $\text{EMA}(50)$ with MACD histogram expansion.
-  * **ModernBERT / MiniLM Fast NLI Classifier**:
-    * Executes single forward-pass zero-shot Natural Language Inference triage in **<10ms**.
-    * Formulates trade hypotheses and scores confidence against quantitative metrics.
+  * **Zero Bypass Policy**:
+    * Candidate pre-filtering generates structured inputs solely for downstream System 2 deliberation.
+    * All fast-reflex bypass shortcuts have been eliminated; no trade can enter execution without full multi-agent consensus.
 
 ---
 
 ### 3.4 System 2: Deliberative Multi-Agent Brain & Meta-Learning
 
 * **`trading_system/agents/debate_engine.py`**:
-  * **Tier 1 Speculative Fast Router**: Candidates with conviction $\ge 0.75$ and unanimous indicator alignment bypass LLM deliberation, enabling instant sub-second order placement.
-  * **Tier 2 Deep Dialectic Debate**: Contested setups trigger multi-agent consensus deliberation:
+  * **Unified Deliberative Dialectic Debate**: 100% of candidate setups undergo deep multi-agent deliberation:
     * **`technical_agent.py`**: Analyzes multi-timeframe RSIs, Bollinger Bands, ATR volatility, volume spikes, and support/resistance structure.
     * **`fundamental_agent.py`**: Evaluates corporate fundamentals, Finnhub sentiment, Olostep headlines, and 48-hour earnings blackout proximity.
-    * **`debate_engine.py`**: Synthesizes technical and fundamental signals through deterministic dialectic synthesis to establish consensus conviction.
+    * **`debate_engine.py`**: Synthesizes technical and fundamental signals through deterministic dialectic synthesis to establish consensus conviction without speculative bypass.
 * **`trading_system/agents/strategy_improvement_agent.py`**:
-  * Autonomous meta-learning agent inspecting `trades.jsonl` performance.
+  * Autonomous meta-learning agent inspecting `trades.jsonl` performance and cycle yields.
   * Detects pipeline starvation (e.g. 3 consecutive zero-signal cycles during low-volatility regimes) and suggests adaptive parameter tuning (e.g., broadening RSI3 threshold from 22 to 25 or lowering ADX gate to 18).
 
 ---

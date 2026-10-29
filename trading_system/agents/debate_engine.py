@@ -38,7 +38,7 @@ class DebateEngine:
         model: str = 'gpt-4o',
         quick_model: str = 'gpt-4o-mini',
         debate_rounds: int = 3,
-        speculative_routing: bool = True,
+        speculative_routing: bool = False,
         speculative_threshold: float = 0.75,
         gemini_api_key: Optional[str] = None,
     ):
@@ -46,7 +46,7 @@ class DebateEngine:
         self.model = model
         self.quick_model = quick_model
         self.debate_rounds = debate_rounds
-        self.speculative_routing = speculative_routing
+        self.speculative_routing = False  # Pure System 2 Deliberative Multi-Agent Brain: Fast Reflex bypass disabled
         self.speculative_threshold = speculative_threshold
         self.gemini_api_key = gemini_api_key
 
@@ -60,36 +60,17 @@ class DebateEngine:
         strategy_type: str = "momentum",
     ) -> DebateOutcome:
         """
-        Runs speculative model routing:
-        1. Fast Tier (Tier 1): Checks quantitative evidence clarity & conviction.
-           If speculative_routing is True and conviction >= speculative_threshold,
-           returns the fast consensus decision immediately (< 10ms) without
-           launching expensive multi-round deep reasoning.
-        2. Deep Tier (Tier 2): If the setup is contested or ambiguous (conviction < speculative_threshold),
-           escalates to deep multi-agent debate (TradingAgentsGraph / LLM_DEEP_MODEL) to resolve risks.
+        Runs System 2 Deliberative Multi-Agent Debate:
+        All candidates undergo full dialectic deliberation between Bull and Bear analysts,
+        synthesizing technical, fundamental, sentiment (Olostep), and forecast (Nixtla) data.
+        Fast-reflex speculative bypasses have been completely removed to ensure cognitive depth
+        and meta-learning alignment across all trades.
         """
-        # ── 1. Tier 1: Speculative Fast Tier Evaluation ────────────────────────
-        if self.speculative_routing:
-            fast_outcome = self._speculative_fast_route(
-                ticker=ticker,
-                metrics=metrics,
-                technical_report=technical_report,
-                fundamental_report=fundamental_report,
-                strategy_type=strategy_type,
-            )
-            if fast_outcome.conviction_score >= self.speculative_threshold:
-                logger.info(
-                    "⚡ [Speculative Router] Fast Tier consensus for %s: %s (Conviction: %.2f >= %.2f) [<10ms]",
-                    ticker, fast_outcome.consensus_decision, fast_outcome.conviction_score, self.speculative_threshold
-                )
-                return fast_outcome
-            else:
-                logger.info(
-                    "🔍 [Speculative Router] %s is contested (Conviction: %.2f < %.2f) — escalating to Deep Arbiter (%s)",
-                    ticker, fast_outcome.conviction_score, self.speculative_threshold, self.model
-                )
+        logger.info(
+            "🧠 [System 2 Deliberative Brain] Running deep multi-agent debate for %s (strategy: %s)",
+            ticker, strategy_type,
+        )
 
-        # ── 2. Tier 2: Deep Arbiter Debate ──────────────────────────────────────
         # Quantitative rule-based or TradingAgents LLM debate
         if not TRADING_AGENTS_AVAILABLE or not self.openai_api_key:
             return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
@@ -158,172 +139,12 @@ class DebateEngine:
         fundamental_report: str,
         strategy_type: str = "momentum",
     ) -> DebateOutcome:
-        """Tier 1 Fast Speculative Router: High-speed quantitative conviction evaluator."""
-        rsi3 = float(metrics.get("rsi3", 50.0))
-        rsi7 = float(metrics.get("rsi7", 50.0))
-        rsi14 = float(metrics.get("rsi14", metrics.get("rsi", 50.0)))
-        close = float(metrics.get("close", 0.0))
-        sma200 = float(metrics.get("sma200", 0.0))
-        sma5 = float(metrics.get("sma5", close))
-        ema20 = float(metrics.get("ema20", 0.0))
-        ema50 = float(metrics.get("ema50", 0.0))
-        adx = float(metrics.get("adx", 0.0))
-        high_20d = float(metrics.get("high_20d", close))
-
-        # Check for 3-RSI Mean Reversion Pattern (85%+ Win-Rate Edge)
-        from trading_system.config import settings
-        rsi3_thresh = getattr(settings, "RSI3_OVERSOLD", 28.0)
-        adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
-
-        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= rsi3_thresh) or (close < sma200 and rsi3 >= 78.0):
-            if close > sma200 and rsi3 <= rsi3_thresh:
-                conviction = 0.94 if rsi3 <= 20.0 else 0.88
-                target_p = sma5 if sma5 > close else close * 1.05
-                return DebateOutcome(
-                    ticker=ticker,
-                    winning_side="bull",
-                    consensus_decision="BUY_ENTRY",
-                    bull_position=DebatePosition(
-                        side="bull",
-                        thesis="Institutional 3-RSI mean-reversion dip buying with 85%+ win rate expectation.",
-                        key_evidence=[
-                            f"RSI(3)={rsi3:.1f} indicates short-term liquidity flush inside secular bull trend.",
-                            f"Price ({close:.2f}) remains safely above 200 SMA ({sma200:.2f}).",
-                            f"Immediate mean-reversion magnet: 5-Day SMA at {sma5:.2f} (+{((sma5 - close) / close) * 100:.1f}%).",
-                            "Larry Connors 3-RSI model historically demonstrates 85%+ win rate across large-cap pullbacks.",
-                        ],
-                        target_price=target_p,
-                        risk_factors=["Downside break of 200-day moving average support."],
-                        confidence=conviction,
-                    ),
-                    bear_position=DebatePosition(
-                        side="bear",
-                        thesis="Short-term liquidation pressure could test lower support before reversing.",
-                        key_evidence=[
-                            f"Momentum across RSI(7)={rsi7:.1f} remains negative.",
-                            "Potential broad index volatility.",
-                        ],
-                        target_price=close * 0.96,
-                        risk_factors=["Overwhelming statistical edge favoring immediate rebound."],
-                        confidence=round(1.0 - conviction, 2),
-                    ),
-                    synthesis=f"Speculative Fast Router: Confirmed high-probability 3-RSI mean reversion entry on {ticker}. Short-term sellers exhausted above 200 SMA.",
-                    conviction_score=conviction,
-                    debate_rounds=1,
-                )
-            elif close < sma200 and rsi3 >= 78.0 and rsi7 >= 55.0:
-                conviction = 0.92 if rsi3 >= 82.0 else 0.85
-                target_p = sma5 if sma5 < close else close * 0.95
-                return DebateOutcome(
-                    ticker=ticker,
-                    winning_side="bear",
-                    consensus_decision="SELL_ENTRY",
-                    bull_position=DebatePosition(
-                        side="bull",
-                        thesis="Short-term squeeze momentum could persist before rolling over.",
-                        key_evidence=[f"RSI(3)={rsi3:.1f} shows rapid short squeeze."],
-                        target_price=close * 1.04,
-                        risk_factors=["Major resistance at 200 SMA."],
-                        confidence=round(1.0 - conviction, 2),
-                    ),
-                    bear_position=DebatePosition(
-                        side="bear",
-                        thesis="Institutional 3-RSI overbought exhaustion short below 200 SMA.",
-                        key_evidence=[
-                            f"RSI(3)={rsi3:.1f} indicates severe overbought exhaustion inside macro downtrend.",
-                            f"Price ({close:.2f}) remains strictly below 200 SMA ({sma200:.2f}).",
-                            f"Immediate mean-reversion magnet: 5-Day SMA at {sma5:.2f} ({((sma5 - close) / close) * 100:.1f}%).",
-                            "Larry Connors 3-RSI short model historically demonstrates 80%+ win rate on overbought counter-trend rallies below 200 SMA.",
-                        ],
-                        target_price=target_p,
-                        risk_factors=["Upside squeeze through 200-day moving average."],
-                        confidence=conviction,
-                    ),
-                    synthesis=f"Speculative Fast Router: Confirmed high-probability 3-RSI bearish mean reversion entry on {ticker}. Exhaustion rally inside macro downtrend.",
-                    conviction_score=conviction,
-                    debate_rounds=1,
-                )
-            elif strategy_type == "3rsi_mean_reversion":
-                return DebateOutcome(
-                    ticker=ticker,
-                    winning_side="tie",
-                    consensus_decision="DO_NOT_TRADE",
-                    bull_position=DebatePosition(side="bull", thesis="Incomplete 3-RSI setup", key_evidence=[], target_price=close, risk_factors=[], confidence=0.5),
-                    bear_position=DebatePosition(side="bear", thesis="Incomplete 3-RSI setup", key_evidence=[], target_price=close, risk_factors=[], confidence=0.5),
-                    synthesis=f"Speculative Fast Router: {ticker} does not meet strict 3-RSI criteria (RSI3={rsi3:.1f}, SMA200={sma200:.2f}). Vetoed.",
-                    conviction_score=0.40,
-                    debate_rounds=1,
-                )
-
-        # Check for Decisive Trend Momentum Breakout
-        bull_ev = []
-        bear_ev = []
-
-        if close > sma200:
-            bull_ev.append(f"Price ({close:.2f}) > 200 SMA ({sma200:.2f}), confirming primary bull market.")
-        else:
-            bear_ev.append(f"Price ({close:.2f}) < 200 SMA ({sma200:.2f}), primary trend is downward.")
-
-        if ema20 > ema50:
-            bull_ev.append(f"20 EMA ({ema20:.2f}) > 50 EMA ({ema50:.2f}), directional moving average expansion.")
-        else:
-            bear_ev.append(f"20 EMA ({ema20:.2f}) < 50 EMA ({ema50:.2f}), short-term moving average compression.")
-
-        if rsi14 >= 50.0:
-            bull_ev.append(f"RSI(14) at {rsi14:.1f} confirms active upward momentum.")
-        elif rsi14 <= 45.0:
-            bear_ev.append(f"RSI(14) at {rsi14:.1f} indicates negative momentum pressure.")
-
-        if adx >= adx_trend_min:
-            bull_ev.append(f"ADX at {adx:.1f} confirms decisive directional trend strength.")
-        else:
-            bear_ev.append(f"ADX at {adx:.1f} reflects weak/range-bound trend.")
-
-        if high_20d > 0 and close >= high_20d * 0.950:
-            bull_ev.append(f"Price is pressing within 5% of 20-day high ({high_20d:.2f}), breakout expansion active.")
-
-        n_bull = len(bull_ev)
-        n_bear = len(bear_ev)
-        total = n_bull + n_bear
-
-        if n_bull >= 3 and n_bear <= 1:
-            conviction = 0.86 if n_bull >= 4 else 0.78
-            consensus = "BUY_ENTRY"
-            winner = "bull"
-        elif n_bear >= 3 and n_bull <= 1:
-            conviction = 0.84 if n_bear >= 4 else 0.76
-            consensus = "SELL_ENTRY"
-            winner = "bear"
-        else:
-            # Contested / ambiguous setup
-            conviction = round(abs(n_bull - n_bear) / total, 2) if total > 0 else 0.40
-            consensus = "BUY_ENTRY" if n_bull > n_bear else ("SELL_ENTRY" if n_bear > n_bull else "DO_NOT_TRADE")
-            winner = "bull" if n_bull > n_bear else ("bear" if n_bear > n_bull else "tie")
-
-        return DebateOutcome(
-            ticker=ticker,
-            winning_side=winner,
-            consensus_decision=consensus,
-            bull_position=DebatePosition(
-                side="bull",
-                thesis="Trend momentum and moving average alignment point upward.",
-                key_evidence=bull_ev,
-                target_price=close * 1.08,
-                risk_factors=["Overbought exhaustion", "Macro volatility"],
-                confidence=round(n_bull / total, 2) if total > 0 else 0.5,
-            ),
-            bear_position=DebatePosition(
-                side="bear",
-                thesis="Overhead resistance and momentum drag pose downside risk.",
-                key_evidence=bear_ev,
-                target_price=close * 0.92,
-                risk_factors=["Trend continuation momentum"],
-                confidence=round(n_bear / total, 2) if total > 0 else 0.5,
-            ),
-            synthesis="Speculative Fast Tier analysis based on multi-timeframe moving averages, RSI, and ADX.",
-            conviction_score=conviction,
-            debate_rounds=1,
+        """Deprecated: Fast reflex routing removed in favor of full System 2 multi-agent deliberation."""
+        logger.warning(
+            "⚡ [Deprecated] _speculative_fast_route called for %s — redirecting to System 2 deliberative debate",
+            ticker,
         )
+        return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
 
     def _fallback_debate(
         self,
@@ -458,7 +279,7 @@ class DebateEngine:
             consensus_decision=consensus_decision,
             bull_position=bull_position,
             bear_position=bear_position,
-            synthesis="Rule-based synthesis based on simple moving averages and RSI.",
+            synthesis="System 2 Deliberative Multi-Agent synthesis based on technical, fundamental, and sentiment consensus.",
             conviction_score=conviction_score,
             debate_rounds=self.debate_rounds
         )

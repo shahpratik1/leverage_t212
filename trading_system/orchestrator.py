@@ -2,14 +2,13 @@
 
 Main Execution Pipeline:
 1. Data Ingestion: Ingests OHLCV for liquid 3x underlying assets (Indices, Tech Giants, Commodities).
-2. System 1 Fast Screening: Laya NLI screener detects Bullish (3x Long) and Bearish (3x Short) momentum,
-   rejecting choppy consolidation (ADX < 20) to prevent volatility decay.
-3. System 2 Deliberation: Multi-agent debate & Risk Manager compute position sizing, ATR Stop Loss,
-   multi-stage Take Profits (TP1, TP2, TP3), and initial Trailing Stop Loss.
+2. Quantitative Pre-Filtering: Scans universe metrics for directional momentum and 3-RSI mean-reversion candidates,
+   rejecting choppy consolidation (ADX < 18) to prevent volatility decay.
+3. System 2 Deliberation: Deliberative multi-agent debate (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter) & Risk Manager compute position sizing, ATR Stop Loss, and 100% Pure Trailing Stop Loss.
 4. Automated Execution & Notifications: Places market entry orders on Trading 212 and dispatches
    real-time multi-channel alerts (Console, Desktop, Telegram, Discord, JSONL) for:
-   BUY, SELL, TP1, TP2, TP3, SL, and TSL.
-5. Continuous Position Monitor: Tracks live positions, triggers partial profit trims, ratchets TSL,
+   BUY, SELL, SL, and TSL.
+5. Continuous Position Monitor: Tracks live positions, ratchets pure Trailing Stop Loss, synchronizes broker GTC stops,
    and closes stopped-out trades.
 """
 
@@ -103,7 +102,7 @@ class Orchestrator:
             enable_desktop=settings.ENABLE_DESKTOP_NOTIFICATIONS,
         )
 
-        # ── 4. System 1: Fast Screener ────────────────────────────
+        # ── 4. Quantitative Candidate Screener ───────────────────
         self.screener = LayaScreener(
             min_setup_score=settings.SCREENER_MIN_SETUP_SCORE,
             max_catalyst_risk=settings.SCREENER_MAX_CATALYST_RISK,
@@ -328,7 +327,7 @@ class Orchestrator:
         return universe_metrics
 
     # ─────────────────────────────────────────────────────────────
-    # Phase 2 — System 1 Fast Screening (Long & Short)
+    # Phase 2 — Candidate Pre-Filtering for System 2 Deliberation
     # ─────────────────────────────────────────────────────────────
     def screen_candidates(
         self, universe_metrics: Dict[str, Dict[str, Any]]
@@ -365,7 +364,7 @@ class Orchestrator:
                 logger.debug("StrategyImprovementAgent record notice: %s", audit_exc)
 
         logger.info(
-            "System 1 passed %d high-momentum candidates: %s",
+            "Candidate pre-filter passed %d assets for System 2 deliberation: %s",
             len(candidates),
             [f"{c.ticker} ({c.bias})" for c in candidates],
         )
@@ -482,7 +481,7 @@ class Orchestrator:
             tech_report = fut_tech.result()
             fund_report = fut_fund.result()
 
-        # ── 4. Speculative Model Routing / Bull vs Bear Debate ───
+        # ── 4. System 2 Deliberative Multi-Agent Debate ───────────
         try:
             outcome = self.debate_engine.run_debate(
                 underlying, metrics, tech_report, fund_report, date=today,

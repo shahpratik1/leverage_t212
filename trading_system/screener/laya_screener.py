@@ -1,4 +1,4 @@
-"""System 1 fast screening layer using the Laya non-autoregressive NLI engine.
+"""Candidate screening and quantitative ranking layer using technical metrics and NLI routing.
 
 This module provides rapid directional bias classification, setup quality
 scoring, and catalyst-risk estimation for a universe of assets.  It uses
@@ -56,7 +56,7 @@ class ScreenerResult:
 
 
 class LayaScreener:
-    """System 1 screener powered by the Laya NLI engine.
+    """Quantitative candidate screener powered by technical indicators and NLI routing.
 
     Parameters:
         min_setup_score: Minimum acceptable setup quality label.  Assets
