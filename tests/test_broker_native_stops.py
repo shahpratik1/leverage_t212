@@ -10,6 +10,7 @@ Verifies:
 
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -141,8 +142,10 @@ class TestBrokerNativeStops(unittest.TestCase):
         )
         self.monitor.positions["QQQ3l_EQ"] = pos
 
-        # Price hits TP3 (435.0) -> triggers full close
-        self.monitor.monitor_tick(current_prices={"QQQ3l_EQ": 435.0})
+        # Simulate position held past anti-whipsaw grace period (>120s)
+        pos.entry_timestamp = time.time() - 200.0
+        # Price drops to stop loss (385.0 <= 390.0) -> triggers full close
+        self.monitor.monitor_tick(current_prices={"QQQ3l_EQ": 385.0})
 
         self.mock_t212.cancel_order.assert_called_with("stop_to_cancel_55")
 

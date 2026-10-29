@@ -21,6 +21,7 @@ class TestActiveTradesDriven(unittest.TestCase):
             risk_manager=self.mock_rm,
             dry_run=False,
             state_file=":memory:",
+            pure_tsl_mode=False,
         )
         self.monitor._save_state = MagicMock()
 

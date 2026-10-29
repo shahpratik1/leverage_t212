@@ -182,20 +182,38 @@ def load_active_signals(
             tp2_gain_pct = abs(tp2 - entry) / entry * 100 if entry > 0 else 0.0
             tp3_gain_pct = abs(tp3 - entry) / entry * 100 if entry > 0 else 0.0
 
-            status = "ACTIVE"
-            tp1_armed_hysteresis = bool(pos.get("tp1_armed_hysteresis", False))
-            tp1_stop_elevated = bool(pos.get("tp1_stop_elevated", False))
-            tp1_escape_threshold = float(pos.get("tp1_escape_threshold") or 0.0)
+            pure_tsl = getattr(settings, "PURE_TSL_MODE", True)
+            if pure_tsl:
+                if pos.get("is_closed"):
+                    status = "CLOSED"
+                    tsl_status = "Closed"
+                elif tsl >= entry and entry > 0:
+                    locked_gain = ((tsl - entry) / entry * 100.0) if direction == "LONG" else ((entry - tsl) / entry * 100.0)
+                    if locked_gain >= 1.4:
+                        status = f"TSL ACTIVE: +{locked_gain:.1f}% Locked"
+                        tsl_status = f"+{locked_gain:.1f}% Cushion Locked"
+                    else:
+                        status = "TSL ACTIVE: Break-Even Locked"
+                        tsl_status = "Break-Even Locked"
+                else:
+                    status = "TSL ACTIVE: Initial Stop Active"
+                    tsl_status = "Initial Stop Active"
+            else:
+                tsl_status = "Trailing Stop"
+                status = "ACTIVE"
+                tp1_armed_hysteresis = bool(pos.get("tp1_armed_hysteresis", False))
+                tp1_stop_elevated = bool(pos.get("tp1_stop_elevated", False))
+                tp1_escape_threshold = float(pos.get("tp1_escape_threshold") or 0.0)
 
-            if pos.get("is_closed"):
-                status = "CLOSED"
-            elif pos.get("tp2_hit"):
-                status = "TP2 HIT: Trailing Runner Active"
-            elif tp1_armed_hysteresis:
-                esc_str = f"{currency_prefix}{tp1_escape_threshold:.2f}{currency_suffix}" if tp1_escape_threshold > 0 else "Trigger Pending"
-                status = f"TP1 HIT: Break-Even (Hysteresis Armed @ {esc_str})"
-            elif tp1_stop_elevated or pos.get("tp1_hit"):
-                status = "TP1 LOCKED (+1.0R Stop Active)"
+                if pos.get("is_closed"):
+                    status = "CLOSED"
+                elif pos.get("tp2_hit"):
+                    status = "TP2 HIT: Trailing Runner Active"
+                elif tp1_armed_hysteresis:
+                    esc_str = f"{currency_prefix}{tp1_escape_threshold:.2f}{currency_suffix}" if tp1_escape_threshold > 0 else "Trigger Pending"
+                    status = f"TP1 HIT: Break-Even (Hysteresis Armed @ {esc_str})"
+                elif tp1_stop_elevated or pos.get("tp1_hit"):
+                    status = "TP1 LOCKED (+1.0R Stop Active)"
 
             rsi3_raw = pos.get("rsi3")
             rsi3_val = float(rsi3_raw) if rsi3_raw is not None else 100.0
@@ -215,23 +233,27 @@ def load_active_signals(
                     earnings_days = None
 
             if direction == "SHORT":
-                overnight_status = "INTRADAY SHORT (Flattens 16:20 UTC)"
+                overnight_status = "INTRADAY SHORT (Flattens 16:20 UTC / Winter Time)"
                 overnight_badge_class = "bg-rose-500/10 text-rose-300 border-rose-500/30"
             elif earnings_days is not None and 0 <= earnings_days <= 1.0:
                 overnight_status = f"EARNINGS BLACKOUT ({earnings_days:.1f}d — Flattens 16:20 UTC)"
                 overnight_badge_class = "bg-amber-500/10 text-amber-300 border-amber-500/30"
-            elif pos.get("tp1_hit"):
+            elif (tsl >= entry and entry > 0) or pos.get("tp1_hit"):
                 radar_tag = f" • Pre-Earnings Radar ({earnings_days:.0f}d)" if (earnings_days and earnings_days <= 21.0) else ""
-                overnight_status = f"OVERNIGHT ELIGIBLE (TP1 Breakeven Active{radar_tag})"
+                overnight_status = f"OVERNIGHT ELIGIBLE (TSL Breakeven Active{radar_tag})"
                 overnight_badge_class = "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
             elif earnings_days is not None and 1.0 < earnings_days <= 21.0:
-                overnight_status = f"PRE-EARNINGS RUN-UP RADAR ({earnings_days:.0f}d away • Flattens 16:20 UTC if < TP1)"
+                overnight_status = f"PRE-EARNINGS RUN-UP RADAR ({earnings_days:.0f}d away • Flattens 16:20 UTC if unhedged)"
                 overnight_badge_class = "bg-purple-500/10 text-purple-300 border-purple-500/30"
             else:
-                overnight_status = "REQUIRES TP1 OR FLATTENS 16:20 UTC"
+                overnight_status = "REQUIRES BREAKEVEN OR FLATTENS 16:20 UTC"
                 overnight_badge_class = "bg-sky-500/10 text-sky-300 border-sky-500/30"
 
             stop_broker_line = f"NATIVE BROKER STOP: Trading 212 Order #{broker_stop_order_id} (Active)\n" if broker_stop_order_id else ""
+
+            tp1_armed_hysteresis = bool(pos.get("tp1_armed_hysteresis", False))
+            tp1_stop_elevated = bool(pos.get("tp1_stop_elevated", False))
+            tp1_escape_threshold = float(pos.get("tp1_escape_threshold") or 0.0)
 
             signals.append({
                 "ticker": ticker,
@@ -258,6 +280,7 @@ def load_active_signals(
                 "currency_suffix": currency_suffix,
                 "stop_loss": round(sl, 2),
                 "trailing_stop_loss": round(tsl, 2),
+                "tsl_status": tsl_status,
                 "stop_distance_pct": round(risk_pct, 2),
                 "broker_stop_order_id": broker_stop_order_id,
                 "tp1": round(tp1, 2),
@@ -283,12 +306,9 @@ def load_active_signals(
                     f"ENTRY: {currency_prefix}{entry:.2f}{currency_suffix}\n"
                     f"CURRENT: {currency_prefix}{current_price:.2f}{currency_suffix} ({pnl_pct:+.2f}%)\n"
                     f"STOP LOSS: {currency_prefix}{sl:.2f}{currency_suffix} (-{risk_pct:.2f}%)\n"
+                    f"ACTIVE TSL: {currency_prefix}{tsl:.2f}{currency_suffix} ({tsl_status})\n"
                     f"{stop_broker_line}"
-                    f"TP1 (+1.0R): {currency_prefix}{tp1:.2f}{currency_suffix} (+{tp1_gain_pct:.2f}%)\n"
-                    f"TP2 (+2.0R): {currency_prefix}{tp2:.2f}{currency_suffix} (+{tp2_gain_pct:.2f}%)\n"
-                    f"TP3 (+3.0R): {currency_prefix}{tp3:.2f}{currency_suffix} (+{tp3_gain_pct:.2f}%)\n"
-                    f"CURRENT TSL: {currency_prefix}{tsl:.2f}{currency_suffix}\n"
-                    f"QUANTITY: {remaining_quantity:.2f} / {original_quantity:.2f} shares\n"
+                    f"QUANTITY: {remaining_quantity:.2f} / {original_quantity:.2f} shares (100% Ride)\n"
                     f"SESSION PROTOCOL: {overnight_status}"
                 ),
             })
@@ -812,9 +832,9 @@ def generate_html_dashboard(output_path: str) -> str:
       <div class="text-xs text-slate-400 mt-1">T212 Server-Side GTC</div>
     </div>
     <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Profit-Taking Exits</div>
-      <div class="text-2xl font-bold text-white mt-1">TP1 / TP2 / TP3</div>
-      <div class="text-xs text-emerald-400 mt-1">⚡ Auto-Scaling (+1R, +2R, +3R)</div>
+      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Exit Engine</div>
+      <div class="text-2xl font-bold text-white mt-1">100% Pure TSL</div>
+      <div class="text-xs text-emerald-400 mt-1">🛡️ Native T212 Server GTC Ratchet</div>
     </div>
     <div class="bg-slate-900/80 border border-amber-500/30 rounded-xl p-4 relative overflow-hidden">
       <div class="text-xs text-amber-400 uppercase tracking-wider font-semibold flex items-center justify-between">
@@ -1201,39 +1221,27 @@ def generate_html_dashboard(output_path: str) -> str:
                 <span class="font-mono font-bold text-rose-200">${{currPrefix}}${{Number(s.stop_loss || 0).toFixed(2)}}${{currSuffix}} (-${{s.stop_distance_pct || 5.0}}%)</span>
               </div>
 
-              <!-- Take Profit 1 -->
+              <!-- Trailing Stop Loss -->
               <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
                 <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
                   <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  TP1 (+1.0R)
+                  Trailing Stop (TSL)
                 </span>
                 <span class="font-mono font-bold text-emerald-200">
-                  ${{currPrefix}}${{Number(s.tp1 || 0).toFixed(2)}}${{currSuffix}}
-                  ${{s.tp1_hit ? '<span class="text-emerald-400 ml-1 font-bold">[✓ Banked 50%]</span>' : '<span class="text-slate-500 ml-1">[Target]</span>'}}
+                  ${{currPrefix}}${{Number(s.trailing_stop_loss || s.stop_loss || 0).toFixed(2)}}${{currSuffix}}
+                  <span class="text-emerald-400 ml-1 font-bold">[${{s.tsl_status || (s.trailing_stop_loss >= s.entry_price ? 'Breakeven Locked' : 'Active Trail')}}]</span>
                 </span>
               </div>
 
-              <!-- Take Profit 2 -->
-              <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
-                <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
-                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  TP2 (+2.0R)
+              <!-- Native Broker Protection -->
+              <div class="flex items-center justify-between p-2 rounded-lg bg-sky-500/5 border border-sky-500/10">
+                <span class="text-sky-300 font-semibold flex items-center gap-1.5">
+                  <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
+                  T212 GTC Stop
                 </span>
-                <span class="font-mono font-bold text-emerald-200">
-                  ${{currPrefix}}${{Number(s.tp2 || 0).toFixed(2)}}${{currSuffix}}
-                  ${{s.tp2_hit ? '<span class="text-emerald-400 ml-1 font-bold">[✓ Banked 25%]</span>' : '<span class="text-slate-500 ml-1">[Target]</span>'}}
-                </span>
-              </div>
-
-              <!-- Take Profit 3 -->
-              <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
-                <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
-                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  TP3 (+3.0R)
-                </span>
-                <span class="font-mono font-bold text-purple-300">
-                  ${{currPrefix}}${{Number(s.tp3 || 0).toFixed(2)}}${{currSuffix}}
-                  <span class="text-purple-400 ml-1 font-bold">[Runner]</span>
+                <span class="font-mono font-bold text-sky-200">
+                  ${{s.broker_stop_order_id ? '#' + s.broker_stop_order_id : 'Syncing Broker...'}}
+                  <span class="text-sky-400 ml-1 font-bold">[100% Protection]</span>
                 </span>
               </div>
             </div>

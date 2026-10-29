@@ -175,7 +175,7 @@ class TestCurrencyPennyDisplay(unittest.TestCase):
             self.assertEqual(xom["currency_suffix"], "p")
             self.assertIn("ENTRY: 3190.00p", xom["copy_text"])
             self.assertIn("STOP LOSS: 3030.50p", xom["copy_text"])
-            self.assertIn("TP1 (+1.0R): 3349.50p", xom["copy_text"])
+            self.assertIn("ACTIVE TSL: 3030.50p", xom["copy_text"])
             self.assertNotIn("€3190", xom["copy_text"])
 
             # Verify WTI3m_EQ

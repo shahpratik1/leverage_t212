@@ -91,12 +91,14 @@ class PositionMonitor:
         risk_manager: RiskManager,
         state_file: str = "active_trades.json",
         dry_run: bool = False,
+        pure_tsl_mode: Optional[bool] = None,
     ):
         self.t212 = t212_client
         self.notifier = notifier
         self.risk_manager = risk_manager
         self.state_file = state_file
         self.dry_run = dry_run
+        self.pure_tsl_mode = pure_tsl_mode if pure_tsl_mode is not None else getattr(settings, "PURE_TSL_MODE", True)
         self.positions: Dict[str, TrackedPosition] = self._load_state()
         self._last_session_close_date: str = ""
         self.is_halted: bool = False
@@ -691,6 +693,13 @@ class PositionMonitor:
 
     def sync_broker_tp_limits(self) -> List[str]:
         """Ensure all active positions have an active native GTC Take Profit Limit Order on Trading 212."""
+        if self.pure_tsl_mode:
+            # In pure TSL mode, ensure any legacy TP limit orders on broker are cancelled to prevent share contention
+            for ticker, pos in list(self.positions.items()):
+                if pos.broker_tp_order_id:
+                    self.cancel_broker_tp_limit(pos)
+            return []
+
         synced = []
         now = time.time()
         for ticker, pos in list(self.positions.items()):
@@ -714,8 +723,10 @@ class PositionMonitor:
         return synced
 
     def sync_broker_orders(self) -> Dict[str, List[str]]:
-        """Ensure all active positions have native GTC Stop and TP Limit orders placed on Trading 212."""
+        """Ensure all active positions have native GTC Stop orders placed on Trading 212."""
         synced_stops = self.sync_broker_stops()
+        if self.pure_tsl_mode:
+            return {"stops": synced_stops, "tps": []}
         synced_tps = self.sync_broker_tp_limits()
         return {"stops": synced_stops, "tps": synced_tps}
 
@@ -1080,7 +1091,7 @@ class PositionMonitor:
                         except Exception as stop_exc:
                             logger.debug("Auto-place broker stop on adoption notice: %s", stop_exc)
 
-                    if not adopted_pos.broker_tp_order_id and not adopted_pos.tp1_hit:
+                    if not self.pure_tsl_mode and not adopted_pos.broker_tp_order_id and not adopted_pos.tp1_hit:
                         try:
                             logger.info("Setting missing native TP Limit Order for adopted position %s...", b_ticker)
                             tp_id = self.place_broker_tp_limit(adopted_pos)
@@ -1248,12 +1259,20 @@ class PositionMonitor:
                     ):
                         positions_to_close.append((pos, "EARNINGS_BLACKOUT_EXIT", current_price))
                         tickers_to_remove.append(ticker)
-                    elif not pos.tp1_hit:
+                    is_risk_free = (
+                        (pos.trailing_stop_loss >= pos.entry_price)
+                        or (pos.stop_loss >= pos.entry_price)
+                        or pos.tp1_hit
+                    )
+                    if not is_risk_free:
                         positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
                         tickers_to_remove.append(ticker)
                     else:
                         pos.is_overnight_eligible = True
-                        logger.info("Retaining Long %s for overnight swing (TP1 hit, Breakeven Stop active)", ticker)
+                        logger.info(
+                            "Retaining Long %s for overnight swing (TSL Breakeven/Profit active: $%.2f >= $%.2f)",
+                            ticker, pos.trailing_stop_loss, pos.entry_price,
+                        )
 
         events: List[Dict[str, Any]] = []
         if positions_to_close:
@@ -1482,117 +1501,192 @@ class PositionMonitor:
                     )
                     continue
 
-                event = self._handle_stop_exit(pos, current_price, is_tsl=(active_stop == pos.trailing_stop_loss and pos.tp1_hit))
+                is_tsl_exit = (active_stop == pos.trailing_stop_loss and (
+                    (pos.trailing_stop_loss <= pos.entry_price) if is_short else (pos.trailing_stop_loss >= pos.entry_price)
+                )) or (pos.tp1_hit and active_stop == pos.trailing_stop_loss)
+                event = self._handle_stop_exit(pos, current_price, is_tsl=is_tsl_exit)
                 events.append(event)
                 tickers_to_remove.append(ticker)
                 continue
 
-            # 2. Take Profit 3 (Final target - Full close)
-            tp3_hit = (current_price <= pos.tp3) if is_short else (current_price >= pos.tp3)
-            if tp3_hit and not pos.tp3_hit:
-                event = self._handle_tp3_hit(pos, current_price)
-                events.append(event)
-                tickers_to_remove.append(ticker)
-                continue
-
-            # 3. Take Profit 1 (First trim - 50% + Breakeven SL + Arm Hysteresis)
-            tp1_hit = (current_price <= pos.tp1) if is_short else (current_price >= pos.tp1)
-            if tp1_hit and not pos.tp1_hit:
-                event = self._handle_tp1_hit(pos, current_price)
-                events.append(event)
-
-            # 4. Take Profit 2 (Second trim - 25% + Ratchet to TP1)
-            tp2_hit = (current_price <= pos.tp2) if is_short else (current_price >= pos.tp2)
-            if tp2_hit and not pos.tp2_hit:
-                event = self._handle_tp2_hit(pos, current_price)
-                events.append(event)
-
-            # 5. Schmitt-Trigger Hysteresis: Elevate stop to TP1 once price clears escape threshold
-            if getattr(pos, "tp1_armed_hysteresis", False) and not pos.tp2_hit:
-                escape_threshold = getattr(pos, "tp1_escape_threshold", 0.0)
-                if not escape_threshold or escape_threshold <= 0:
-                    escape_threshold = self.risk_manager.calculate_escape_threshold(
-                        tp1=pos.tp1, atr=pos.atr, direction=pos.direction
-                    )
-                    pos.tp1_escape_threshold = escape_threshold
-
-                escape_cleared = (current_price <= escape_threshold) if is_short else (current_price >= escape_threshold)
-                if escape_cleared:
-                    pos.tp1_armed_hysteresis = False
-                    pos.tp1_stop_elevated = True
-                    if self.is_true_short_contract(pos):
-                        pos.trailing_stop_loss = min(pos.trailing_stop_loss, pos.tp1) if pos.trailing_stop_loss > 0 else pos.tp1
-                        pos.stop_loss = min(pos.stop_loss, pos.tp1) if pos.stop_loss > 0 else pos.tp1
-                    else:
-                        pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1)
-                        pos.stop_loss = max(pos.stop_loss, pos.tp1)
-                    locked_pct = abs((pos.tp1 - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0.0
-                    logger.info(
-                        "🎯 %s Schmitt-Trigger Hysteresis ESCAPE: price $%.2f cleared threshold $%.2f. Stop safely elevated to TP1 ($%.2f, +%.1f%% locked)",
-                        ticker, current_price, escape_threshold, pos.tp1, locked_pct,
-                    )
-                    # Update native broker stop order on Trading 212
-                    self.place_broker_stop(pos, stop_price=pos.tp1)
-                    self.notifier.notify_tsl(
-                        ticker=pos.ticker,
-                        underlying=pos.underlying,
-                        direction=pos.direction,
-                        current_price=current_price,
-                        new_tsl=pos.tp1,
-                        locked_in_pnl_pct=locked_pct,
-                        event_type="HYSTERESIS_TP1_RATCHET",
-                    )
-                    events.append({"event": "HYSTERESIS_TP1_RATCHET", "ticker": ticker, "new_tsl": pos.tp1})
-
-            # 5b. Progressive Trailing Stop (+1.5% BE, +3.0% cushion)
-            prog_sl = self.check_progressive_stops(
-                entry_price=pos.entry_price,
-                current_price=current_price,
-                current_sl=pos.trailing_stop_loss,
-                direction=pos.direction,
-            )
-            prog_ratcheted = (prog_sl < pos.trailing_stop_loss) if is_short else (prog_sl > pos.trailing_stop_loss)
-            if prog_ratcheted:
-                pos.trailing_stop_loss = prog_sl
-                pos.stop_loss = min(pos.stop_loss, prog_sl) if is_short else max(pos.stop_loss, prog_sl)
-                self.place_broker_stop(pos, stop_price=prog_sl)
-                events.append({"event": "PROGRESSIVE_STOP_RATCHET", "ticker": ticker, "new_tsl": prog_sl})
-
-            # 6. Trailing Stop Ratchet (Ratchets higher with new highs once hysteresis clears)
-            if pos.tp1_hit and not getattr(pos, "tp1_armed_hysteresis", False):
-                favorable_price = pos.lowest_price if is_short else pos.highest_price
-                new_tsl = self.risk_manager.calculate_trailing_stop(
+            if self.pure_tsl_mode:
+                # ── Pure 100% TSL Execution: No partial trims, let winners run fully ──
+                # 1. Progressive Trailing Stop (+1.5% BE, +3.0% cushion)
+                prog_sl = self.check_progressive_stops(
+                    entry_price=pos.entry_price,
                     current_price=current_price,
-                    peak_price=favorable_price,
-                    atr=pos.atr,
-                    current_tsl=pos.trailing_stop_loss,
+                    current_sl=pos.trailing_stop_loss,
                     direction=pos.direction,
                 )
-                ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
-                if ratcheted:
+                prog_ratcheted = (prog_sl < pos.trailing_stop_loss) if is_short else (prog_sl > pos.trailing_stop_loss)
+                if prog_ratcheted:
                     old_tsl = pos.trailing_stop_loss
-                    pos.trailing_stop_loss = new_tsl
-                    pos.stop_loss = min(pos.stop_loss, new_tsl) if is_short else max(pos.stop_loss, new_tsl)
+                    pos.trailing_stop_loss = prog_sl
+                    pos.stop_loss = min(pos.stop_loss, prog_sl) if is_short else max(pos.stop_loss, prog_sl)
                     locked_pct = (
-                        ((pos.entry_price - new_tsl) / pos.entry_price * 100)
+                        ((pos.entry_price - prog_sl) / pos.entry_price * 100)
                         if is_short
-                        else ((new_tsl - pos.entry_price) / pos.entry_price * 100)
+                        else ((prog_sl - pos.entry_price) / pos.entry_price * 100)
                     ) if pos.entry_price > 0 else 0.0
-                    logger.info("%s TSL ratcheted: $%.2f -> $%.2f (+%.1f%% locked)", ticker, old_tsl, new_tsl, locked_pct)
-
-                    # Update native broker stop order on Trading 212
-                    self.place_broker_stop(pos, stop_price=new_tsl)
-
+                    logger.info(
+                        "🛡️ %s Progressive TSL ratcheted: $%.2f -> $%.2f (+%.1f%% locked)",
+                        ticker, old_tsl, prog_sl, locked_pct,
+                    )
+                    self.place_broker_stop(pos, stop_price=prog_sl)
                     self.notifier.notify_tsl(
                         ticker=pos.ticker,
                         underlying=pos.underlying,
                         direction=pos.direction,
                         current_price=current_price,
-                        new_tsl=new_tsl,
+                        new_tsl=prog_sl,
                         locked_in_pnl_pct=locked_pct,
-                        event_type="TSL_RATCHET",
+                        event_type="PROGRESSIVE_STOP_RATCHET",
                     )
-                    events.append({"event": "TSL_RATCHET", "ticker": ticker, "new_tsl": new_tsl})
+                    events.append({"event": "PROGRESSIVE_STOP_RATCHET", "ticker": ticker, "new_tsl": prog_sl})
+
+                # 2. Dynamic ATR Trailing Stop Ratchet:
+                # Trailing stop only activates once position achieves profit (gain >= 1.5% or stop at/above breakeven)
+                gain_pct = ((pos.entry_price - current_price) / pos.entry_price * 100.0) if is_short else ((current_price - pos.entry_price) / pos.entry_price * 100.0)
+                is_in_profit_zone = gain_pct >= 1.5 or (pos.trailing_stop_loss <= pos.entry_price if is_short else pos.trailing_stop_loss >= pos.entry_price)
+                if is_in_profit_zone:
+                    favorable_price = pos.lowest_price if is_short else pos.highest_price
+                    new_tsl = self.risk_manager.calculate_trailing_stop(
+                        current_price=current_price,
+                        peak_price=favorable_price,
+                        atr=pos.atr,
+                        current_tsl=pos.trailing_stop_loss,
+                        direction=pos.direction,
+                    )
+                    ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
+                    if ratcheted:
+                        old_tsl = pos.trailing_stop_loss
+                        pos.trailing_stop_loss = new_tsl
+                        pos.stop_loss = min(pos.stop_loss, new_tsl) if is_short else max(pos.stop_loss, new_tsl)
+                        locked_pct = (
+                            ((pos.entry_price - new_tsl) / pos.entry_price * 100)
+                            if is_short
+                            else ((new_tsl - pos.entry_price) / pos.entry_price * 100)
+                        ) if pos.entry_price > 0 else 0.0
+                        logger.info(
+                            "🚀 %s Dynamic ATR TSL ratcheted: $%.2f -> $%.2f (+%.1f%% locked, peak $%.2f)",
+                            ticker, old_tsl, new_tsl, locked_pct, favorable_price,
+                        )
+                        self.place_broker_stop(pos, stop_price=new_tsl)
+                        self.notifier.notify_tsl(
+                            ticker=pos.ticker,
+                            underlying=pos.underlying,
+                            direction=pos.direction,
+                            current_price=current_price,
+                            new_tsl=new_tsl,
+                            locked_in_pnl_pct=locked_pct,
+                            event_type="TSL_RATCHET",
+                        )
+                        events.append({"event": "TSL_RATCHET", "ticker": ticker, "new_tsl": new_tsl})
+
+            else:
+                # ── Legacy Milestone Trim Execution (TP1/TP2/TP3) ──
+                # 2. Take Profit 3 (Final target - Full close)
+                tp3_hit = (current_price <= pos.tp3) if is_short else (current_price >= pos.tp3)
+                if tp3_hit and not pos.tp3_hit:
+                    event = self._handle_tp3_hit(pos, current_price)
+                    events.append(event)
+                    tickers_to_remove.append(ticker)
+                    continue
+
+                # 3. Take Profit 1 (First trim - 50% + Breakeven SL + Arm Hysteresis)
+                tp1_hit = (current_price <= pos.tp1) if is_short else (current_price >= pos.tp1)
+                if tp1_hit and not pos.tp1_hit:
+                    event = self._handle_tp1_hit(pos, current_price)
+                    events.append(event)
+
+                # 4. Take Profit 2 (Second trim - 25% + Ratchet to TP1)
+                tp2_hit = (current_price <= pos.tp2) if is_short else (current_price >= pos.tp2)
+                if tp2_hit and not pos.tp2_hit:
+                    event = self._handle_tp2_hit(pos, current_price)
+                    events.append(event)
+
+                # 5. Schmitt-Trigger Hysteresis: Elevate stop to TP1 once price clears escape threshold
+                if getattr(pos, "tp1_armed_hysteresis", False) and not pos.tp2_hit:
+                    escape_threshold = getattr(pos, "tp1_escape_threshold", 0.0)
+                    if not escape_threshold or escape_threshold <= 0:
+                        escape_threshold = self.risk_manager.calculate_escape_threshold(
+                            tp1=pos.tp1, atr=pos.atr, direction=pos.direction
+                        )
+                        pos.tp1_escape_threshold = escape_threshold
+
+                    escape_cleared = (current_price <= escape_threshold) if is_short else (current_price >= escape_threshold)
+                    if escape_cleared:
+                        pos.tp1_armed_hysteresis = False
+                        pos.tp1_stop_elevated = True
+                        if self.is_true_short_contract(pos):
+                            pos.trailing_stop_loss = min(pos.trailing_stop_loss, pos.tp1) if pos.trailing_stop_loss > 0 else pos.tp1
+                            pos.stop_loss = min(pos.stop_loss, pos.tp1) if pos.stop_loss > 0 else pos.tp1
+                        else:
+                            pos.trailing_stop_loss = max(pos.trailing_stop_loss, pos.tp1)
+                            pos.stop_loss = max(pos.stop_loss, pos.tp1)
+                        locked_pct = abs((pos.tp1 - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0.0
+                        logger.info(
+                            "🎯 %s Schmitt-Trigger Hysteresis ESCAPE: price $%.2f cleared threshold $%.2f. Stop safely elevated to TP1 ($%.2f, +%.1f%% locked)",
+                            ticker, current_price, escape_threshold, pos.tp1, locked_pct,
+                        )
+                        self.place_broker_stop(pos, stop_price=pos.tp1)
+                        self.notifier.notify_tsl(
+                            ticker=pos.ticker,
+                            underlying=pos.underlying,
+                            direction=pos.direction,
+                            current_price=current_price,
+                            new_tsl=pos.tp1,
+                            locked_in_pnl_pct=locked_pct,
+                            event_type="HYSTERESIS_TP1_RATCHET",
+                        )
+                        events.append({"event": "HYSTERESIS_TP1_RATCHET", "ticker": ticker, "new_tsl": pos.tp1})
+
+                # 5b. Progressive Trailing Stop (+1.5% BE, +3.0% cushion)
+                prog_sl = self.check_progressive_stops(
+                    entry_price=pos.entry_price,
+                    current_price=current_price,
+                    current_sl=pos.trailing_stop_loss,
+                    direction=pos.direction,
+                )
+                prog_ratcheted = (prog_sl < pos.trailing_stop_loss) if is_short else (prog_sl > pos.trailing_stop_loss)
+                if prog_ratcheted:
+                    pos.trailing_stop_loss = prog_sl
+                    pos.stop_loss = min(pos.stop_loss, prog_sl) if is_short else max(pos.stop_loss, prog_sl)
+                    self.place_broker_stop(pos, stop_price=prog_sl)
+                    events.append({"event": "PROGRESSIVE_STOP_RATCHET", "ticker": ticker, "new_tsl": prog_sl})
+
+                # 6. Trailing Stop Ratchet (Ratchets higher with new highs once hysteresis clears)
+                if pos.tp1_hit and not getattr(pos, "tp1_armed_hysteresis", False):
+                    favorable_price = pos.lowest_price if is_short else pos.highest_price
+                    new_tsl = self.risk_manager.calculate_trailing_stop(
+                        current_price=current_price,
+                        peak_price=favorable_price,
+                        atr=pos.atr,
+                        current_tsl=pos.trailing_stop_loss,
+                        direction=pos.direction,
+                    )
+                    ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
+                    if ratcheted:
+                        old_tsl = pos.trailing_stop_loss
+                        pos.trailing_stop_loss = new_tsl
+                        pos.stop_loss = min(pos.stop_loss, new_tsl) if is_short else max(pos.stop_loss, new_tsl)
+                        locked_pct = (
+                            ((pos.entry_price - new_tsl) / pos.entry_price * 100)
+                            if is_short
+                            else ((new_tsl - pos.entry_price) / pos.entry_price * 100)
+                        ) if pos.entry_price > 0 else 0.0
+                        logger.info("%s TSL ratcheted: $%.2f -> $%.2f (+%.1f%% locked)", ticker, old_tsl, new_tsl, locked_pct)
+                        self.place_broker_stop(pos, stop_price=new_tsl)
+                        self.notifier.notify_tsl(
+                            ticker=pos.ticker,
+                            underlying=pos.underlying,
+                            direction=pos.direction,
+                            current_price=current_price,
+                            new_tsl=new_tsl,
+                            locked_in_pnl_pct=locked_pct,
+                            event_type="TSL_RATCHET",
+                        )
+                        events.append({"event": "TSL_RATCHET", "ticker": ticker, "new_tsl": new_tsl})
 
         # Clean up closed positions
         for t in tickers_to_remove:
@@ -1651,102 +1745,180 @@ class PositionMonitor:
 
             is_short = self.is_true_short_contract(pos)
             pnl_pct = ((pos.entry_price - cur_px) / pos.entry_price * 100.0) if is_short else ((cur_px - pos.entry_price) / pos.entry_price * 100.0)
-
-            # 1. Connors 3-RSI Mean Reversion Overbought Profit-Taking (LONG)
-            if not is_short:
-                # Overbought peak: RSI3 >= 75 with at least +1% profit
-                if pos.rsi3 is not None and pos.rsi3 >= 75.0 and pnl_pct > 1.0:
-                    if not pos.tp1_hit:
-                        logger.info(
-                            "🎯 Signal Achieved for %s: Connors 3-RSI Overbought (%.1f >= 75.0, PnL +%.2f%%). Executing TP1 trim.",
-                            ticker, pos.rsi3, pnl_pct,
-                        )
-                        event = self._handle_tp1_hit(pos, cur_px)
-                        event["signal_reason"] = f"3RSI_OVERBOUGHT_{pos.rsi3:.1f}"
-                        events.append(event)
-                    elif not pos.tp2_hit and pos.rsi3 >= 82.0 and pnl_pct > 3.0:
-                        logger.info(
-                            "🎯 Signal Achieved for %s: Connors 3-RSI Extreme Overbought (%.1f >= 82.0, PnL +%.2f%%). Executing TP2 trim.",
-                            ticker, pos.rsi3, pnl_pct,
-                        )
-                        event = self._handle_tp2_hit(pos, cur_px)
-                        event["signal_reason"] = f"3RSI_EXTREME_OVERBOUGHT_{pos.rsi3:.1f}"
-                        events.append(event)
-
-                # SMA5 Mean-Reversion Target: Price crossed above 5-day SMA with RSI3 >= 68 and +2% profit
-                elif (
-                    pos.sma5 is not None
-                    and cur_px > pos.sma5
-                    and pos.rsi3 is not None
-                    and pos.rsi3 >= 68.0
-                    and pnl_pct >= 2.0
-                    and not pos.tp1_hit
-                ):
-                    logger.info(
-                        "🎯 Signal Achieved for %s: Price (%.2f) > SMA5 (%.2f) with RSI3=%.1f (PnL +%.2f%%). Executing TP1 trim.",
-                        ticker, cur_px, pos.sma5, pos.rsi3, pnl_pct,
-                    )
-                    event = self._handle_tp1_hit(pos, cur_px)
-                    event["signal_reason"] = "SMA5_REVERSION_EXIT"
-                    events.append(event)
-
-            # 2. Connors 3-RSI Mean Reversion Oversold Cover (SHORT)
-            else:
-                # Oversold trough: RSI3 <= 25 with at least +1% profit
-                if pos.rsi3 is not None and pos.rsi3 <= 25.0 and pnl_pct > 1.0:
-                    if not pos.tp1_hit:
-                        logger.info(
-                            "🎯 Signal Achieved for %s: Connors 3-RSI Oversold Cover (%.1f <= 25.0, PnL +%.2f%%). Executing TP1 trim.",
-                            ticker, pos.rsi3, pnl_pct,
-                        )
-                        event = self._handle_tp1_hit(pos, cur_px)
-                        event["signal_reason"] = f"3RSI_OVERSOLD_COVER_{pos.rsi3:.1f}"
-                        events.append(event)
-                    elif not pos.tp2_hit and pos.rsi3 <= 18.0 and pnl_pct > 3.0:
-                        logger.info(
-                            "🎯 Signal Achieved for %s: Connors 3-RSI Extreme Oversold Cover (%.1f <= 18.0, PnL +%.2f%%). Executing TP2 trim.",
-                            ticker, pos.rsi3, pnl_pct,
-                        )
-                        event = self._handle_tp2_hit(pos, cur_px)
-                        event["signal_reason"] = f"3RSI_EXTREME_OVERSOLD_COVER_{pos.rsi3:.1f}"
-                        events.append(event)
-
-            # 3. Nixtla 5-Day Forecast Reversal / Target Signals
             nixtla_ret = metrics.get("nixtla_expected_return_pct")
-            if nixtla_ret is not None:
-                try:
-                    ret_val = float(nixtla_ret)
-                    if not is_short:
-                        # Long: If Nixtla forecasts sharp downward trend (<= -3.0%) and position has profit >= 1.5%
-                        if ret_val <= -3.0 and pnl_pct >= 1.5 and not pos.tp1_hit:
+
+            if self.pure_tsl_mode:
+                # ── Pure TSL Technical Adaptation: Tighten TSL instead of cutting shares ──
+                if not is_short:
+                    should_tighten = False
+                    tighten_reason = ""
+                    if pos.rsi3 is not None and pos.rsi3 >= 75.0 and pnl_pct > 1.0:
+                        should_tighten = True
+                        tighten_reason = f"3RSI_OVERBOUGHT_{pos.rsi3:.1f}"
+                    elif (
+                        pos.sma5 is not None
+                        and cur_px > pos.sma5
+                        and pos.rsi3 is not None
+                        and pos.rsi3 >= 68.0
+                        and pnl_pct >= 2.0
+                    ):
+                        should_tighten = True
+                        tighten_reason = "SMA5_REVERSION"
+                    elif nixtla_ret is not None and float(nixtla_ret) <= -3.0 and pnl_pct >= 1.5:
+                        should_tighten = True
+                        tighten_reason = f"NIXTLA_BEARISH_REVERSAL_{float(nixtla_ret):.1f}%"
+
+                    if should_tighten:
+                        candidate_sl = max(pos.entry_price, round(pos.entry_price + (cur_px - pos.entry_price) * 0.50, 2))
+                        if candidate_sl > pos.trailing_stop_loss:
+                            old_tsl = pos.trailing_stop_loss
+                            pos.trailing_stop_loss = candidate_sl
+                            pos.stop_loss = max(pos.stop_loss, candidate_sl)
+                            locked_pct = ((candidate_sl - pos.entry_price) / pos.entry_price * 100.0) if pos.entry_price > 0 else 0.0
                             logger.info(
-                                "🎯 Signal Achieved for %s: Nixtla 5-Day Bearish Reversal (%.1f%%) with PnL +%.2f%%. Executing TP1 trim.",
-                                ticker, ret_val, pnl_pct,
+                                "🛡️ %s TSL tightened on technical signal (%s): $%.2f -> $%.2f (+%.1f%% locked, 100%% shares riding)",
+                                ticker, tighten_reason, old_tsl, candidate_sl, locked_pct,
+                            )
+                            self.place_broker_stop(pos, stop_price=candidate_sl)
+                            self.notifier.notify_tsl(
+                                ticker=pos.ticker,
+                                underlying=pos.underlying,
+                                direction=pos.direction,
+                                current_price=cur_px,
+                                new_tsl=candidate_sl,
+                                locked_in_pnl_pct=locked_pct,
+                                event_type="SIGNAL_TSL_TIGHTEN",
+                            )
+                            events.append({"event": "SIGNAL_TSL_TIGHTEN", "ticker": ticker, "new_tsl": candidate_sl, "reason": tighten_reason})
+                else:
+                    should_tighten = False
+                    tighten_reason = ""
+                    if pos.rsi3 is not None and pos.rsi3 <= 25.0 and pnl_pct > 1.0:
+                        should_tighten = True
+                        tighten_reason = f"3RSI_OVERSOLD_{pos.rsi3:.1f}"
+                    elif nixtla_ret is not None and float(nixtla_ret) >= 3.0 and pnl_pct >= 1.5:
+                        should_tighten = True
+                        tighten_reason = f"NIXTLA_BULLISH_REVERSAL_{float(nixtla_ret):.1f}%"
+
+                    if should_tighten:
+                        candidate_sl = min(pos.entry_price, round(pos.entry_price - (pos.entry_price - cur_px) * 0.50, 2))
+                        if candidate_sl < pos.trailing_stop_loss or pos.trailing_stop_loss <= 0:
+                            old_tsl = pos.trailing_stop_loss
+                            pos.trailing_stop_loss = candidate_sl
+                            pos.stop_loss = min(pos.stop_loss, candidate_sl)
+                            locked_pct = ((pos.entry_price - candidate_sl) / pos.entry_price * 100.0) if pos.entry_price > 0 else 0.0
+                            logger.info(
+                                "🛡️ %s TSL tightened on technical signal (%s): $%.2f -> $%.2f (+%.1f%% locked, 100%% shares riding)",
+                                ticker, tighten_reason, old_tsl, candidate_sl, locked_pct,
+                            )
+                            self.place_broker_stop(pos, stop_price=candidate_sl)
+                            self.notifier.notify_tsl(
+                                ticker=pos.ticker,
+                                underlying=pos.underlying,
+                                direction=pos.direction,
+                                current_price=cur_px,
+                                new_tsl=candidate_sl,
+                                locked_in_pnl_pct=locked_pct,
+                                event_type="SIGNAL_TSL_TIGHTEN",
+                            )
+                            events.append({"event": "SIGNAL_TSL_TIGHTEN", "ticker": ticker, "new_tsl": candidate_sl, "reason": tighten_reason})
+
+            else:
+                # ── Legacy Milestone Trims on Technical Signals ──
+                # 1. Connors 3-RSI Mean Reversion Overbought Profit-Taking (LONG)
+                if not is_short:
+                    # Overbought peak: RSI3 >= 75 with at least +1% profit
+                    if pos.rsi3 is not None and pos.rsi3 >= 75.0 and pnl_pct > 1.0:
+                        if not pos.tp1_hit:
+                            logger.info(
+                                "🎯 Signal Achieved for %s: Connors 3-RSI Overbought (%.1f >= 75.0, PnL +%.2f%%). Executing TP1 trim.",
+                                ticker, pos.rsi3, pnl_pct,
                             )
                             event = self._handle_tp1_hit(pos, cur_px)
-                            event["signal_reason"] = f"NIXTLA_BEARISH_REVERSAL_{ret_val:.1f}%"
+                            event["signal_reason"] = f"3RSI_OVERBOUGHT_{pos.rsi3:.1f}"
                             events.append(event)
-                        # Long: If profit reached or exceeded forecast return (>= 4.0%)
-                        elif ret_val > 0 and pnl_pct >= max(4.0, ret_val) and pos.tp1_hit and not pos.tp2_hit:
+                        elif not pos.tp2_hit and pos.rsi3 >= 82.0 and pnl_pct > 3.0:
                             logger.info(
-                                "🎯 Signal Achieved for %s: Nixtla 5-Day Target Achieved (PnL +%.2f%% >= Forecast %.1f%%). Executing TP2 trim.",
-                                ticker, pnl_pct, ret_val,
+                                "🎯 Signal Achieved for %s: Connors 3-RSI Extreme Overbought (%.1f >= 82.0, PnL +%.2f%%). Executing TP2 trim.",
+                                ticker, pos.rsi3, pnl_pct,
                             )
                             event = self._handle_tp2_hit(pos, cur_px)
-                            event["signal_reason"] = f"NIXTLA_TARGET_ACHIEVED_{pnl_pct:.1f}%"
+                            event["signal_reason"] = f"3RSI_EXTREME_OVERBOUGHT_{pos.rsi3:.1f}"
                             events.append(event)
-                    else:
-                        # Short: If Nixtla forecasts sharp upward rally (>= +3.0%) and position has profit >= 1.5%
-                        if ret_val >= 3.0 and pnl_pct >= 1.5 and not pos.tp1_hit:
+
+                    # SMA5 Mean-Reversion Target: Price crossed above 5-day SMA with RSI3 >= 68 and +2% profit
+                    elif (
+                        pos.sma5 is not None
+                        and cur_px > pos.sma5
+                        and pos.rsi3 is not None
+                        and pos.rsi3 >= 68.0
+                        and pnl_pct >= 2.0
+                        and not pos.tp1_hit
+                    ):
+                        logger.info(
+                            "🎯 Signal Achieved for %s: Price (%.2f) > SMA5 (%.2f) with RSI3=%.1f (PnL +%.2f%%). Executing TP1 trim.",
+                            ticker, cur_px, pos.sma5, pos.rsi3, pnl_pct,
+                        )
+                        event = self._handle_tp1_hit(pos, cur_px)
+                        event["signal_reason"] = "SMA5_REVERSION_EXIT"
+                        events.append(event)
+
+                # 2. Connors 3-RSI Mean Reversion Oversold Cover (SHORT)
+                else:
+                    # Oversold trough: RSI3 <= 25 with at least +1% profit
+                    if pos.rsi3 is not None and pos.rsi3 <= 25.0 and pnl_pct > 1.0:
+                        if not pos.tp1_hit:
                             logger.info(
-                                "🎯 Signal Achieved for %s: Nixtla 5-Day Bullish Reversal on Short (%.1f%%) with PnL +%.2f%%. Executing TP1 trim.",
-                                ticker, ret_val, pnl_pct,
+                                "🎯 Signal Achieved for %s: Connors 3-RSI Oversold Cover (%.1f <= 25.0, PnL +%.2f%%). Executing TP1 trim.",
+                                ticker, pos.rsi3, pnl_pct,
                             )
                             event = self._handle_tp1_hit(pos, cur_px)
-                            event["signal_reason"] = f"NIXTLA_BULLISH_REVERSAL_{ret_val:.1f}%"
+                            event["signal_reason"] = f"3RSI_OVERSOLD_COVER_{pos.rsi3:.1f}"
                             events.append(event)
-                except (ValueError, TypeError):
-                    pass
+                        elif not pos.tp2_hit and pos.rsi3 <= 18.0 and pnl_pct > 3.0:
+                            logger.info(
+                                "🎯 Signal Achieved for %s: Connors 3-RSI Extreme Oversold Cover (%.1f <= 18.0, PnL +%.2f%%). Executing TP2 trim.",
+                                ticker, pos.rsi3, pnl_pct,
+                            )
+                            event = self._handle_tp2_hit(pos, cur_px)
+                            event["signal_reason"] = f"3RSI_EXTREME_OVERSOLD_COVER_{pos.rsi3:.1f}"
+                            events.append(event)
+
+                # 3. Nixtla 5-Day Forecast Reversal / Target Signals
+                if nixtla_ret is not None:
+                    try:
+                        ret_val = float(nixtla_ret)
+                        if not is_short:
+                            # Long: If Nixtla forecasts sharp downward trend (<= -3.0%) and position has profit >= 1.5%
+                            if ret_val <= -3.0 and pnl_pct >= 1.5 and not pos.tp1_hit:
+                                logger.info(
+                                    "🎯 Signal Achieved for %s: Nixtla 5-Day Bearish Reversal (%.1f%%) with PnL +%.2f%%. Executing TP1 trim.",
+                                    ticker, ret_val, pnl_pct,
+                                )
+                                event = self._handle_tp1_hit(pos, cur_px)
+                                event["signal_reason"] = f"NIXTLA_BEARISH_REVERSAL_{ret_val:.1f}%"
+                                events.append(event)
+                            # Long: If profit reached or exceeded forecast return (>= 4.0%)
+                            elif ret_val > 0 and pnl_pct >= max(4.0, ret_val) and pos.tp1_hit and not pos.tp2_hit:
+                                logger.info(
+                                    "🎯 Signal Achieved for %s: Nixtla 5-Day Target Achieved (PnL +%.2f%% >= Forecast %.1f%%). Executing TP2 trim.",
+                                    ticker, pnl_pct, ret_val,
+                                )
+                                event = self._handle_tp2_hit(pos, cur_px)
+                                event["signal_reason"] = f"NIXTLA_TARGET_ACHIEVED_{pnl_pct:.1f}%"
+                                events.append(event)
+                        else:
+                            # Short: If Nixtla forecasts sharp upward rally (>= +3.0%) and position has profit >= 1.5%
+                            if ret_val >= 3.0 and pnl_pct >= 1.5 and not pos.tp1_hit:
+                                logger.info(
+                                    "🎯 Signal Achieved for %s: Nixtla 5-Day Bullish Reversal on Short (%.1f%%) with PnL +%.2f%%. Executing TP1 trim.",
+                                    ticker, ret_val, pnl_pct,
+                                )
+                                event = self._handle_tp1_hit(pos, cur_px)
+                                event["signal_reason"] = f"NIXTLA_BULLISH_REVERSAL_{ret_val:.1f}%"
+                                events.append(event)
+                    except (ValueError, TypeError):
+                        pass
 
         for t in tickers_to_remove:
             if t in self.positions:

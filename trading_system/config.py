@@ -133,11 +133,12 @@ class Settings:
     MR_MAX_HOLD_DAYS: int = 4        # Fast mean reversion holding period (eliminates beta decay)
 
     # Trailing Stop Loss & Schmitt Hysteresis Ratcheting
+    PURE_TSL_MODE: bool = True            # Pure 100% Trailing Stop Loss mode (no partial TP trims, lets winners run fully)
     TSL_ATR_MULTIPLIER: float = 1.2
     TSL_HYSTERESIS_ATR_MULT: float = 0.5  # Escape buffer past TP1 before elevating stop to TP1
-    TP1_TRIM_PCT: float = 0.50            # Upfront cash profit trim (50%)
-    TP2_TRIM_PCT: float = 0.25            # Second milestone trim (25%)
-    TP3_TRIM_PCT: float = 0.25            # Remaining runner tranche (25%)
+    TP1_TRIM_PCT: float = 0.50            # Upfront cash profit trim (50%) - legacy
+    TP2_TRIM_PCT: float = 0.25            # Second milestone trim (25%) - legacy
+    TP3_TRIM_PCT: float = 0.25            # Remaining runner tranche (25%) - legacy
 
     # Asymmetric Session Protocol & API Rate Quota Management
     SESSION_CLOSE_CUTOFF_UTC: str = "16:20"  # 10m before 16:30 LSE close

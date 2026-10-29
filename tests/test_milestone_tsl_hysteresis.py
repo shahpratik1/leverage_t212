@@ -56,6 +56,7 @@ class TestMilestoneTSLHysteresis(unittest.TestCase):
             risk_manager=self.risk_manager,
             state_file=self.state_file,
             dry_run=False,
+            pure_tsl_mode=False,
         )
 
     def tearDown(self):
