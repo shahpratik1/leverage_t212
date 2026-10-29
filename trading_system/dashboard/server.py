@@ -446,13 +446,13 @@ def fetch_live_broker_notifications(
                     ev = "SL" if (pnl_val is not None and pnl_val < 0) else "TSL"
                     rationale = f"Live T212 Stop Order Executed #{order_id}"
                 elif "LIMIT" in o_type:
-                    ev = "TP1" if (pnl_val is not None and pnl_val > 0) else "SELL"
+                    ev = "TSL" if (pnl_val is not None and pnl_val > 0) else "SELL"
                     rationale = f"Live T212 Limit Target Filled #{order_id}"
                 else:
                     if pnl_val is not None and pnl_val < 0:
                         ev = "SL"
                     elif pnl_val is not None and pnl_val > 0:
-                        ev = "TP1"
+                        ev = "TSL"
                     else:
                         ev = "SELL"
                     rationale = f"Live T212 Exit Order Filled #{order_id}"
@@ -629,7 +629,7 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                         "strategy_type": "broker_placed",
                         "rsi3": None, "rsi7": None, "rsi14": None, "sma5": None,
                         "win_rate_exp": "85%",
-                        "overnight_status": "REQUIRES TP1 OR FLATTENS 16:20 UTC" if direction == "LONG" else "INTRADAY SHORT (Flattens 16:20 UTC)",
+                        "overnight_status": "REQUIRES BREAKEVEN OR FLATTENS 16:20 UTC" if direction == "LONG" else "INTRADAY SHORT (Flattens 16:20 UTC / Winter Time)",
                         "overnight_badge_class": "bg-sky-500/10 text-sky-300 border-sky-500/30" if direction == "LONG" else "bg-rose-500/10 text-rose-300 border-rose-500/30",
                         "earnings_in_days": None,
                         "entry_price": round(avg_px, 2),
@@ -912,7 +912,7 @@ def generate_html_dashboard(output_path: str) -> str:
             <span>🔔 Recent Trade & Alert History</span>
             <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono" id="alerts-badge">0</span>
           </h3>
-          <p class="text-xs text-slate-400">Real-time desktop alerts, trade entries, native stop registrations, and profit exits (TP1/TP2/TP3/SL).</p>
+          <p class="text-xs text-slate-400">Real-time desktop alerts, trade entries, native stop registrations, and 100% Pure Trailing Stop Loss ratchets.</p>
         </div>
         <div class="text-xs text-slate-500 font-mono">Live Event Stream</div>
       </div>
@@ -1352,6 +1352,15 @@ def generate_html_dashboard(output_path: str) -> str:
         }} else if (ev === 'SELL') {{
           badgeColor = 'bg-rose-500/10 text-rose-400 border-rose-500/20';
           badgeIcon = '🔴 SELL';
+        }} else if (ev === 'TSL_BREAKEVEN') {{
+          badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
+          badgeIcon = '🛡️ TSL BREAKEVEN';
+        }} else if (ev === 'TSL_CUSHION') {{
+          badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
+          badgeIcon = '🛡️ TSL CUSHION (+1.5%)';
+        }} else if (ev === 'TSL' || ev === 'TSL_DYNAMIC' || ev === 'TSL_RATCHET') {{
+          badgeColor = 'bg-sky-500/10 text-sky-300 border-sky-500/30';
+          badgeIcon = '📈 TSL RATCHET';
         }} else if (ev === 'TP1') {{
           badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
           badgeIcon = '🎯 TP1 (+1.0R)';
@@ -1367,9 +1376,6 @@ def generate_html_dashboard(output_path: str) -> str:
         }} else if (ev.includes('HYSTERESIS')) {{
           badgeColor = 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30';
           badgeIcon = '🛡️ TSL ELEVATED';
-        }} else if (ev === 'TSL' || ev === 'TSL_RATCHET') {{
-          badgeColor = 'bg-amber-500/10 text-amber-300 border-amber-500/30';
-          badgeIcon = '📈 TSL RATCHET';
         }}
 
         const nCode = (n.currency || '').toUpperCase();
@@ -1919,7 +1925,7 @@ def start_local_server_thread(
 
 def start_local_server(html_file: str, port: int = 8888, open_browser: bool = True) -> None:
     """Serve the dashboard on a local HTTP server with autonomous background position monitoring."""
-    # Launch autonomous background position monitor for 100% automated TP1/TP2/TP3 execution
+    # Launch autonomous background position monitor for 100% automated Pure TSL execution
     start_background_position_monitor(html_file=html_file, interval_seconds=15)
 
     web_dir = Path(html_file).resolve().parent
@@ -1930,7 +1936,7 @@ def start_local_server(html_file: str, port: int = 8888, open_browser: bool = Tr
     with ThreadingDashboardServer(("0.0.0.0", port), HandlerClass) as httpd:
         url = f"http://localhost:{port}/{html_name}"
         print(f"\n🚀 Signals Dashboard running live at: {url}")
-        print("⚡ COMPLETE AUTOMATION ACTIVE: Polling every 15s for TP1/TP2/TP3 auto-sells")
+        print("⚡ COMPLETE AUTOMATION ACTIVE: Polling every 15s for dynamic TSL ratchets & GTC stop synchronization")
         print("Press Ctrl+C to stop the dashboard server.\n")
         if open_browser:
             webbrowser.open(url)

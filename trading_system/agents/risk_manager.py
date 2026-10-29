@@ -687,6 +687,13 @@ class RiskManager:
 
     def format_decision_card(self, card: DecisionCard) -> str:
         """Format the DecisionCard into a readable string block."""
+        from trading_system.config import settings
+        pure_tsl = getattr(settings, "PURE_TSL_MODE", True)
+        exit_line = (
+            "Exit Protocol:   100% Pure Trailing Stop Loss (+1.5% BE, +3.0% Cushion, Dynamic ATR Trail)"
+            if pure_tsl
+            else f"Take Profits:    TP1=${card.take_profit_1:.2f} | TP2=${card.take_profit_2:.2f} | TP3=${card.take_profit_3:.2f}"
+        )
         lines = [
             f"=== DECISION CARD: {card.ticker} -> {card.trading212_ticker} ===",
             f"Timestamp:       {card.timestamp}",
@@ -696,7 +703,7 @@ class RiskManager:
             f"Entry Price:     ${card.entry_price:.2f}",
             f"Stop Loss:       ${card.stop_loss:.2f} ({card.stop_distance_pct*100:.2f}%)",
             f"Trailing Stop:   ${card.trailing_stop_loss:.2f}",
-            f"Take Profits:    TP1=${card.take_profit_1:.2f} | TP2=${card.take_profit_2:.2f} | TP3=${card.take_profit_3:.2f}",
+            exit_line,
             f"Position Size:   {card.position_size_shares:.3f} shares",
             f"Notional Value:  ${card.position_notional:.2f}",
             f"Risk Amount:     ${card.risk_amount:.2f} ({card.risk_pct_of_equity*100:.2f}% of equity)",
