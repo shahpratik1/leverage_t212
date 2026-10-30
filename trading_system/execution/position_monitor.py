@@ -802,6 +802,11 @@ class PositionMonitor:
             recommended_sl = min(target_50pct, target_chandelier) if is_short else max(target_50pct, target_chandelier)
             recommended_sl = round(recommended_sl, 2)
 
+            # Invariant check: Stop must remain below current market price for long spot positions
+            cur_px = getattr(pos, "current_price", 0.0)
+            if not is_short and cur_px and cur_px > 0 and recommended_sl >= cur_px:
+                recommended_sl = round(min(pos.trailing_stop_loss, cur_px * 0.985), 2)
+
             # Check if this ratchets tighter than current stop
             should_ratchet = (recommended_sl < pos.trailing_stop_loss) if is_short else (recommended_sl > pos.trailing_stop_loss)
             if should_ratchet:
