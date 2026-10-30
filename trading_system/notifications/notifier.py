@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 NotificationType = Literal[
     "BUY", "SELL", "TP1", "TP2", "TP3", "SL", "TSL",
-    "ASYMMETRIC_SESSION_EXIT", "INVERSE_INTRADAY_FLATTEN", "EARNINGS_BLACKOUT_EXIT"
+    "ASYMMETRIC_SESSION_EXIT", "INVERSE_INTRADAY_FLATTEN", "EARNINGS_BLACKOUT_EXIT",
+    "ZERO_ALPHA_EVACUATION"
 ]
 
 
@@ -361,11 +362,12 @@ class Notifier:
         pnl_pct: Optional[float] = None,
     ) -> None:
         """Send a 16:20 UTC Asymmetric Session Exit notification."""
-        event_type = exit_reason if exit_reason in ("ASYMMETRIC_SESSION_EXIT", "INVERSE_INTRADAY_FLATTEN", "EARNINGS_BLACKOUT_EXIT") else "SELL"
+        event_type = exit_reason if exit_reason in ("ASYMMETRIC_SESSION_EXIT", "INVERSE_INTRADAY_FLATTEN", "EARNINGS_BLACKOUT_EXIT", "ZERO_ALPHA_EVACUATION") else "SELL"
         rationale_map = {
             "ASYMMETRIC_SESSION_EXIT": "16:20 UTC Asymmetric Session Exit: Long position did not reach TP1 break-even before LSE close. Flattened to protect against overnight gap.",
             "INVERSE_INTRADAY_FLATTEN": "16:20 UTC Inverse Flatten: 3x Short ETP liquidated 100% at session close to eliminate overnight compounding decay.",
             "EARNINGS_BLACKOUT_EXIT": "16:20 UTC Earnings Blackout: Liquidated due to underlying earnings release scheduled within 24 hours.",
+            "ZERO_ALPHA_EVACUATION": "16:20 UTC Zero-Alpha Evacuation: Position remained stagnant for 4+ sessions without directional expansion. Liquidated to eliminate compounding volatility drag.",
         }
         rationale = rationale_map.get(exit_reason, f"Session close exit: {exit_reason}")
         note = TradeNotification(
@@ -425,6 +427,7 @@ class Notifier:
             "ASYMMETRIC_SESSION_EXIT": "⏳ [16:20 UTC ASYMMETRIC GAP EVACUATION]",
             "INVERSE_INTRADAY_FLATTEN": "⚡ [16:20 UTC INVERSE INTRADAY FLATTEN]",
             "EARNINGS_BLACKOUT_EXIT": "⚠️ [16:20 UTC EARNINGS BLACKOUT EXIT]",
+            "ZERO_ALPHA_EVACUATION": "⏳ [16:20 UTC ZERO-ALPHA EVACUATION]",
         }
         title = icons.get(note.event_type, f"📢 [{note.event_type}]")
         border = "═" * 60

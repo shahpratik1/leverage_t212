@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ideation Deliverable: Next-Gen Institutional Execution & Micro-Runner Architecture</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+  </script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              500: '#22c55e',
+              600: '#16a34a',
+              900: '#14532d',
+            },
+            accent: {
+              500: '#38bdf8',
+              600: '#0284c7',
+            },
+            slate: {
+              850: '#151e2e',
+              900: '#0f172a',
+              950: '#020617',
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #0b0f19;
+      color: #cbd5e1;
+    }
+    .gradient-border {
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.25rem 0.625rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body class="p-6 md:p-12 max-w-6xl mx-auto space-y-10">
+
+  <!-- Header & Metadata -->
+  <header class="border-b border-slate-800 pb-8">
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-2 mb-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800/60">CE-IDEATE DISCOVERY</span>
+          <span class="badge bg-sky-950 text-sky-400 border border-sky-800/60">MODE: REPO-GROUNDED</span>
+          <span class="badge bg-purple-950 text-purple-400 border border-purple-800/60">SURPRISE-ME AUTONOMOUS EXPLORATION</span>
+        </div>
+        <h1 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Next-Gen Quantitative Execution & Micro-Runner Architecture</h1>
+        <p class="text-slate-400 mt-2 text-base">Grounded ideation on leveraged ETP volatility-drag mitigation, deterministic fly-by-wire gates, and multi-regime risk allocation.</p>
+      </div>
+      <div class="text-right text-xs text-slate-500 font-mono">
+        <div>Date: <span class="text-slate-300 font-bold">2026-10-30</span></div>
+        <div>Topic: <span class="text-slate-300">quantitative-execution-ideation</span></div>
+        <div>Scope: <span class="text-slate-300">Open Autonomous Discovery</span></div>
+        <div>Status: <span class="text-emerald-400 font-semibold">Ranked & Verified</span></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Grounding Context -->
+  <section class="gradient-border rounded-xl p-6 shadow-xl">
+    <h2 class="text-xl font-bold text-white mb-4 flex items-center gap-2">
+      <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+      Codebase Grounding Context
+    </h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 text-sm">
+      <div class="space-y-2">
+        <h3 class="font-semibold text-slate-200">Current Architecture</h3>
+        <p class="text-slate-400 leading-relaxed">
+          The system operates 24/7 on a Raspberry Pi 5 (<code class="text-slate-300">trading-bot.service</code>) executing across 120+ European Leveraged ETPs via Trading 212 Invest API. Recently unified under a <strong>100% Pure Trailing Stop Loss (TSL)</strong> engine, removing legacy static TP milestones.
+        </p>
+      </div>
+      <div class="space-y-2">
+        <h3 class="font-semibold text-slate-200">9 Institutional Safety Gates</h3>
+        <p class="text-slate-400 leading-relaxed">
+          Pre-trade validation includes a 15-minute market opening auction buffer (LSE & US), pre-trade price drift check (&lt;1.50%), bid-ask spread guard (&lt;1.00%), stop invariant protection, 16:20 UTC asymmetric inverse ETP liquidation, and pre-earnings blackout.
+        </p>
+      </div>
+      <div class="space-y-2">
+        <h3 class="font-semibold text-slate-200">Key Leverage & Friction Points</h3>
+        <p class="text-slate-400 leading-relaxed">
+          Winter/Summer daylight saving shifts (DST) between London, Frankfurt, and New York cause auction buffer misalignment. Multi-day volatility drag (beta slippage) drains capital in sideways chop. Currency normalization (GBX pence vs GBP/EUR/USD) requires continuous precision.
+        </p>
+      </div>
+    </div>
+    <div class="mt-4 pt-4 border-t border-slate-800 text-xs text-slate-400 flex items-center justify-between">
+      <span>Topic Axes: <strong class="text-slate-300">Decomposition skipped — surprise-me mode</strong></span>
+      <span>Fleet: <strong class="text-slate-300">6 Ceiling-Tier Frames + Fresh-Context Verifier</strong></span>
+    </div>
+  </section>
+
+  <!-- Jump-List Navigation for Ranked Ideas -->
+  <section class="space-y-3">
+    <div class="flex items-center justify-between">
+      <h2 class="text-2xl font-bold text-white tracking-tight">Ranked Survivor Ideas (6 Survivors from 23 Candidates)</h2>
+      <span class="text-xs text-slate-400 font-mono">17 Pruned & Consolidated</span>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 text-sm">
+      <a href="#idea-1" class="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-lg flex items-center justify-between transition-colors group">
+        <span class="font-medium text-slate-300 group-hover:text-emerald-400">1. Dynamic Volatility-Drag Time Decay TSL</span>
+        <span class="text-xs text-emerald-400 font-mono">90% · Med</span>
+      </a>
+      <a href="#idea-2" class="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-lg flex items-center justify-between transition-colors group">
+        <span class="font-medium text-slate-300 group-hover:text-emerald-400">2. Fly-by-Wire Execution & DST Guard</span>
+        <span class="text-xs text-emerald-400 font-mono">95% · Low-Med</span>
+      </a>
+      <a href="#idea-3" class="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-lg flex items-center justify-between transition-colors group">
+        <span class="font-medium text-slate-300 group-hover:text-emerald-400">3. Multi-Currency Live Normalization Matrix</span>
+        <span class="text-xs text-emerald-400 font-mono">92% · Low</span>
+      </a>
+      <a href="#idea-4" class="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-lg flex items-center justify-between transition-colors group">
+        <span class="font-medium text-slate-300 group-hover:text-emerald-400">4. Dynamic Regime Allocator & Covariance Shield</span>
+        <span class="text-xs text-emerald-400 font-mono">85% · Med-High</span>
+      </a>
+      <a href="#idea-5" class="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-lg flex items-center justify-between transition-colors group">
+        <span class="font-medium text-slate-300 group-hover:text-emerald-400">5. Generational Trade Lifecycle & Red Team Audit</span>
+        <span class="text-xs text-emerald-400 font-mono">82% · Med</span>
+      </a>
+      <a href="#idea-6" class="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-lg flex items-center justify-between transition-colors group">
+        <span class="font-medium text-slate-300 group-hover:text-emerald-400">6. Autonomous Immune Memory & Self-Healing Pipeline</span>
+        <span class="text-xs text-emerald-400 font-mono">88% · Med</span>
+      </a>
+    </div>
+  </section>
+
+  <!-- Detailed Idea Cards -->
+  <main class="space-y-8">
+
+    <!-- Idea 1 -->
+    <article id="idea-1" class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/10 text-emerald-400 font-bold text-sm border border-emerald-500/20">1</span>
+          <div>
+            <h3 class="text-xl font-bold text-white">Dynamic Volatility-Drag Time-Decay Trailing Stop Envelope</h3>
+            <span class="text-xs text-slate-400">Frame: Inversion & Cross-Cutting Synthesis (Synthesizes Raw Ideas 5 & 8)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800">Confidence: 90%</span>
+          <span class="badge bg-slate-800 text-slate-300 border border-slate-700">Complexity: Medium</span>
+        </div>
+      </div>
+
+      <p class="text-slate-300 leading-relaxed text-base">
+        A multi-dimensional trailing stop loss engine that actively models daily compounding beta slippage on leveraged ETPs. Instead of maintaining a static percentage or ATR distance from peak price, the allowable stop distance dynamically compresses non-linearly over holding duration. Stagnant trades that fail to produce directional expansion are automatically liquidated before volatility drag consumes the initial risk budget.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Basis & Grounding</h4>
+          <p class="text-slate-400">
+            <code class="text-xs text-emerald-400 font-mono">external:</code> Leverage Shares & GraniteShares Prospectuses on daily rebalancing volatility drag; Return Stacked research on variance drain. <code class="text-xs text-sky-400 font-mono">direct:</code> <a href="file:///Users/pratikshah/Documents/antigravity/modest-bose/CONCEPTS.md#L18" class="text-sky-400 underline">CONCEPTS.md line 18</a>: <em>"Volatility drag is non-linear and escalates rapidly over multi-week holding periods in choppy sideways markets."</em>
+          </p>
+        </div>
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Why It Matters</h4>
+          <p class="text-slate-400">
+            Prevents the classic retail leveraged trap: holding a 3x position that chops around entry price for 10 days, suffering 4% compounded beta decay even when the underlying benchmark finishes completely flat.
+          </p>
+        </div>
+      </div>
+
+      <div class="bg-slate-950/80 rounded-lg p-4 border border-slate-800/80 space-y-2">
+        <h4 class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Stop Envelope Mechanics (Mermaid Flow)</h4>
+        <div class="mermaid">
+          flowchart LR
+            Entry[Day 0: Entry] --> BaseATR[Stop Distance = 2.5x ATR]
+            BaseATR --> CheckProf{Unrealized P&L}
+            CheckProf -->|P&L >= +1.5%| BreakEven[Ratchet Stop to Break-Even]
+            CheckProf -->|P&L >= +3.0%| Cushion[Lock +1.5% Min Profit]
+            BreakEven --> DayDecay[Day 2+: Holding Duration Decay Factor]
+            Cushion --> DayDecay
+            DayDecay --> StopTighten[Dynamic Trail: Tighten Stop 0.3x ATR per Holding Day]
+            StopTighten --> AutoExit[Zero-Alpha Evacuation Exit]
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-800/60">
+        <span><strong>Known Tradeoffs:</strong> May prematurely stop out slow-grinding multi-week trends; requires tuning decay factor for 3x vs 5x products.</span>
+        <span class="text-emerald-400 font-medium">✓ Passes Meeting Test</span>
+      </div>
+    </article>
+
+    <!-- Idea 2 -->
+    <article id="idea-2" class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/10 text-emerald-400 font-bold text-sm border border-emerald-500/20">2</span>
+          <div>
+            <h3 class="text-xl font-bold text-white">Fly-by-Wire Execution Guard with Dynamic Multi-Exchange DST & Spread Filter</h3>
+            <span class="text-xs text-slate-400">Frame: Friction Removal & Cross-Cutting (Synthesizes Raw Ideas 1, 2, & 14)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800">Confidence: 95%</span>
+          <span class="badge bg-slate-800 text-slate-300 border border-slate-700">Complexity: Low-Medium</span>
+        </div>
+      </div>
+
+      <p class="text-slate-300 leading-relaxed text-base">
+        A deterministic pre-trade flight envelope controller that intercepts all buy/sell intents before broker dispatch. It continuously computes live daylight saving offsets (handling European winter time vs US summer time desynchronization weeks), enforces opening/closing auction dead-bands, and calculates dynamic bid-ask spread percentiles. Orders are physically vetoed if market maker spreads exceed 1.00% or 1.5x historical baseline.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Basis & Grounding</h4>
+          <p class="text-slate-400">
+            <code class="text-xs text-emerald-400 font-mono">direct:</code> User prompt: <em>"Also take consideration the time, winter time is enabled now. Units must be aligned. this is major flaw."</em> <code class="text-xs text-sky-400 font-mono">external:</code> Airbus A320 flight envelope protection architecture; institutional execution research on auction illiquidity traps.
+          </p>
+        </div>
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Why It Matters</h4>
+          <p class="text-slate-400">
+            Completely eliminates bad fills caused by crossed orders during uncrossed exchange opening auctions or illiquid mid-day spread blowouts.
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-800/60">
+        <span><strong>Known Tradeoffs:</strong> Rejecting orders during fast-moving market opens may cause missed breakout entries.</span>
+        <span class="text-emerald-400 font-medium">✓ Passes Meeting Test</span>
+      </div>
+    </article>
+
+    <!-- Idea 3 -->
+    <article id="idea-3" class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/10 text-emerald-400 font-bold text-sm border border-emerald-500/20">3</span>
+          <div>
+            <h3 class="text-xl font-bold text-white">Multi-Currency Live Exposure & Real-Time Normalization Matrix</h3>
+            <span class="text-xs text-slate-400">Frame: Pain & Friction / Direct Grounding (Raw Idea 4)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800">Confidence: 92%</span>
+          <span class="badge bg-slate-800 text-slate-300 border border-slate-700">Complexity: Low</span>
+        </div>
+      </div>
+
+      <p class="text-slate-300 leading-relaxed text-base">
+        A unified real-time FX and unit conversion layer that homogenizes position accounting across London (GBX pence and GBP), Frankfurt (EUR), and New York (USD). Automatically converts GBX pence to pounds (1/100) before calculating notional exposure, and continuously translates unrealized P&L into account base currency (EUR) using live ECB or Trading 212 FX quotes.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Basis & Grounding</h4>
+          <p class="text-slate-400">
+            <code class="text-xs text-emerald-400 font-mono">direct:</code> User prompt: <em>"Profits must be calculated properly and cross check always... Units must be aligned. this is major flaw."</em> <code class="text-xs text-sky-400 font-mono">direct:</code> <a href="file:///Users/pratikshah/Documents/antigravity/modest-bose/docs/solutions/logic-errors/dashboard-history-pnl-percentage-and-quantity-sync.md" class="text-sky-400 underline">dashboard-history-pnl-percentage-and-quantity-sync.md</a>.
+          </p>
+        </div>
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Why It Matters</h4>
+          <p class="text-slate-400">
+            A 100x scale error between GBX pence and GBP distorts circuit breakers, portfolio risk weights, and equity curve telemetry, rendering automated risk budgets inaccurate.
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-800/60">
+        <span><strong>Known Tradeoffs:</strong> Requires caching FX rates to avoid blocking execution during external currency API downtime.</span>
+        <span class="text-emerald-400 font-medium">✓ Passes Meeting Test</span>
+      </div>
+    </article>
+
+    <!-- Idea 4 -->
+    <article id="idea-4" class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/10 text-emerald-400 font-bold text-sm border border-emerald-500/20">4</span>
+          <div>
+            <h3 class="text-xl font-bold text-white">Multi-Strategy Dynamic Regime Allocator with Cross-Asset Covariance Shield</h3>
+            <span class="text-xs text-slate-400">Frame: Compounding & Cross-Cutting (Synthesizes Raw Ideas 11 & 13)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800">Confidence: 85%</span>
+          <span class="badge bg-slate-800 text-slate-300 border border-slate-700">Complexity: Medium-High</span>
+        </div>
+      </div>
+
+      <p class="text-slate-300 leading-relaxed text-base">
+        Modularizes trade signal generation into distinct specialized sub-strategies (Connors 3-RSI Mean Reversion, Supertrend Momentum, and Volatility Breakout). Allocates risk capital dynamically based on prevailing market regimes (Range/Chop vs Trending vs Volatile Breakout), while simultaneously computing a live 120-asset covariance matrix to enforce a strict portfolio beta cap.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Basis & Grounding</h4>
+          <p class="text-slate-400">
+            <code class="text-xs text-emerald-400 font-mono">direct:</code> <a href="file:///Users/pratikshah/Documents/antigravity/modest-bose/docs/architecture.md#L68" class="text-sky-400 underline">docs/architecture.md Safety Gate 9</a> (Max Sector / Directional Exposure). <code class="text-xs text-sky-400 font-mono">reasoned:</code> 3LNV, 3MSF, and QQQ3 share &gt;0.85 correlation; holding all three creates hidden 9x tech beta concentration.
+          </p>
+        </div>
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Why It Matters</h4>
+          <p class="text-slate-400">
+            Mean reversion produces consistent gains in range-bound chop but suffers deep drawdowns during structural trends; dynamic allocation ensures the portfolio adapts to market regime shifts automatically.
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-800/60">
+        <span><strong>Known Tradeoffs:</strong> Increased computational overhead for covariance calculation on Raspberry Pi; requires historical candle caching in SQLite.</span>
+        <span class="text-emerald-400 font-medium">✓ Passes Meeting Test</span>
+      </div>
+    </article>
+
+    <!-- Idea 5 -->
+    <article id="idea-5" class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/10 text-emerald-400 font-bold text-sm border border-emerald-500/20">5</span>
+          <div>
+            <h3 class="text-xl font-bold text-white">Generational Trade Lifecycle with Asynchronous Red Team Exit Audit</h3>
+            <span class="text-xs text-slate-400">Frame: Analogy & Inversion (Synthesizes Raw Ideas 6 & 16)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800">Confidence: 82%</span>
+          <span class="badge bg-slate-800 text-slate-300 border border-slate-700">Complexity: Medium</span>
+        </div>
+      </div>
+
+      <p class="text-slate-300 leading-relaxed text-base">
+        Manages open positions through generational lifecycle stages modeled after computer science memory management. Newly opened trades start in the "Young Generation" (Eden: 0-24h probation, subject to hourly Red Team liquidation audits). Trades that achieve +1.5% profit cushion graduate to "Tenured" (wide Chandelier trailing stop, multi-day runner). Stagnant positions are marked-and-swept automatically.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Basis & Grounding</h4>
+          <p class="text-slate-400">
+            <code class="text-xs text-emerald-400 font-mono">external:</code> Computer systems Generational Garbage Collection; TiMi & GroundTrader adversarial supervisory LLM frameworks (arXiv 2025/2026).
+          </p>
+        </div>
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Why It Matters</h4>
+          <p class="text-slate-400">
+            Eliminates cognitive bias and attachment to losing trades. The Red Team's sole incentive is to find technical or macroeconomic flaws in existing positions to free up capital for fresh opportunities.
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-800/60">
+        <span><strong>Known Tradeoffs:</strong> Adversarial LLM audits consume tokens if run too frequently; requires caching conviction scores.</span>
+        <span class="text-emerald-400 font-medium">✓ Passes Meeting Test</span>
+      </div>
+    </article>
+
+    <!-- Idea 6 -->
+    <article id="idea-6" class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+        <div class="flex items-center gap-3">
+          <span class="flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/10 text-emerald-400 font-bold text-sm border border-emerald-500/20">6</span>
+          <div>
+            <h3 class="text-xl font-bold text-white">Autonomous Immune Memory & Self-Healing Micro-Runner Pipeline</h3>
+            <span class="text-xs text-slate-400">Frame: Cross-Domain Analogy & Infrastructure (Synthesizes Raw Ideas 12, 15, & 18)</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800">Confidence: 88%</span>
+          <span class="badge bg-slate-800 text-slate-300 border border-slate-700">Complexity: Medium</span>
+        </div>
+      </div>
+
+      <p class="text-slate-300 leading-relaxed text-base">
+        An adaptive operational resilience system that creates digital "antibodies" for both market anomalies and infrastructure failures. When a trade suffers a sudden microstructure stop-hunt wick, its volatility signature is fingerprinted in SQLite to suppress repeat entries for 72 hours. Simultaneously, a local daemon monitors Raspberry Pi CPU thermals, broker socket heartbeats, and disk health, automatically repairing corrupt state files.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Basis & Grounding</h4>
+          <p class="text-slate-400">
+            <code class="text-xs text-emerald-400 font-mono">external:</code> Biological adaptive immunity; structural resilience in IoT edge computing. <code class="text-xs text-sky-400 font-mono">direct:</code> <a href="file:///Users/pratikshah/Documents/antigravity/modest-bose/docs/solutions/infrastructure/pi-deployment-host-discovery-and-keyless-backtesting.md" class="text-sky-400 underline">pi-deployment-host-discovery-and-keyless-backtesting.md</a>.
+          </p>
+        </div>
+        <div class="space-y-2">
+          <h4 class="font-semibold text-slate-200">Why It Matters</h4>
+          <p class="text-slate-400">
+            Enables true autonomous hands-off operation of the trading robot on residential Raspberry Pi edge hardware, immune to transient network hiccups or repeat market whipsaws.
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-800/60">
+        <span><strong>Known Tradeoffs:</strong> Overly aggressive antibody suppression might cause the scanner to skip valid bounce opportunities in high-volatility regimes.</span>
+        <span class="text-emerald-400 font-medium">✓ Passes Meeting Test</span>
+      </div>
+    </article>
+
+  </main>
+
+  <!-- Rejection & Consolidation Summary -->
+  <section class="gradient-border rounded-xl p-6 md:p-8 space-y-6">
+    <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+      <h2 class="text-xl font-bold text-white">Rejection & Consolidation Summary (17 Candidates Handled)</h2>
+      <span class="text-xs text-slate-400">Strict Adversarial Filtering Pass</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-sm text-slate-400">
+        <thead class="bg-slate-900/60 text-xs uppercase text-slate-300 font-semibold border-b border-slate-800">
+          <tr>
+            <th class="p-3">Raw Candidate Idea</th>
+            <th class="p-3">Origin Frame</th>
+            <th class="p-3">Verdict</th>
+            <th class="p-3">Disposition / Rationale</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-800/60 font-mono text-xs">
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">1. Automatic DST Clock Sync</td>
+            <td class="p-3 text-slate-400">Pain & Friction</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #2 (Fly-by-Wire Execution Guard).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">2. Spread Spike Circuit Breaker</td>
+            <td class="p-3 text-slate-400">Pain & Friction</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #2 (Fly-by-Wire Execution Guard).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">3. Telemetry Deduping Engine</td>
+            <td class="p-3 text-slate-400">Pain & Friction</td>
+            <td class="p-3 text-amber-400">REJECTED</td>
+            <td class="p-3 font-sans">Below ambition floor — cosmetic UI refinement rather than trading/risk alpha.</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">5. Volatility Drag Budget</td>
+            <td class="p-3 text-slate-400">Inversion</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #1 (Dynamic Volatility-Drag Time Decay TSL).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">6. Adversarial Red Team Auditor</td>
+            <td class="p-3 text-slate-400">Inversion</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #5 (Generational Trade Lifecycle).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">7. WebSocket Quote Streaming</td>
+            <td class="p-3 text-slate-400">Inversion</td>
+            <td class="p-3 text-amber-400">REJECTED</td>
+            <td class="p-3 font-sans">Trading 212 Invest API does not support native public WebSocket tick streams for retail ETPs.</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">8. Time & Volatility Envelope</td>
+            <td class="p-3 text-slate-400">Assumption-Breaking</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #1 (Dynamic Volatility-Drag Time Decay TSL).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">9. Modular Multi-Broker Abstraction</td>
+            <td class="p-3 text-slate-400">Assumption-Breaking</td>
+            <td class="p-3 text-amber-400">REJECTED</td>
+            <td class="p-3 font-sans">Scope overrun — premature multi-broker architecture; current roadmap is maximizing Trading 212 execution.</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">10. Bayesian Monte Carlo Surface</td>
+            <td class="p-3 text-slate-400">Assumption-Breaking</td>
+            <td class="p-3 text-amber-400">REJECTED</td>
+            <td class="p-3 font-sans">High compute burden for Raspberry Pi 5; introduces latency into execution path.</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">11. Cross-Asset Correlation Matrix</td>
+            <td class="p-3 text-slate-400">Compounding</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #4 (Multi-Strategy Dynamic Regime Allocator).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">12. Continuous Calibration Loop</td>
+            <td class="p-3 text-slate-400">Compounding</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #6 (Autonomous Immune Memory).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">13. Dynamic Multi-Strategy Allocator</td>
+            <td class="p-3 text-slate-400">Compounding</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #4 (Multi-Strategy Dynamic Regime Allocator).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">14. Fly-by-Wire Protection</td>
+            <td class="p-3 text-slate-400">Analogy</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #2 (Fly-by-Wire Execution Guard).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">15. Immune Memory Fingerprinting</td>
+            <td class="p-3 text-slate-400">Analogy</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #6 (Autonomous Immune Memory).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">16. Generational Garbage Collection</td>
+            <td class="p-3 text-slate-400">Analogy</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #5 (Generational Trade Lifecycle).</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">17. 72h Disconnected Survivability</td>
+            <td class="p-3 text-slate-400">Constraint-Flipping</td>
+            <td class="p-3 text-amber-400">REJECTED</td>
+            <td class="p-3 font-sans">Already covered by native broker GTC stop orders; offline state engine creates unnecessary sync conflicts.</td>
+          </tr>
+          <tr>
+            <td class="p-3 font-semibold text-slate-300">18. Zero-Human Automated DevOps</td>
+            <td class="p-3 text-slate-400">Constraint-Flipping</td>
+            <td class="p-3 text-emerald-400">CONSOLIDATED</td>
+            <td class="p-3 font-sans">Merged into Survivor #6 (Autonomous Immune Memory).</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Composition Signal Footer -->
+  <footer class="pt-6 border-t border-slate-800 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-4">
+    <div class="composition-signal">
+      Composed 2026-10-30T11:50Z by ce-ideate (surprise-me mode) · Source: <code class="text-slate-400">trading_system/</code> & <code class="text-slate-400">docs/solutions/</code>
+    </div>
+    <div class="text-slate-400 font-mono">
+      Deliverable: <span class="text-emerald-400">docs/ideation/2026-10-30-quantitative-execution-ideation.html</span>
+    </div>
+  </footer>
+
+</body>
+</html>

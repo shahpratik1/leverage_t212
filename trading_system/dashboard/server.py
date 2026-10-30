@@ -183,6 +183,11 @@ def load_active_signals(
             tp3_gain_pct = abs(tp3 - entry) / entry * 100 if entry > 0 else 0.0
 
             # Pure TSL Status Resolution (100% Ride with progressive ratchets)
+            session_count = int(pos.get("session_count") or 1)
+            is_runner = bool(pos.get("is_runner", False))
+            decay_multiplier = RiskManager.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+            decay_label = "Runner (2.00x ATR)" if is_runner else f"Day {session_count} ({decay_multiplier:.2f}x ATR)"
+
             if pos.get("is_closed"):
                 status = "CLOSED"
                 tsl_status = "Closed"
@@ -263,6 +268,10 @@ def load_active_signals(
                 "stop_loss": round(sl, 2),
                 "trailing_stop_loss": round(tsl, 2),
                 "tsl_status": tsl_status,
+                "session_count": session_count,
+                "is_runner": is_runner,
+                "decay_multiplier": decay_multiplier,
+                "decay_label": decay_label,
                 "stop_distance_pct": round(risk_pct, 2),
                 "broker_stop_order_id": broker_stop_order_id,
                 "quantity": original_quantity,
@@ -277,6 +286,7 @@ def load_active_signals(
                     f"CURRENT: {currency_prefix}{current_price:.2f}{currency_suffix} ({pnl_pct:+.2f}%)\n"
                     f"STOP LOSS: {currency_prefix}{sl:.2f}{currency_suffix} (-{risk_pct:.2f}%)\n"
                     f"ACTIVE TSL: {currency_prefix}{tsl:.2f}{currency_suffix} ({tsl_status})\n"
+                    f"DECAY ENVELOPE: {decay_label}\n"
                     f"{stop_broker_line}"
                     f"QUANTITY: {remaining_quantity:.2f} / {original_quantity:.2f} shares (100% Ride)\n"
                     f"SESSION PROTOCOL: {overnight_status}"

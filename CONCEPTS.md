@@ -66,3 +66,16 @@ By locking in accrued gains prior to projected negative momentum shifts, forecas
 ### Micro-Runner Dynamic Host Discovery
 An automated probing mechanism for deploying to physical micro-runners (e.g. Raspberry Pi) across local area networks subject to DHCP lease drift, sequentially testing candidate hostnames and active subnet IPs before initiating synchronization.
 *Avoid: Hardcoded static IP, manual target entry*
+
+### Session-Day Decay Trailing Stop Envelope
+A multi-dimensional trailing stop loss protocol that tightens allowable ATR distance by a fixed daily decrement (e.g. 0.35x ATR per session) across completed exchange trading days on leveraged ETPs, forcing stagnant positions to Break-Even or liquidating them before daily rebalancing volatility drag (beta slippage) erodes capital.
+*Avoid: Static percentage stop, perpetual holding stop*
+
+### Zero-Alpha Evacuation
+An automated risk exit triggered on stagnant leveraged positions that fail to achieve positive directional expansion after a defined holding duration (e.g. 4 market sessions), liquidating exposure at 16:20 UTC before market close to eliminate compounding beta decay.
+*Avoid: Indefinite chop holding, passive drift*
+
+### Tenured Runner Immunity
+A risk management rule that exempts strongly trending, profitable positions (e.g. >= +3.0% unrealized gain with Cushion locked) from time-decay stop tightening, preserving full ATR trailing distance for multi-week momentum moves.
+*Avoid: Universal decay choking, premature profit choking*
+

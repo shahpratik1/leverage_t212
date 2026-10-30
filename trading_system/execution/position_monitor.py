@@ -24,6 +24,32 @@ from trading_system.notifications.notifier import Notifier
 
 logger = logging.getLogger(__name__)
 
+OFFLINE_EXCHANGE_HOLIDAYS = {
+    # 2026 European (LSE) & US Market Holidays
+    "2026-01-01",  # New Year's Day
+    "2026-01-19",  # MLK Jr. Day
+    "2026-02-16",  # Presidents' Day
+    "2026-04-03",  # Good Friday
+    "2026-04-06",  # Easter Monday
+    "2026-05-04",  # Early May Bank Holiday
+    "2026-05-25",  # Spring Bank Holiday / Memorial Day
+    "2026-06-19",  # Juneteenth
+    "2026-07-03",  # US Independence Day observed
+    "2026-08-31",  # Summer Bank Holiday
+    "2026-11-26",  # Thanksgiving
+    "2026-12-25",  # Christmas Day
+    "2026-12-28",  # Boxing Day observed
+}
+
+
+def is_exchange_trading_day(dt: Optional[datetime] = None) -> bool:
+    """Check if date is a standard exchange business trading day (Mon-Fri and not holiday)."""
+    target = dt or datetime.now(timezone.utc)
+    if target.weekday() >= 5:  # 5=Sat, 6=Sun
+        return False
+    date_str = target.strftime("%Y-%m-%d")
+    return date_str not in OFFLINE_EXCHANGE_HOLIDAYS
+
 
 @dataclass
 class TrackedPosition:
@@ -64,6 +90,9 @@ class TrackedPosition:
     scale_calibrated: bool = False
     current_price: Optional[float] = None
     currency: str = "EUR"
+    session_count: int = 1
+    is_runner: bool = False
+    last_session_date: str = ""
 
     def __post_init__(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -71,6 +100,8 @@ class TrackedPosition:
             self.entry_time = now
         if not self.last_update_time:
             self.last_update_time = now
+        if not self.last_session_date:
+            self.last_session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.highest_price <= 0:
             self.highest_price = self.entry_price
         if self.lowest_price <= 0:
@@ -764,13 +795,23 @@ class PositionMonitor:
         return {"stops": synced_stops, "tps": synced_tps}
 
     def apply_daily_rollover_stops(self) -> List[Dict[str, Any]]:
-        """Apply new-day session stop loss elevation to permanently lock in prior-day gains.
+        """Apply new-day session stop loss elevation and time-decay envelope compression.
 
-        Rule: For any active position sitting in profit from yesterday (peak > entry),
-        ratchet the stop loss to at least Entry + 50% of the peak unrealized gain,
-        or Chandelier ATR trail (Peak - 1.5 * ATR), whichever is higher.
+        Rules:
+        1. On regular exchange trading days, increment session_count for each active position.
+        2. Evaluate runner status: if gain >= +3.0% or cushion locked, mark is_runner = True.
+        3. Compress ATR trail by 0.35x per session for non-runners (2.20x -> 1.85x -> 1.50x -> 1.15x).
+        4. If position has gain: ratchet to at least Entry + 50% gain, or decayed Chandelier trail.
+        5. If stagnant: apply decayed Chandelier trail.
+        6. Day 4+ Stagnancy Gate: If session_count >= 4 and not is_runner and gain < +1.5%,
+           elevate stop directly to Entry Price (Break-Even).
+        7. Strict ratchet invariant: Stop only moves in favorable direction (never loosens).
         """
         results = []
+        now_utc = datetime.now(timezone.utc)
+        today_str = now_utc.strftime("%Y-%m-%d")
+        is_trading_day = is_exchange_trading_day(now_utc)
+
         for ticker, pos in list(self.positions.items()):
             if pos.is_closed or pos.remaining_quantity <= 0 or pos.entry_price <= 0:
                 continue
@@ -785,27 +826,56 @@ class PositionMonitor:
                 pos.lowest_price = pos.current_price or pos.entry_price
                 continue
 
-            # Check if position experienced positive gain
-            has_gain = (peak < pos.entry_price) if is_short else (peak > pos.entry_price)
-            if not has_gain:
-                continue
+            # 1. Session age accounting: increment session_count on business trading days
+            if is_trading_day and getattr(pos, "last_session_date", "") != today_str:
+                pos.session_count = getattr(pos, "session_count", 1) + 1
+                pos.last_session_date = today_str
 
-            gain_amt = (pos.entry_price - peak) if is_short else (peak - pos.entry_price)
-            # 50% profit lock
-            target_50pct = (pos.entry_price - 0.50 * gain_amt) if is_short else (pos.entry_price + 0.50 * gain_amt)
+            session_count = getattr(pos, "session_count", 1)
 
-            # Chandelier ATR trail
-            atr_trail_dist = max(pos.atr * 1.5, peak * 0.015) if pos.atr > 0 else (peak * 0.02)
+            # 2. Check runner status (Cushion locked or gain >= +3.0%)
+            cur_px = getattr(pos, "current_price", 0.0) or peak
+            gain_pct = ((cur_px - pos.entry_price) / pos.entry_price * 100.0) if not is_short else ((pos.entry_price - cur_px) / pos.entry_price * 100.0)
+            is_cushion_locked = (pos.trailing_stop_loss >= pos.entry_price * 1.0149 if not is_short else pos.trailing_stop_loss <= pos.entry_price * 0.9851)
+            if gain_pct >= 3.0 or is_cushion_locked:
+                pos.is_runner = True
+
+            is_runner = getattr(pos, "is_runner", False)
+
+            # 3. Dynamic Decay Multiplier
+            if hasattr(self.risk_manager, "get_decay_atr_multiplier"):
+                try:
+                    decay_mult = self.risk_manager.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+                except Exception:
+                    decay_mult = RiskManager.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+            else:
+                decay_mult = RiskManager.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+
+            if not isinstance(decay_mult, (int, float)):
+                decay_mult = RiskManager.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+            atr_trail_dist = max(pos.atr * decay_mult, peak * 0.015) if pos.atr > 0 else (peak * 0.02)
             target_chandelier = (peak + atr_trail_dist) if is_short else (peak - atr_trail_dist)
 
-            # Choose the tighter of the two (higher for long, lower for short)
-            recommended_sl = min(target_50pct, target_chandelier) if is_short else max(target_50pct, target_chandelier)
+            # 4. Check if position experienced positive gain
+            has_gain = (peak < pos.entry_price) if is_short else (peak > pos.entry_price)
+            if has_gain:
+                gain_amt = (pos.entry_price - peak) if is_short else (peak - pos.entry_price)
+                target_50pct = (pos.entry_price - 0.50 * gain_amt) if is_short else (pos.entry_price + 0.50 * gain_amt)
+                recommended_sl = min(target_50pct, target_chandelier) if is_short else max(target_50pct, target_chandelier)
+            else:
+                recommended_sl = target_chandelier
+
+            # 5. Day 4+ Stagnancy Gate: Force Break-Even on 4+ sessions of chop
+            if session_count >= 4 and not is_runner and gain_pct < 1.5:
+                recommended_sl = pos.entry_price
+
             recommended_sl = round(recommended_sl, 2)
 
             # Invariant check: Stop must remain below current market price for long spot positions
-            cur_px = getattr(pos, "current_price", 0.0)
             if not is_short and cur_px and cur_px > 0 and recommended_sl >= cur_px:
-                recommended_sl = round(min(pos.trailing_stop_loss, cur_px * 0.985), 2)
+                recommended_sl = round(cur_px * 0.985, 2)
+            elif is_short and cur_px and cur_px > 0 and recommended_sl <= cur_px:
+                recommended_sl = round(cur_px * 1.015, 2)
 
             # Check if this ratchets tighter than current stop
             should_ratchet = (recommended_sl < pos.trailing_stop_loss) if is_short else (recommended_sl > pos.trailing_stop_loss)
@@ -820,8 +890,9 @@ class PositionMonitor:
 
                 locked_pct = abs((recommended_sl - pos.entry_price) / pos.entry_price) * 100.0 if pos.entry_price > 0 else 0.0
                 logger.info(
-                    "🌅 Daily Session Rollover: %s stop ratcheted $%.2f -> $%.2f (Peak: $%.2f, +%.2f%% locked)",
-                    ticker, old_sl, recommended_sl, peak, locked_pct,
+                    "🌅 Daily Session Rollover: %s stop ratcheted $%.2f -> $%.2f (Peak: $%.2f, +%.2f%% locked, Session %d, %.2fx ATR%s)",
+                    ticker, old_sl, recommended_sl, peak, locked_pct, session_count, decay_mult,
+                    " [RUNNER IMMUNITY]" if is_runner else "",
                 )
                 self.place_broker_stop(pos, stop_price=recommended_sl)
                 if hasattr(self.notifier, "notify_tsl"):
@@ -844,6 +915,8 @@ class PositionMonitor:
                     "new_sl": recommended_sl,
                     "peak": peak,
                     "locked_pct": round(locked_pct, 2),
+                    "session_count": session_count,
+                    "decay_multiplier": decay_mult,
                 })
         if results:
             self._save_state()
@@ -1289,7 +1362,7 @@ class PositionMonitor:
                 if flatten_all:
                     positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
                     tickers_to_remove.append(ticker)
-                elif settings.ENFORCE_LONG_BREAKEVEN_OVERNIGHT:
+                else:
                     if (
                         pos.earnings_in_days is not None
                         and isinstance(pos.earnings_in_days, (int, float))
@@ -1297,20 +1370,37 @@ class PositionMonitor:
                     ):
                         positions_to_close.append((pos, "EARNINGS_BLACKOUT_EXIT", current_price))
                         tickers_to_remove.append(ticker)
-                    is_risk_free = (
-                        (pos.trailing_stop_loss >= pos.entry_price)
-                        or (pos.stop_loss >= pos.entry_price)
-                        or pos.tp1_hit
+                        continue
+
+                    # Day 4+ Zero-Alpha Stagnancy Gate
+                    gain_pct = ((current_price - pos.entry_price) / pos.entry_price * 100.0) if pos.entry_price > 0 else 0.0
+                    is_day4_stagnant = (
+                        getattr(pos, "session_count", 1) >= 4
+                        and not getattr(pos, "is_runner", False)
+                        and gain_pct < 1.5
                     )
-                    if not is_risk_free:
-                        positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
+                    if is_day4_stagnant:
+                        positions_to_close.append((pos, "ZERO_ALPHA_EVACUATION", current_price))
                         tickers_to_remove.append(ticker)
+                        continue
+
+                    if settings.ENFORCE_LONG_BREAKEVEN_OVERNIGHT:
+                        is_risk_free = (
+                            (pos.trailing_stop_loss >= pos.entry_price)
+                            or (pos.stop_loss >= pos.entry_price)
+                            or pos.tp1_hit
+                        )
+                        if not is_risk_free:
+                            positions_to_close.append((pos, "ASYMMETRIC_SESSION_EXIT", current_price))
+                            tickers_to_remove.append(ticker)
+                        else:
+                            pos.is_overnight_eligible = True
+                            logger.info(
+                                "Retaining Long %s for overnight swing (TSL Breakeven/Profit active: $%.2f >= $%.2f)",
+                                ticker, pos.trailing_stop_loss, pos.entry_price,
+                            )
                     else:
                         pos.is_overnight_eligible = True
-                        logger.info(
-                            "Retaining Long %s for overnight swing (TSL Breakeven/Profit active: $%.2f >= $%.2f)",
-                            ticker, pos.trailing_stop_loss, pos.entry_price,
-                        )
 
         events: List[Dict[str, Any]] = []
         if positions_to_close:
@@ -1586,6 +1676,10 @@ class PositionMonitor:
                 # 2. Dynamic ATR Trailing Stop Ratchet:
                 # Trailing stop only activates once position achieves profit (gain >= 1.5% or stop at/above breakeven)
                 gain_pct = ((pos.entry_price - current_price) / pos.entry_price * 100.0) if is_short else ((current_price - pos.entry_price) / pos.entry_price * 100.0)
+                is_cushion_locked = (pos.trailing_stop_loss >= pos.entry_price * 1.0149 if not is_short else pos.trailing_stop_loss <= pos.entry_price * 0.9851)
+                if gain_pct >= 3.0 or is_cushion_locked:
+                    pos.is_runner = True
+
                 is_in_profit_zone = gain_pct >= 1.5 or (pos.trailing_stop_loss <= pos.entry_price if is_short else pos.trailing_stop_loss >= pos.entry_price)
                 if is_in_profit_zone:
                     favorable_price = pos.lowest_price if is_short else pos.highest_price
@@ -1596,6 +1690,8 @@ class PositionMonitor:
                         current_tsl=pos.trailing_stop_loss,
                         direction=pos.direction,
                         ticker=pos.ticker,
+                        session_count=getattr(pos, "session_count", 1),
+                        is_runner=getattr(pos, "is_runner", False),
                     )
                     ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
                     if ratcheted:
@@ -1706,6 +1802,8 @@ class PositionMonitor:
                         current_tsl=pos.trailing_stop_loss,
                         direction=pos.direction,
                         ticker=pos.ticker,
+                        session_count=getattr(pos, "session_count", 1),
+                        is_runner=getattr(pos, "is_runner", False),
                     )
                     ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
                     if ratcheted:

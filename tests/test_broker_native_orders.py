@@ -248,7 +248,7 @@ class TestBrokerNativeOrders(unittest.TestCase):
             tp1=106.0,
             tp2=112.0,
             tp3=118.0,
-            atr=2.0,  # 1.5 * 2.0 = 3.0 trail distance -> 110 - 3.0 = 107.0
+            atr=2.0,  # Runner immunity (gain +10% >= 3%): 2.00 * 2.0 = 4.0 trail distance -> 110 - 4.0 = 106.0
             broker_stop_order_id="OLD_STOP_001",
         )
         self.monitor.positions["3TSMl_EQ"] = pos
@@ -256,13 +256,13 @@ class TestBrokerNativeOrders(unittest.TestCase):
         ratchets = self.monitor.apply_daily_rollover_stops()
         self.assertEqual(len(ratchets), 1)
         self.assertEqual(ratchets[0]["ticker"], "3TSMl_EQ")
-        self.assertEqual(ratchets[0]["new_sl"], 107.0)
-        self.assertEqual(pos.trailing_stop_loss, 107.0)
-        self.assertEqual(pos.stop_loss, 107.0)
+        self.assertEqual(ratchets[0]["new_sl"], 106.0)
+        self.assertEqual(pos.trailing_stop_loss, 106.0)
+        self.assertEqual(pos.stop_loss, 106.0)
         self.mock_t212.place_stop_order.assert_called_with(
             ticker="3TSMl_EQ",
             quantity=-5.0,
-            stop_price=107.0,
+            stop_price=106.0,
             time_validity="GOOD_TILL_CANCEL",
         )
 

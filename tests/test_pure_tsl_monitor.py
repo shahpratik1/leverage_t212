@@ -189,15 +189,16 @@ class TestPureTSLMonitor(unittest.TestCase):
         )
         self.monitor.positions["QQQ3l_EQ"] = pos
 
-        # Price surges to 440.0 (Peak = 440.0). Distance = max(1.2 * 5.0, 440.0 * 0.02) = max(6.0, 8.8) = 8.8 -> Stop = 431.20
+        # Price surges to 440.0 (Peak = 440.0). Runner immunity active (gain +10% >= 3%):
+        # Distance = max(2.0 * 5.0, 440.0 * 0.02) = max(10.0, 8.8) = 10.0 -> Stop = 430.00
         events = self.monitor.monitor_tick(current_prices={"QQQ3l_EQ": 440.0})
 
         self.assertEqual(pos.highest_price, 440.0)
-        self.assertEqual(pos.trailing_stop_loss, 431.20)
+        self.assertEqual(pos.trailing_stop_loss, 430.00)
         self.mock_t212.place_stop_order.assert_called_with(
             ticker="QQQ3l_EQ",
             quantity=-10.0,
-            stop_price=431.20,
+            stop_price=430.00,
             time_validity="GOOD_TILL_CANCEL",
         )
 

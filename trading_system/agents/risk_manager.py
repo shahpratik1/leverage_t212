@@ -284,6 +284,22 @@ class RiskManager:
             escape_price = tp1 + buffer
         return round(escape_price, 2)
 
+    @classmethod
+    def get_decay_atr_multiplier(cls, session_count: int = 1, is_runner: bool = False) -> float:
+        """Calculate the active ATR trailing stop multiplier with session-day decay.
+        
+        - If is_runner is True: decay is frozen at 2.00x ATR to let multi-week trends ride.
+        - Otherwise, compresses by 0.35x ATR per elapsed completed session:
+            Day 1: 2.20x ATR
+            Day 2: 1.85x ATR
+            Day 3: 1.50x ATR
+            Day 4+: 1.15x ATR (compression floor)
+        """
+        if is_runner:
+            return 2.00
+        decayed = 2.20 - (0.35 * max(0, session_count - 1))
+        return round(max(1.15, decayed), 2)
+
     def calculate_trailing_stop(
         self,
         current_price: float,
@@ -292,12 +308,15 @@ class RiskManager:
         current_tsl: float,
         direction: str = "LONG",
         ticker: str = "",
+        session_count: int = 1,
+        is_runner: bool = False,
     ) -> float:
-        """Calculate dynamic trailing stop level.
+        """Calculate dynamic trailing stop level with session-day decay envelope.
 
         The trailing stop ratchets ONLY in the favorable direction (never widens).
         """
-        distance = max(self.tsl_atr_multiplier * atr, peak_price * 0.02)
+        effective_mult = self.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+        distance = max(effective_mult * atr, peak_price * 0.02)
         is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
         if is_cfd_short:
             new_tsl = peak_price + distance
