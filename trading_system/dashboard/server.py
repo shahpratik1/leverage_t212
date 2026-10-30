@@ -182,38 +182,24 @@ def load_active_signals(
             tp2_gain_pct = abs(tp2 - entry) / entry * 100 if entry > 0 else 0.0
             tp3_gain_pct = abs(tp3 - entry) / entry * 100 if entry > 0 else 0.0
 
-            pure_tsl = getattr(settings, "PURE_TSL_MODE", True)
-            if pure_tsl:
-                if pos.get("is_closed"):
-                    status = "CLOSED"
-                    tsl_status = "Closed"
-                elif tsl >= entry and entry > 0:
-                    locked_gain = ((tsl - entry) / entry * 100.0) if direction == "LONG" else ((entry - tsl) / entry * 100.0)
-                    if locked_gain >= 1.4:
-                        status = f"TSL ACTIVE: +{locked_gain:.1f}% Locked"
-                        tsl_status = f"+{locked_gain:.1f}% Cushion Locked"
-                    else:
-                        status = "TSL ACTIVE: Break-Even Locked"
-                        tsl_status = "Break-Even Locked"
+            # Pure TSL Status Resolution (100% Ride with progressive ratchets)
+            if pos.get("is_closed"):
+                status = "CLOSED"
+                tsl_status = "Closed"
+            elif tsl > 0 and entry > 0:
+                locked_gain = ((tsl - entry) / entry * 100.0)
+                if locked_gain >= 1.4:
+                    status = f"CUSHION LOCKED (+{locked_gain:.1f}% Locked)"
+                    tsl_status = f"+{locked_gain:.1f}% Cushion Locked"
+                elif locked_gain >= -0.05:
+                    status = "BREAKEVEN LOCKED (Risk-Free Trail Active)"
+                    tsl_status = "Break-Even Locked"
                 else:
-                    status = "TSL ACTIVE: Initial Stop Active"
+                    status = "ACTIVE (Initial Stop Protection)"
                     tsl_status = "Initial Stop Active"
             else:
-                tsl_status = "Trailing Stop"
                 status = "ACTIVE"
-                tp1_armed_hysteresis = bool(pos.get("tp1_armed_hysteresis", False))
-                tp1_stop_elevated = bool(pos.get("tp1_stop_elevated", False))
-                tp1_escape_threshold = float(pos.get("tp1_escape_threshold") or 0.0)
-
-                if pos.get("is_closed"):
-                    status = "CLOSED"
-                elif pos.get("tp2_hit"):
-                    status = "TP2 HIT: Trailing Runner Active"
-                elif tp1_armed_hysteresis:
-                    esc_str = f"{currency_prefix}{tp1_escape_threshold:.2f}{currency_suffix}" if tp1_escape_threshold > 0 else "Trigger Pending"
-                    status = f"TP1 HIT: Break-Even (Hysteresis Armed @ {esc_str})"
-                elif tp1_stop_elevated or pos.get("tp1_hit"):
-                    status = "TP1 LOCKED (+1.0R Stop Active)"
+                tsl_status = "Initial Stop Active"
 
             rsi3_raw = pos.get("rsi3")
             rsi3_val = float(rsi3_raw) if rsi3_raw is not None else 100.0
@@ -251,10 +237,6 @@ def load_active_signals(
 
             stop_broker_line = f"NATIVE BROKER STOP: Trading 212 Order #{broker_stop_order_id} (Active)\n" if broker_stop_order_id else ""
 
-            tp1_armed_hysteresis = bool(pos.get("tp1_armed_hysteresis", False))
-            tp1_stop_elevated = bool(pos.get("tp1_stop_elevated", False))
-            tp1_escape_threshold = float(pos.get("tp1_escape_threshold") or 0.0)
-
             signals.append({
                 "ticker": ticker,
                 "underlying": underlying,
@@ -283,21 +265,9 @@ def load_active_signals(
                 "tsl_status": tsl_status,
                 "stop_distance_pct": round(risk_pct, 2),
                 "broker_stop_order_id": broker_stop_order_id,
-                "tp1": round(tp1, 2),
-                "tp1_pct": round(tp1_gain_pct, 2),
-                "tp2": round(tp2, 2),
-                "tp2_pct": round(tp2_gain_pct, 2),
-                "tp3": round(tp3, 2),
-                "tp3_pct": round(tp3_gain_pct, 2),
                 "quantity": original_quantity,
                 "remaining_quantity": remaining_quantity,
                 "status": status,
-                "tp1_hit": pos.get("tp1_hit", False),
-                "tp2_hit": pos.get("tp2_hit", False),
-                "tp3_hit": pos.get("tp3_hit", False),
-                "tp1_armed_hysteresis": tp1_armed_hysteresis,
-                "tp1_stop_elevated": tp1_stop_elevated,
-                "tp1_escape_threshold": round(tp1_escape_threshold, 2),
                 "entry_time": pos.get("entry_time", ""),
                 "atr": round(pos.get("atr", 0.0), 2),
                 "copy_text": (
@@ -644,18 +614,9 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                         "trailing_stop_loss": sl,
                         "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2) if avg_px > 0 else 5.0,
                         "broker_stop_order_id": None,
-                        "tp1": round(avg_px + sl_dist, 2),
-                        "tp1_pct": round(abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 5.0,
-                        "tp2": round(avg_px + 2 * sl_dist, 2),
-                        "tp2_pct": round(2 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 10.0,
-                        "tp3": round(avg_px + 3 * sl_dist, 2),
-                        "tp3_pct": round(3 * abs(sl_dist) / avg_px * 100, 2) if avg_px > 0 else 15.0,
                         "quantity": bp.quantity,
                         "remaining_quantity": bp.quantity,
                         "status": "ACTIVE (Broker Placed)",
-                        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
-                        "tp1_armed_hysteresis": False, "tp1_stop_elevated": False,
-                        "tp1_escape_threshold": 0.0,
                         "entry_time": datetime.now(timezone.utc).isoformat(),
                         "atr": round(avg_px * 0.025, 2),
                         "copy_text": f"ADOPTED: {b_ticker} ({underlying}) Qty: {bp.quantity}",

@@ -23,8 +23,10 @@ The system operates on a pure **System 2 Deliberative Multi-Agent Brain** (Techn
 3. **Multi-Regime Strategy Ensemble & Beta Decay Shield**:
    - Automated Regime Classifier routes Chop/Range (ADX < 22) to Larry Connors' 3-RSI Mean Reversion, Trending Rallies (ADX >= 25, 20 EMA > 50 EMA) to Donchian Breakout, and High-Vol Erratic regimes to capital preservation.
    - Verified on benchmark backtesting engine with **Sharpe Ratio 3.40, Profit Factor 6.86, and Win Rate 75.0%**.
-4. **Calculated Risk Gates (Spread, Beta Heat & Circuit Breaker)**:
-   - **Bid-Ask Spread Gate**: Real-time screening blocks entries when ETP relative spread $> 1.50\%$, protecting against illiquid London session spreads.
+4. **Calculated Risk Gates (Spread, Drift, Auction Buffer & Circuit Breaker)**:
+   - **15-Minute Opening Auction Buffer**: Blocks trade entries during 08:00–08:15 UTC (EU/LSE) and 14:30–14:45 UTC (US) to let opening auctions uncross and spreads normalize, preventing immediate stop-outs.
+   - **Pre-Trade Spread & Drift Gates**: Rejects setups if live broker spread $> 1.00\%$ or overnight price has drifted $> 1.50\%$ from signal generation. Recalibrates entry and stop to live quote when within limits.
+   - **Stop Invariant Gate**: Asserts that protective stops on spot holdings are strictly below current market price and resting bid ($P_{\text{stop}} < P_{\text{bid}}$), eliminating inverted stop liquidations.
    - **Currency Normalization**: Canonical EUR base conversion divides LSE GBX pence quotes by 100, enforcing a strict 20% max equity cap.
    - **Daily Circuit Breaker**: Automatically suspends trading for 24h if portfolio daily drawdown breaches $-2.0\%$.
 5. **High-Throughput In-Memory Candle Cache**:

@@ -4,8 +4,8 @@
 The Trading 212 algorithmic system is an autonomous multi-agent quantitative trading engine for leveraged equities and ETPs.
 - **Data & Indicators Layer**: `trading_system/data/` (`trading212_client.py`, `leveraged_universe.py`, `candle_db.py`). Provides market data caching, indicator computation (RSI, EMA, ADX, ATR, Donchian, Bollinger, Volatility), and live broker connectivity.
 - **Screener & Regime Layer**: `trading_system/screener/` (`laya_screener.py`). Filters universe candidates and classifies market regime (`CHOP_RANGE`, `TRENDING_BREAKOUT`, `HIGH_VOL_ERRATIC`).
-- **Agent Deliberation Layer**: `trading_system/agents/` (`technical_agent.py`, `risk_manager.py`, `debate_engine.py`). Analyzes candidates, generates strategy signals (Fast 3-RSI vs Donchian/EMA Breakout), validates risks, and sizes positions.
-- **Execution & Position Monitoring Layer**: `trading_system/orchestrator.py`, `trading_system/execution/position_monitor.py`. Places orders via Trading 212 API, tracks active trades, and manages dynamic trailing stop ratchets.
+- **Agent Deliberation Layer**: `trading_system/agents/` (`technical_agent.py`, `risk_manager.py`, `debate_engine.py`). Pure System 2 deliberative multi-agent debate (technical + fundamental + dialectic arbiter) with fast reflex bypass completely removed.
+- **Execution & Position Monitoring Layer**: `trading_system/orchestrator.py`, `trading_system/execution/position_monitor.py`. 15-minute market opening auction buffer, pre-trade drift & spread gates, 100% Pure Trailing Stop Loss engine (0% TP limits), and native Trading 212 GTC stop synchronization.
 - **Backtesting & Simulation Layer**: `trading_system/backtest/` (`engine.py`). Simulates strategy execution across historical OHLCV data and verifies statistical edge (Sharpe, Profit Factor, Win Rate).
 - **Dashboard & Operations Layer**: `trading_system/dashboard/server.py`, `scripts/deploy_to_pi.sh`. Web UI anchored to live broker equity and Raspberry Pi systemd deployment.
 
@@ -63,12 +63,13 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
 - **Output**: Recorded in `ScreenerResult.market_regime`, `TechnicalAnalysis.market_regime`, and `DecisionCard.market_regime`.
 
 ### 4. 100% Pure Trailing Stop Loss Engine & Broker Synchronization
-- **Zero Partial Trims**: 100% of shares ride the trend intact without premature exits at fixed targets.
+- **Complete Elimination of Take Profit Targets (TP1 / TP2 / TP3)**: Static profit targets and partial quantity trims (50%/25%/25%) are fully excised. 100% of shares ride the trend intact without artificial profit caps.
 - **Progressive Ratchet Rules**:
-  - At +1.5% unrealized profit: move Stop Loss to Entry Price (Breakeven).
-  - At +3.0% unrealized profit: move Stop Loss to Entry Price + 1.5% (Lock Profit Cushion).
+  - At +1.5% unrealized profit: move Stop Loss to Entry Price (Breakeven Lock — risk-free trade).
+  - At +3.0% unrealized profit: move Stop Loss to Entry Price + 1.5% (Lock Profit Cushion — guaranteed net gain).
   - Above +3.0% unrealized profit: dynamic ATR Chandelier trail follows peak price ($P_{\text{peak}} - 1.2 \times \text{ATR}$).
 - **Single GTC Stop Protection**: Eliminates broker order contention (`400 Bad Request: 'Selling more equities than owned'`). 100% of shares are protected under a single server-side GTC Stop on Trading 212.
+- **Market Opening Auction Buffer & Drift Gates**: 15-minute execution buffer on market open (08:00–08:15 UTC for EU/LSE, 14:30–14:45 UTC for US), pre-trade spread gate (<1.00%), and overnight price drift gate (<1.50%).
 - **Asymmetric Session Isolation**: Intraday shorts flatten at 16:20 UTC (Winter Time / GMT aware); longs with locked breakeven stops carry overnight.
 
 ### 5. Backtest Benchmark Targets

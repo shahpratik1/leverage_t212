@@ -18,9 +18,9 @@ The platform monitors global equities, broad market indices, sovereign bonds, co
 | **Currency Preference** | **82%+ EUR Natively** | EUR-first policy eliminating FX currency conversion fees for EU accounts |
 | **Ingestion Latency** | **<10ms Triage** | Parallel multi-worker async pipeline + local SQLite WAL candle database |
 | **Cognitive Framework** | **Deliberative Multi-Agent Brain** | Pure System 2 Multi-Agent Dialectic (Technical + Fundamental + Sentiment + Forecast) without speculative bypass |
-| **Risk Containment** | **7 Multi-Layer Gates** | Circuit breaker (-2% equity), 48h earnings blackout, spread filter, synthetic safety gate |
-| **Execution Safety** | **Crash-Proof Hybrid** | Native broker-side GTC Stops placed immediately at fill + single order 100% quantity protection |
-| **Target Lifecycle** | **100% Pure Trailing Stop Loss** | Progressive ratchets (+1.5% Breakeven, +3.0% Cushion, ATR Chandelier Trail) with 100% quantity ride (0% partial trims) |
+| **Risk Containment** | **9 Multi-Layer Gates** | Circuit breaker (-2% equity), 15m opening auction buffer, spread gate (<1.0%), drift gate (<1.5%), 48h earnings blackout |
+| **Execution Safety** | **Crash-Proof Native GTC** | Native broker-side GTC Stops placed immediately at fill + single order 100% quantity protection |
+| **Target Lifecycle** | **100% Pure Trailing Stop Loss** | Progressive ratchets (+1.5% Breakeven, +3.0% Cushion, ATR Chandelier Trail) with 100% quantity ride (0% TP limits / trims) |
 | **Overnight Policy** | **16:20 UTC Protocol** | Asymmetric gap isolation: intraday shorts flatten; winners with breakeven/cushion stops carry |
 | **Statistical Edge** | **Sharpe 3.40 / PF 6.86 / WR 75%** | Verified walk-forward benchmark simulator across curated 3x leveraged universe |
 | **Test Verification** | **606 Automated Tests (100% Pass)** | 405 unit tests + 201 opaque-box E2E tests (Tiers 1-4) with 0 regressions |
@@ -70,7 +70,7 @@ flowchart TD
     subgraph Quantitative Risk Management
         DEBATE_SYNTH --> RISK_MGR["RiskManager\n(0.5% Equity Risk / Kelly ATR Sizing)"]
         
-        RISK_MGR --> GATES{"Pre-Trade Safety Gates\n- Daily Drawdown (-2.0%)\n- 48h Earnings Blackout\n- Bid-Ask Spread Gate (<0.35%)\n- ETP Direction Gate (No Long on Short)\n- Synthetic Data Gate"}
+        RISK_MGR --> GATES{"Pre-Trade Safety Gates\n- Daily Drawdown (-2.0%)\n- 15m Opening Auction Settlement Buffer\n- Pre-Trade Live Spread Gate (<1.00%)\n- Stale Overnight Drift Gate (<1.50%)\n- Stop Invariant Gate (Stop < Price)\n- 48h Earnings Blackout\n- Direction Gate (No Long on Short)\n- Synthetic Data Gate"}
         GATES -->|Pass| CARD["DecisionCard\n(Validated Order Intent)"]
         GATES -->|Fail| REJECT["Order Rejected / Logged\n(Safety Violation Prevented)"]
     end
@@ -184,15 +184,17 @@ The market data layer is decoupled into specialized providers with a persistent 
 * **`trading_system/agents/risk_manager.py`**:
   * **Strict Volatility-Scaled Sizing**:
     $$\text{Shares} = \frac{\text{Equity} \times 0.5\%}{\text{ATR Stop Distance}}$$
-    Constrained by maximum position notional ($\le 5\%$ of equity) and broker minimum trade sizes.
-  * **The 7 Non-Negotiable Safety Gates**:
+    Constrained by maximum position notional ($\le 20\%$ of equity) and broker minimum trade sizes.
+  * **The 9 Non-Negotiable Safety Gates**:
     1. **Daily Drawdown Circuit Breaker**: If equity drops $\ge 2.0\%$ from session start, triggers emergency system halt and halts new order submission.
-    2. **Pre-Trade Earnings Blackout Gate**: Rejects trades if company earnings are scheduled within $\le 48\text{ hours}$ (eliminates binary earnings-gap risk).
-    3. **Real-Time Bid-Ask Spread Gate**: Queries real-time spread before order submission; rejects orders if spread exceeds $0.35\%$ ($0.50\%$ for commodities) to prevent transaction cost drag.
-    4. **Direction Integrity Safety Gate**: Validates that a `SHORT` signal maps to an inverse short ETP. Forbids buying a Long ETP on a Short signal. Rejects trades if no short ETP exists.
-    5. **Synthetic Market Data Gate**: Intercepts and aborts live broker execution if incoming price feeds were generated synthetically (dry-run simulation only).
-    6. **Market Session Hours Gate**: Rejects orders if the destination exchange (LSE, Euronext, Xetra) is currently closed.
-    7. **Portfolio Cluster Concentration Gate**: Limits concurrent exposure to a maximum of 2 positions per sector or thematic cluster.
+    2. **15-Minute Market Opening Auction Settlement Buffer**: Blocks new trade execution during 08:00–08:15 UTC (European / LSE markets) and 14:30–14:45 UTC (US markets) to allow opening auctions to uncross and spreads to settle, eliminating immediate opening stop-outs.
+    3. **Pre-Trade Real-Time Bid-Ask Spread Gate (< 1.00%)**: Queries real-time broker spread immediately prior to order submission; rejects orders if spread exceeds $1.00\%$ to prevent adverse selection and slippage.
+    4. **Stale Overnight Price Drift Gate (< 1.50%)**: Validates live broker quote against candidate setup entry price. Rejects orders if price has drifted $> 1.50\%$ due to overnight gaps. If drift $\le 1.50\%$, recalibrates entry price and stop loss to live market quote.
+    5. **Stop Invariant Protection Gate**: Strictly asserts that for spot holdings, Stop Loss must be strictly below current market price and resting bid ($P_{\text{stop}} < P_{\text{bid}}$). Prevents submitting inverted stops that would trigger instant market liquidation.
+    6. **Pre-Trade Earnings Blackout Gate**: Rejects trades if company earnings are scheduled within $\le 48\text{ hours}$ (eliminates binary earnings-gap risk).
+    7. **Direction Integrity Safety Gate**: Validates that a `SHORT` signal maps to an inverse short ETP. Forbids buying a Long ETP on a Short signal. Rejects trades if no short ETP exists.
+    8. **Synthetic Market Data Gate**: Intercepts and aborts live broker execution if incoming price feeds were generated synthetically (dry-run simulation only).
+    9. **Market Session Hours Gate**: Rejects orders if the destination exchange (LSE, Euronext, Xetra) is currently closed.
 
 ---
 
@@ -244,12 +246,15 @@ stateDiagram-v2
     RiskStopHit --> Closed: Initial Capital Preserved
 ```
 
-* **Dynamic Progressive Ratchet Mechanics**:
-  * **100% Quantity Retention**: Positions ride favorable trends with their entire quantity intact (`100% Ride`). No partial shares are trimmed early at fixed targets.
-  * **+1.5% Breakeven Lock**: Once price advances $+1.5\%$, stop loss ratchets to `entry_price`, guaranteeing zero capital risk.
-  * **+3.0% Cushion Lock**: Once price advances $+3.0\%$, stop loss ratchets to `entry_price * 1.015`, securing $+1.5\%$ net profit.
-  * **Dynamic ATR Chandelier Trail**: Above $+3.0\%$ profit, dynamic trailing stop follows peak prices ($P_{\text{peak}} - 1.2 \times \text{ATR}$ for longs).
-  * **Adaptive Technical Tightening**: On Connors 3-RSI overbought, SMA5 cross, or Nixtla inflection, TSL is tightened aggressively to lock unrealized gains rather than taking partial trims.
+* **Complete Elimination of Take Profit Targets (TP1 / TP2 / TP3)**:
+  * Static profit milestones (TP1 +1.0R, TP2 +2.0R, TP3 +3.0R) and partial profit trims (50% / 25% / 25%) have been completely excised from the production engine.
+  * In leveraged momentum trading, capping winners early at arbitrary multiples truncates the right-tail return distribution, while placing broker-side TP limit orders creates severe order contention (`Trading 212 Error 400: Selling more equities than owned`).
+  * The architecture now relies exclusively on **100% Pure Trailing Stop Loss (TSL)**:
+    1. **Phase 1: Capital Defense**: Server-side GTC stop loss placed immediately upon fill at entry $- 2.2 \times \text{ATR}$ (capped at 3.0% max stop distance).
+    2. **Phase 2: Breakeven Lock (+1.5% Gain)**: Once unrealized profit reaches $+1.5\%$, the stop loss ratchets to `entry_price`, guaranteeing a risk-free trade while keeping 100% of shares intact.
+    3. **Phase 3: Profit Cushion Lock (+3.0% Gain)**: Once unrealized profit reaches $+3.0\%$, the stop loss ratchets to `entry_price * 1.015`, locking in $+1.5\%$ minimum net profit on 100% of the position.
+    4. **Phase 4: Dynamic ATR Chandelier Trail (> +3.0% Gain)**: Above $+3.0\%$, the stop trails behind peak market prices ($P_{\text{peak}} - 1.2 \times \text{ATR}$), continuously ratcheting upward on new highs and never loosening.
+    5. **100% Position Liquidation**: The position runs until the market reverses into the tightened broker GTC stop, banking maximal trend gains.
 * **Broker Order Contention Elimination**:
   * Resolves Trading 212 Invest API restriction where simultaneous stop and limit orders on identical shares produce `400 Bad Request: 'Selling more equities than owned'`.
   * All shares are protected under a single server-side GTC Stop Order that updates monotonically.

@@ -131,21 +131,6 @@ class DebateEngine:
             logger.error(f"Error during TradingAgents debate: {e}. Falling back to analytical arbiter.")
             return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
 
-    def _speculative_fast_route(
-        self,
-        ticker: str,
-        metrics: Dict[str, Any],
-        technical_report: str,
-        fundamental_report: str,
-        strategy_type: str = "momentum",
-    ) -> DebateOutcome:
-        """Deprecated: Fast reflex routing removed in favor of full System 2 multi-agent deliberation."""
-        logger.warning(
-            "⚡ [Deprecated] _speculative_fast_route called for %s — redirecting to System 2 deliberative debate",
-            ticker,
-        )
-        return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
-
     def _fallback_debate(
         self,
         ticker: str,
