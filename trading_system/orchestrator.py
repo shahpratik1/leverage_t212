@@ -617,15 +617,93 @@ class Orchestrator:
             )
             self._log_trade(card, executed=False, reason="Blocked by Safety Interceptor: Market data was synthetic")
             return False
-        # ── Pre-Execution Market Hours Gate ──────────────────────
-        if not self.dry_run and not self.t212.is_market_open(card.trading212_ticker):
-            info = Trading212Client.get_market_session_info(card.trading212_ticker)
-            logger.warning(
-                "Execution held: Market for %s (%s) is CLOSED right now (%s UTC, current %s UTC). Refusing to submit rejected order.",
-                card.trading212_ticker, info["exchange"], info["open_time_utc"], info["current_time_utc"]
-            )
-            self._log_trade(card, executed=False, reason=f"Market closed ({info['exchange']} session: {info['open_time_utc']}-{info['close_time_utc']} UTC)")
-            return False
+        # ── Pre-Execution Market Hours Gate & Auction Buffer ─────
+        if not self.dry_run:
+            if not self.t212.is_market_open(card.trading212_ticker):
+                info = Trading212Client.get_market_session_info(card.trading212_ticker)
+                logger.warning(
+                    "Execution held: Market for %s (%s) is CLOSED right now (%s UTC, current %s UTC). Refusing to submit rejected order.",
+                    card.trading212_ticker, info["exchange"], info["open_time_utc"], info["current_time_utc"]
+                )
+                self._log_trade(card, executed=False, reason=f"Market closed ({info['exchange']} session: {info['open_time_utc']}-{info['close_time_utc']} UTC)")
+                return False
+
+            # 15-Minute Market Opening Auction Settlement Buffer:
+            # During the first 15 minutes after market open (e.g. 08:00-08:15 UTC for LSE, 14:30-14:45 UTC for US),
+            # opening auctions uncross and spreads blow out (often 5-10%), causing instantaneous stop-outs.
+            session_info = Trading212Client.get_market_session_info(card.trading212_ticker)
+            if session_info.get("exchange") != "CRYPTO":
+                now_utc = datetime.now(timezone.utc)
+                open_parts = [int(p) for p in session_info.get("open_time_utc", "08:00").split(":")]
+                market_open_dt = now_utc.replace(hour=open_parts[0], minute=open_parts[1], second=0, microsecond=0)
+                minutes_since_open = (now_utc - market_open_dt).total_seconds() / 60.0
+                if 0 <= minutes_since_open < 15.0:
+                    logger.warning(
+                        "Execution held: %s (%s) is within the 15-minute opening auction buffer "
+                        "(opened %s UTC, elapsed %.1f mins < 15 mins). "
+                        "Preventing entry into wide opening auction spreads.",
+                        card.trading212_ticker, session_info.get("exchange"),
+                        session_info.get("open_time_utc"), minutes_since_open
+                    )
+                    self._log_trade(
+                        card, executed=False,
+                        reason=f"Opening auction buffer ({session_info.get('exchange')} opened {session_info.get('open_time_utc')} UTC, {minutes_since_open:.1f}m < 15m)"
+                    )
+                    return False
+
+            # ── Pre-Trade Live Broker Quote & Drift Cross-Check ──────────
+            try:
+                live_quote = self.t212.get_quote(card.trading212_ticker)
+                live_ask = float(live_quote.get("ask", 0.0) or 0.0)
+                live_bid = float(live_quote.get("bid", 0.0) or 0.0)
+                live_mid = float(live_quote.get("mid", 0.0) or 0.0)
+                spread_pct = float(live_quote.get("spread_pct", 0.0) or 0.0)
+
+                # 1. Spread Check: Max acceptable spread is 1.00% (0.010)
+                if live_ask > 0 and live_bid > 0:
+                    calc_spread = (live_ask - live_bid) / live_ask
+                    spread_pct = max(spread_pct, calc_spread)
+
+                if spread_pct > 0.010:  # > 1.0%
+                    logger.warning(
+                        "Execution rejected: %s bid/ask spread %.2f%% exceeds 1.00%% safety threshold "
+                        "(bid=%.4f, ask=%.4f). Refusing to execute into wide spread.",
+                        card.trading212_ticker, spread_pct * 100.0, live_bid, live_ask
+                    )
+                    self._log_trade(
+                        card, executed=False,
+                        reason=f"Wide bid/ask spread: {spread_pct * 100.0:.2f}% > 1.00% limit (bid={live_bid}, ask={live_ask})"
+                    )
+                    return False
+
+                # 2. Overnight / Stale Price Drift Check: Max allowable drift from setup entry price is 1.5%
+                ref_price = live_ask if live_ask > 0 else (live_mid if live_mid > 0 else live_bid)
+                if ref_price > 0 and card.entry_price > 0:
+                    drift_pct = abs(ref_price - card.entry_price) / card.entry_price
+                    if drift_pct > 0.015:  # > 1.5%
+                        logger.warning(
+                            "Execution rejected: %s live quote (%.4f) drifted %.2f%% from setup entry price (%.4f) "
+                            "(threshold: 1.50%%). Setup from overnight/prior close is stale.",
+                            card.trading212_ticker, ref_price, drift_pct * 100.0, card.entry_price
+                        )
+                        self._log_trade(
+                            card, executed=False,
+                            reason=f"Stale price drift: {drift_pct * 100.0:.2f}% > 1.50% threshold (live={ref_price}, setup={card.entry_price})"
+                        )
+                        return False
+
+                    # If within 1.5% drift, recalibrate entry_price and stop_loss to live quote
+                    old_entry = card.entry_price
+                    card.entry_price = ref_price
+                    if card.stop_loss > 0 and old_entry > 0:
+                        sl_ratio = card.stop_loss / old_entry
+                        card.stop_loss = round(ref_price * sl_ratio, 4)
+                        logger.info(
+                            "Recalibrated %s to live market quote: entry $%.4f -> $%.4f, SL $%.4f (drift %.2f%%)",
+                            card.trading212_ticker, old_entry, card.entry_price, card.stop_loss, drift_pct * 100.0
+                        )
+            except Exception as quote_exc:
+                logger.debug("Pre-trade live quote validation skipped due to lookup error: %s", quote_exc)
 
         # ── Execute Entry Order on Trading 212 ───────────────────
         order_id = "DRY_RUN_ORDER"
@@ -705,7 +783,8 @@ class Orchestrator:
 
         # ── Place Native Broker GTC Stop & Limit Orders on Trading 212 ────
         self.position_monitor.place_broker_stop(pos)
-        self.position_monitor.place_broker_tp_limit(pos)
+        if not getattr(self.position_monitor, "pure_tsl_mode", False):
+            self.position_monitor.place_broker_tp_limit(pos)
 
         # ── Dispatch Real-Time Notifications ─────────────────────
         notif_price = pos.entry_price

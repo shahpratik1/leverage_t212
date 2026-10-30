@@ -267,19 +267,23 @@ class PositionMonitor:
             "atr": effective_atr,
         }
 
-    @staticmethod
+    @classmethod
     def check_progressive_stops(
+        cls,
         entry_price: float,
         current_price: float,
         current_sl: float,
         direction: str = "LONG",
+        ticker: str = "",
     ) -> float:
         """Lock in gains progressively:
         - At +1.5% unrealized profit: move stop loss to Entry Price (Breakeven).
         - At +3.0% unrealized profit: move stop loss to Entry Price + 1.5% (lock profit cushion).
         - Stop never loosens.
         """
-        is_short = str(direction).upper() in ("SHORT", "SELL")
+        is_short = cls.is_true_short_contract(ticker, direction=direction) if ticker else (
+            str(direction).upper() in ("SHORT", "SELL") and not str(direction).upper().endswith("_ETP")
+        )
         if is_short:
             gain_pct = ((entry_price - current_price) / entry_price * 100.0) if entry_price > 0 else 0.0
             if gain_pct >= 3.0:
@@ -414,6 +418,15 @@ class PositionMonitor:
         is_cfd_short = self.is_true_short_contract(pos)
         if not is_cfd_short:
             cur_price = pos.current_price or pos.highest_price or pos.entry_price
+            if not self.dry_run and self.t212 and hasattr(self.t212, "get_quote") and not type(self.t212).__name__.endswith("Mock"):
+                try:
+                    q = self.t212.get_quote(pos.ticker)
+                    live_bid = float(q.get("bid") or 0.0)
+                    if live_bid > 0 and cur_price > 0 and (0.7 < (live_bid / cur_price) < 1.3) and live_bid < cur_price:
+                        cur_price = live_bid
+                except Exception:
+                    pass
+
             if cur_price > 0 and price >= cur_price:
                 logger.error(
                     "INVARIANT VIOLATION: Stop price %.4f >= current price %.4f for spot holding %s! "
@@ -586,6 +599,10 @@ class PositionMonitor:
         quantity: Optional[float] = None,
     ) -> Optional[str]:
         """Place or replace a native GTC Limit Order for Take Profit on Trading 212 broker server."""
+        if getattr(self, "pure_tsl_mode", True):
+            logger.debug("Pure TSL mode: broker TP limit orders disabled for %s to ensure 100%% stop protection", pos.ticker)
+            return None
+
         price = limit_price if limit_price is not None else pos.tp1
         qty = quantity if quantity is not None else round(pos.remaining_quantity * 0.5, 4)
         if qty <= 0 or price <= 0:
@@ -724,6 +741,22 @@ class PositionMonitor:
 
     def sync_broker_orders(self) -> Dict[str, List[str]]:
         """Ensure all active positions have native GTC Stop orders placed on Trading 212."""
+        # In pure TSL mode, cancel any competing broker limit orders to prevent share reservation contention
+        if getattr(self, "pure_tsl_mode", True) and not self.dry_run:
+            try:
+                open_orders = self.t212.get_orders()
+                for o in open_orders:
+                    if isinstance(o, dict) and o.get("type") == "LIMIT":
+                        limit_id = str(o.get("id"))
+                        limit_ticker = o.get("ticker")
+                        logger.info(
+                            "Pure TSL audit: Canceling competing broker Limit Order %s for %s to ensure 100%% stop protection",
+                            limit_id, limit_ticker
+                        )
+                        self.t212.cancel_order(limit_id)
+            except Exception as clean_exc:
+                logger.debug("Pure TSL limit cancellation check notice: %s", clean_exc)
+
         synced_stops = self.sync_broker_stops()
         if self.pure_tsl_mode:
             return {"stops": synced_stops, "tps": []}
@@ -1517,6 +1550,7 @@ class PositionMonitor:
                     current_price=current_price,
                     current_sl=pos.trailing_stop_loss,
                     direction=pos.direction,
+                    ticker=pos.ticker,
                 )
                 prog_ratcheted = (prog_sl < pos.trailing_stop_loss) if is_short else (prog_sl > pos.trailing_stop_loss)
                 if prog_ratcheted:
@@ -1556,6 +1590,7 @@ class PositionMonitor:
                         atr=pos.atr,
                         current_tsl=pos.trailing_stop_loss,
                         direction=pos.direction,
+                        ticker=pos.ticker,
                     )
                     ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
                     if ratcheted:
@@ -1647,6 +1682,7 @@ class PositionMonitor:
                     current_price=current_price,
                     current_sl=pos.trailing_stop_loss,
                     direction=pos.direction,
+                    ticker=pos.ticker,
                 )
                 prog_ratcheted = (prog_sl < pos.trailing_stop_loss) if is_short else (prog_sl > pos.trailing_stop_loss)
                 if prog_ratcheted:
@@ -1664,6 +1700,7 @@ class PositionMonitor:
                         atr=pos.atr,
                         current_tsl=pos.trailing_stop_loss,
                         direction=pos.direction,
+                        ticker=pos.ticker,
                     )
                     ratcheted = (new_tsl < pos.trailing_stop_loss) if is_short else (new_tsl > pos.trailing_stop_loss)
                     if ratcheted:

@@ -17,6 +17,7 @@ class TestBrokerNativeOrders(unittest.TestCase):
             risk_manager=self.mock_rm,
             dry_run=False,
             state_file=":memory:",
+            pure_tsl_mode=False,
         )
         # Avoid disk writes
         self.monitor._save_state = MagicMock()
@@ -135,6 +136,7 @@ class TestBrokerNativeOrders(unittest.TestCase):
             risk_manager=self.mock_rm,
             dry_run=True,
             state_file=":memory:",
+            pure_tsl_mode=False,
         )
         monitor_dry._save_state = MagicMock()
 

@@ -1447,10 +1447,18 @@ class MarketDataProvider:
                     is_milan_or_exotic = clean.endswith(".MI") or raw_sym.endswith("m_EQ") or any(k in raw_sym for k in ("WTI", "BRL", "CFL", "WHL", "NGL"))
                     mult = 4.0 if is_milan_or_exotic else 1.5
                     proxy_pct = round(und_spread["spread_pct"] * mult, 4)
+                    if regular_price > 0:
+                        mid_px = regular_price
+                        return {
+                            "bid": round(mid_px * (1.0 - proxy_pct / 2.0), 4),
+                            "ask": round(mid_px * (1.0 + proxy_pct / 2.0), 4),
+                            "mid": mid_px,
+                            "spread_pct": proxy_pct,
+                        }
                     return {
-                        "bid": round(und_spread.get("bid", 0.0), 4),
-                        "ask": round(und_spread.get("ask", 0.0), 4),
-                        "mid": und_spread.get("mid", 0.0),
+                        "bid": 0.0,
+                        "ask": 0.0,
+                        "mid": 0.0,
                         "spread_pct": proxy_pct,
                     }
         except Exception:

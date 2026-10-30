@@ -202,33 +202,57 @@ class RiskManager:
                     self.loss_cooldowns.pop(sym, None)
         return False, 0.0
 
-    def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG") -> float:
+    @staticmethod
+    def is_true_short_contract(ticker: str = "", direction: str = "") -> bool:
+        """Return True only if position is a margin/CFD short where falling price is profit.
+
+        For all Trading 212 Invest assets (including 3x and 5x inverse ETPs),
+        shares are held long, so rising ETP price is profit and Stop Loss must be BELOW live price.
+        """
+        dir_u = str(direction or "").upper()
+        if dir_u in ("LONG", "BUY"):
+            return False
+        t_u = str(ticker or "").upper()
+        if (
+            t_u.endswith("_EQ")
+            or t_u.endswith(".L")
+            or "_ETP" in t_u
+            or dir_u.endswith("_ETP")
+            or t_u.startswith("3")
+            or t_u.startswith("5")
+        ):
+            return False
+        return dir_u in ("SHORT", "SELL")
+
+    def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG", ticker: str = "") -> float:
         """Calculate stop loss based on ATR, bounded between min_sl_pct and max_sl_pct.
 
         For LONG:  SL = Entry - clamp(multiplier * ATR, Entry * min_sl_pct, Entry * max_sl_pct)
         For SHORT (if CFD): SL = Entry + clamp(multiplier * ATR, Entry * min_sl_pct, Entry * max_sl_pct)
-        Note: When buying an Inverse 3x ETP, treat the ETP as a Long position with respect to its own price.
+        Note: When buying an Inverse 3x/5x ETP, treat the ETP as a Long position with respect to its own price.
         """
         raw_sl_distance = max(self.atr_sl_multiplier * atr, entry_price * self.min_sl_pct)
         max_distance = entry_price * getattr(self, "max_sl_pct", 0.03)
         sl_distance = min(raw_sl_distance, max_distance)
-        if direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP"):
+        is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
+        if is_cfd_short:
             stop_loss = entry_price + sl_distance
         else:
             stop_loss = max(0.01, entry_price - sl_distance)
         return round(stop_loss, 2)
 
     def calculate_take_profits(
-        self, entry_price: float, stop_loss: float, direction: str = "LONG"
+        self, entry_price: float, stop_loss: float, direction: str = "LONG", ticker: str = ""
     ) -> Tuple[float, float, float]:
         """Calculate multiple take profit levels based on Risk (R).
 
         R = abs(entry_price - stop_loss)
         For LONG:  TP = Entry + (multiplier * R)
-        For SHORT: TP = Entry - (multiplier * R)
+        For SHORT (if CFD): TP = Entry - (multiplier * R)
         """
         r_distance = abs(entry_price - stop_loss)
-        if direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP"):
+        is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
+        if is_cfd_short:
             tp1 = max(0.01, entry_price - (self.tp1_r * r_distance))
             tp2 = max(0.01, entry_price - (self.tp2_r * r_distance))
             tp3 = max(0.01, entry_price - (self.tp3_r * r_distance))
@@ -244,6 +268,7 @@ class RiskManager:
         atr: float,
         direction: str = "LONG",
         multiplier: Optional[float] = None,
+        ticker: str = "",
     ) -> float:
         """Calculate the escape threshold for Schmitt Hysteresis past TP1.
 
@@ -252,7 +277,8 @@ class RiskManager:
         """
         mult = multiplier if multiplier is not None else self.tsl_hysteresis_atr_mult
         buffer = mult * atr if atr > 0 else tp1 * 0.015
-        if direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP"):
+        is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
+        if is_cfd_short:
             escape_price = max(0.01, tp1 - buffer)
         else:
             escape_price = tp1 + buffer
@@ -265,13 +291,15 @@ class RiskManager:
         atr: float,
         current_tsl: float,
         direction: str = "LONG",
+        ticker: str = "",
     ) -> float:
         """Calculate dynamic trailing stop level.
 
         The trailing stop ratchets ONLY in the favorable direction (never widens).
         """
         distance = max(self.tsl_atr_multiplier * atr, peak_price * 0.02)
-        if direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP"):
+        is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
+        if is_cfd_short:
             new_tsl = peak_price + distance
             # For short, lower is better; ratchet down
             return round(min(current_tsl, new_tsl) if current_tsl > 0 else new_tsl, 2)
@@ -280,19 +308,21 @@ class RiskManager:
             # For long, higher is better; ratchet up
             return round(max(current_tsl, new_tsl), 2)
 
-    @staticmethod
+    @classmethod
     def calculate_progressive_trailing_stop(
+        cls,
         entry_price: float,
         current_price: float,
         current_sl: float,
         direction: str = "LONG",
+        ticker: str = "",
     ) -> float:
         """Lock in gains progressively:
         - At +1.5% unrealized profit: move stop loss to Entry Price (Breakeven).
         - At +3.0% unrealized profit: move stop loss to Entry Price + 1.5% (lock profit cushion).
         - Stop never loosens.
         """
-        is_short = direction.upper() in ("SHORT", "SELL") and not direction.upper().endswith("_ETP")
+        is_short = cls.is_true_short_contract(ticker=ticker, direction=direction)
         if is_short:
             gain_pct = ((entry_price - current_price) / entry_price * 100.0) if entry_price > 0 else 0.0
             if gain_pct >= 3.0:
@@ -508,11 +538,15 @@ class RiskManager:
                 leverage=resolved_leverage,
             )
 
-        stop_loss = self.calculate_stop_loss(actual_entry_price, etp_atr, direction=direction)
+        stop_loss = self.calculate_stop_loss(
+            actual_entry_price, etp_atr, direction=direction, ticker=sanitized_t212_ticker
+        )
         stop_distance_pct = (
             abs(actual_entry_price - stop_loss) / actual_entry_price if actual_entry_price > 0 else 0.0
         )
-        tp1, tp2, tp3 = self.calculate_take_profits(actual_entry_price, stop_loss, direction=direction)
+        tp1, tp2, tp3 = self.calculate_take_profits(
+            actual_entry_price, stop_loss, direction=direction, ticker=sanitized_t212_ticker
+        )
 
         consensus = getattr(debate_outcome, "consensus_decision", "DO_NOT_TRADE")
         conviction_score = getattr(debate_outcome, "conviction_score", 0.0)
