@@ -35,9 +35,13 @@ ssh "$PI_DEST" "mkdir -p $REMOTE_DIR"
 echo "Syncing .env configuration to Pi..."
 scp .env "$PI_DEST:$REMOTE_DIR/.env"
 
-# 3. Sync recalibrated active_trades.json to Pi
-echo "Syncing recalibrated active_trades.json to Pi..."
-scp active_trades.json "$PI_DEST:$REMOTE_DIR/active_trades.json"
+# 3. Sync active_trades.json only if remote does not exist
+if ssh "$PI_DEST" "[ ! -f $REMOTE_DIR/active_trades.json ]"; then
+  echo "Seeding initial active_trades.json to Pi..."
+  scp active_trades.json "$PI_DEST:$REMOTE_DIR/active_trades.json"
+else
+  echo "Preserving live active_trades.json on Pi (not overwriting runtime positions)..."
+fi
 
 # 4. Sync application code (excluding runtime state, logs, and git)
 echo "Syncing code files..."
