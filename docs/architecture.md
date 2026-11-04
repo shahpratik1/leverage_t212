@@ -18,12 +18,14 @@ The platform monitors global equities, broad market indices, sovereign bonds, co
 | **Currency Preference** | **82%+ EUR Natively** | EUR-first policy eliminating FX currency conversion fees for EU accounts |
 | **Ingestion Latency** | **<10ms Triage** | Parallel multi-worker async pipeline + local SQLite WAL candle database |
 | **Cognitive Framework** | **Deliberative Multi-Agent Brain** | Pure System 2 Multi-Agent Dialectic (Technical + Fundamental + Sentiment + Forecast) without speculative bypass |
+| **Quantitative Strategy** | **Directional Trend (Sole Strategy)** | Isolated pluggable Strategy Engine (`trading_system/strategies/`); DMI (+DI/-DI) polarity gating + 20/50 EMA slope hierarchy + Dual-Track Bear execution |
 | **Risk Containment** | **9 Multi-Layer Gates** | Circuit breaker (-2% equity), 15m opening auction buffer, spread gate (<1.0%), drift gate (<1.5%), 48h earnings blackout |
 | **Execution Safety** | **Crash-Proof Native GTC** | Native broker-side GTC Stops placed immediately at fill + single order 100% quantity protection |
 | **Target Lifecycle** | **100% Pure Trailing Stop Loss** | Progressive ratchets (+1.5% Breakeven, +3.0% Cushion, ATR Chandelier Trail) with 100% quantity ride (0% TP limits / trims) |
 | **Overnight Policy** | **16:20 UTC Protocol** | Asymmetric gap isolation: intraday shorts flatten; winners with breakeven/cushion stops carry |
 | **Statistical Edge** | **Sharpe 3.40 / PF 6.86 / WR 75%** | Verified walk-forward benchmark simulator across curated 3x leveraged universe |
-| **Test Verification** | **606 Automated Tests (100% Pass)** | 405 unit tests + 201 opaque-box E2E tests (Tiers 1-4) with 0 regressions |
+| **Order Reconciliation**| **Pre-Flight Queue Purge** | Automatically cancels stale market orders (>300s or closed market) and deduplicates in-flight entries |
+| **Test Verification** | **437 Automated Tests (100% Pass)** | Comprehensive unit and opaque-box E2E suites passing with zero regressions |
 | **Deployment** | **24/7 Hardened Linux Daemon** | Raspberry Pi 5 runner via `systemd`, SSE live dashboard, atomic state persistence |
 
 ---
@@ -47,8 +49,8 @@ flowchart TD
         UNIV["LeveragedUniverse\n(120+ 3x/5x Curated Pairs)"] --> PARALLEL["Parallel Ingestion Engine\n(24 Thread Workers)"]
         CANDLE_DB --> PARALLEL
         T212_API --> PARALLEL
-        PARALLEL --> SCREENER["Candidate Pre-Filter\n(Larry Connors 3-RSI + ADX Momentum)"]
-        SCREENER --> CANDIDATES["Qualified Universe Candidates\n(Top N Ranked Setups)"]
+        PARALLEL --> SCREENER["Candidate Pre-Filter & Strategy Engine\n(Directional Trend: DMI Polarity + 20/50 EMA Slope)"]
+        SCREENER --> CANDIDATES["Qualified Universe Candidates\n(Top N Ranked Directional Setups)"]
     end
 
     subgraph System 2: Deliberative Multi-Agent Brain
@@ -76,7 +78,7 @@ flowchart TD
     end
 
     subgraph Hybrid Broker Execution
-        CARD --> ORCH["Orchestrator Engine"]
+        CARD --> ORCH["Orchestrator Engine\n(Pre-Flight Order Queue Reconciliation & Deduplication)"]
         ORCH --> T212_EXEC["Trading 212 Client\n(Spot Market Order Q > 0)"]
         T212_EXEC --> BROKER_STOP["Broker Server Stop Order\n(POST /equity/orders/stop GTC)"]
         T212_EXEC --> POS_MON["PositionMonitor\n(Lifecycle Manager)"]
@@ -148,21 +150,33 @@ The market data layer is decoupled into specialized providers with a persistent 
 
 ---
 
-### 3.3 Universe Candidate Pre-Filtering & Screening Layer
+### 3.3 Pluggable Strategy Engine & Directional Trend Layer
 
+* **`trading_system/strategies/`**:
+  * **Abstract Strategy Protocol (`base.py`)**:
+    * Introduces `@runtime_checkable` `BaseStrategy` Protocol with `evaluate_candidate(ticker: str, metrics: Dict[str, Any]) -> StrategySignal`.
+    * Encapsulates candidate evaluation into `StrategySignal` (`direction`, `conviction`, `setup_quality`, `bull_evidence`, `bear_evidence`, `catalyst_risk`). Decouples strategy mathematics from the screener and multi-agent debate.
+  * **Central Strategy Registry (`registry.py`)**:
+    * Provides `@StrategyRegistry.register("name")` factory, allowing zero-touch strategy swapping via `ACTIVE_STRATEGY = "directional_trend"` in `config.py`.
+* **Directional Trend Strategy (`directional_trend.py`)**:
+  * **Directional Movement Index (DMI) Polarity Gating**:
+    * Evaluates dominant directional pressure: $+DI > -DI$ with $ADX \ge 18.0$ for Longs; $-DI > +DI$ with $ADX \ge 18.0$ for Shorts.
+    * Eliminates non-directional momentum errors where crashing assets previously awarded ADX strength to the bullish case.
+  * **Multi-Timeframe 20/50 EMA Slope Hierarchy**:
+    * Long entries strictly require: $\text{Close} > 50\text{ EMA}$, $20\text{ EMA} \ge 50\text{ EMA}$, and positive 5-day slope ($\text{slope}_{20} > 0\%$).
+    * Macro trend tailwind: $\text{Close} > 200\text{ SMA}$.
+    * Eliminates counter-trend knife catching: forbidding dip buying into sustained intermediate downtrends.
+  * **MACD Divergence Conflict Gating**:
+    * Rejects long entries when MACD line is below signal line (`macd < macd_signal`); rejects short entries when MACD is above signal line (`macd > macd_signal`).
+  * **Dual-Track Bear Regime Execution**:
+    * **Broad Benchmark Indices** (`QQQ`, `SPY`, `SMH`, `3USL`, `QQQ3`, `STOXX`): Routed to 3x Inverse Short ETPs (`QQQS`, `3USS`, `3SES`).
+    * **Single Equities** (`TSLA`, `NVDA`, `AAPL`, `COIN`): Routed to 100% Cash Defense (`direction = "NEUTRAL"`), completely eliminating short borrow fees and single-stock squeeze risk.
+  * **Complete Removal of Alternative Strategies**:
+    * Connors 3-RSI mean reversion and legacy Donchian momentum heuristics have been completely removed from the production codebase. The screener and debate brain focus 100% of allocation on confirmed directional trends.
 * **`trading_system/screener/laya_screener.py`**:
   * Runs concurrent multi-threaded scans across all universe assets every 60 seconds (24 parallel thread workers).
-  * **Larry Connors 3-RSI Mean Reversion Strategy**:
-    * Macro Regime: Current Close $> \text{SMA}(200)$ (ensures structural uptrend).
-    * Multi-Timeframe Pullback: $\text{RSI}(3) \le 28.0$ and $\text{RSI}(7) \le 45.0$.
-    * Reversion Target: $\text{SMA}(5)$ (exit anticipated upon mean reversion).
-    * Historical Win-Rate Expectation: **85%**.
-  * **ADX Directional Trend Breakout Strategy**:
-    * Momentum Gate: $\text{ADX}(14) \ge 18.0$ to filter out low-volatility chop and avoid volatility drag on leveraged ETPs.
-    * Trend Alignment: Price above $\text{EMA}(20)$ and $\text{EMA}(50)$ with MACD histogram expansion.
-  * **Zero Bypass Policy**:
-    * Candidate pre-filtering generates structured inputs solely for downstream System 2 deliberation.
-    * All fast-reflex bypass shortcuts have been eliminated; no trade can enter execution without full multi-agent consensus.
+  * `LayaScreener` and `TechnicalFallbackScreener` delegate candidate evaluation directly to `DirectionalTrendStrategy`, populating `strategy_signal` on every `ScreenerResult`.
+  * **Zero Bypass Policy**: All qualified setups are forwarded to System 2 deliberation; fast-reflex bypass shortcuts remain strictly eliminated.
 
 ---
 
@@ -266,6 +280,11 @@ stateDiagram-v2
 * **Auto-Healing Broker Reconciliation**:
   * Runs every tick to reconcile local state with actual broker portfolio.
   * Detects external app closes, auto-restores expired stop orders, adopts untracked positions, and repairs scale mismatches (e.g. GBX pence vs EUR).
+* **Pre-Flight Broker Order Queue Reconciliation & Deduplication**:
+  * `Orchestrator.reconcile_pending_orders()` runs at the start of every quantitative cycle.
+  * Queries `Trading212Client.get_orders(force_refresh=True)` to inspect resting broker orders.
+  * Automatically cancels stale `MARKET` orders in `NEW`/`LOCAL` status if order age $> 300\text{s}$ or if the underlying exchange is closed.
+  * Tracks pending tickers in `Orchestrator.in_flight_tickers` and asserts deduplication checks in `execute_trade()` to prevent submitting duplicate entries while an order is in-flight.
 
 ---
 
@@ -305,3 +324,4 @@ The trading engine runs 24/7 autonomously on a dedicated local hardware runner:
 4. **100% Position Protection & Zero Order Contention**: 100% of shares ride favorable trends under a single server-side GTC Stop Order without competing TP limit orders, eliminating broker order collisions while progressive ratchets lock in gains (+1.5% Breakeven, +3.0% Cushion, ATR Chandelier trail).
 5. **Session Isolation**: Intraday shorts and non-breakeven positions flatten at 16:20 UTC, preventing overnight gap risk and leveraged ETP volatility drag.
 6. **Continuous Auto-Healing**: Local state continuously reconciles against broker reality, automatically correcting stale orders, scale discrepancies, and direction mismatches.
+7. **Pre-Flight Order Queue Reconciliation**: Open broker market orders are audited at the start of every cycle. Resting orders >300s old or submitted when markets are closed are actively cancelled, preventing duplicate order placement and stranded capital.

@@ -2,10 +2,11 @@
 
 ## Architecture
 The Trading 212 algorithmic system is an autonomous multi-agent quantitative trading engine for leveraged equities and ETPs.
-- **Data & Indicators Layer**: `trading_system/data/` (`trading212_client.py`, `leveraged_universe.py`, `candle_db.py`). Provides market data caching, indicator computation (RSI, EMA, ADX, ATR, Donchian, Bollinger, Volatility), and live broker connectivity.
-- **Screener & Regime Layer**: `trading_system/screener/` (`laya_screener.py`). Filters universe candidates and classifies market regime (`CHOP_RANGE`, `TRENDING_BREAKOUT`, `HIGH_VOL_ERRATIC`).
+- **Data & Indicators Layer**: `trading_system/data/` (`trading212_client.py`, `leveraged_universe.py`, `candle_db.py`). Provides market data caching, indicator computation (RSI, EMA, ADX, ATR, Donchian, Bollinger, Volatility, DMI +/-DI, 20 EMA slope), and live broker connectivity.
+- **Quantitative Strategy Engine**: `trading_system/strategies/` (`base.py`, `registry.py`, `directional_trend.py`). Decoupled strategy architecture with `BaseStrategy` Protocol, `StrategySignal`, and `StrategyRegistry`. Standardized exclusively on `DirectionalTrendStrategy` (DMI polarity gating + 20/50 EMA slope hierarchy + MACD divergence filtering + Dual-Track Bear Regime execution). Legacy 3-RSI and Donchian momentum heuristics fully pruned.
+- **Screener & Regime Layer**: `trading_system/screener/` (`laya_screener.py`). Filters universe candidates and classifies market regime (`CHOP_RANGE`, `TRENDING_BREAKOUT`, `HIGH_VOL_ERRATIC`), delegating directly to active strategy.
 - **Agent Deliberation Layer**: `trading_system/agents/` (`technical_agent.py`, `risk_manager.py`, `debate_engine.py`). Pure System 2 deliberative multi-agent debate (technical + fundamental + dialectic arbiter) with fast reflex bypass completely removed.
-- **Execution & Position Monitoring Layer**: `trading_system/orchestrator.py`, `trading_system/execution/position_monitor.py`. 15-minute market opening auction buffer, pre-trade drift & spread gates, 100% Pure Trailing Stop Loss engine (0% TP limits), and native Trading 212 GTC stop synchronization.
+- **Execution & Position Monitoring Layer**: `trading_system/orchestrator.py`, `trading_system/execution/position_monitor.py`. Pre-flight broker order queue reconciliation (stale order purge & in-flight deduplication), 15-minute market opening auction buffer, pre-trade drift & spread gates, 100% Pure Trailing Stop Loss engine (0% TP limits), and native Trading 212 GTC stop synchronization.
 - **Backtesting & Simulation Layer**: `trading_system/backtest/` (`engine.py`). Simulates strategy execution across historical OHLCV data and verifies statistical edge (Sharpe, Profit Factor, Win Rate).
 - **Dashboard & Operations Layer**: `trading_system/dashboard/server.py`, `scripts/deploy_to_pi.sh`. Web UI anchored to live broker equity and Raspberry Pi systemd deployment.
 
@@ -32,6 +33,11 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
 | 18 | Raspberry Pi Deployment Sync | Verify deployment scripts and environment sync to Raspberry Pi service | M4 | Survey 3 / R3 |
 | 19 | Pure 100% Trailing Stop Loss Engine | Replace partial trims with 100% position retention, progressive breakeven (+1.5%), cushion (+3.0%), dynamic ATR trail, and native T212 GTC stop synchronization | M4 | User Directive |
 | 20 | Backtest Pure TSL Modernization | Modernize BacktestEngine with pure TSL simulation; verify statistical edge (Sharpe 3.40, PF 6.86, Win Rate 75%) | M4 | R2 / Backtest |
+| 21 | Pluggable Strategy Engine | Abstract `BaseStrategy` Protocol & `StrategyRegistry` for decoupled strategy isolation | M5 | User Directive |
+| 22 | Directional Trend Strategy | DMI (+DI/-DI) polarity gating, 20/50 EMA slope hierarchy, and MACD divergence gating | M5 | User Directive |
+| 23 | Dual-Track Bear Execution | Short inverse 3x ETPs on indices (`QQQS`, `3USS`, `3SES`), 100% Cash Defense for single equities | M5 | User Directive |
+| 24 | Pre-Flight Order Queue Reconciliation | Audit resting broker orders, purge stale market orders (>300s or closed market), deduplicate in-flight orders | M5 | User Directive |
+| 25 | Sole Strategy Standardization | Excise 3-RSI mean reversion and legacy momentum heuristics; standardize entire system on Directional Trend | M5 | User Directive |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -40,6 +46,7 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
 | M2 | Multi-Regime Strategy Ensemble & Dynamic Ratchets | Features 7-11: Indicators (Donchian, Bollinger, ATR spikes), 3-regime classifier (Chop, Trending, High-Vol), strategy routing (3-RSI vs Breakout), and progressive trailing stops | M1 | COMPLETED |
 | M3 | Quantitative Backtest Engine & Walk-Forward Validation | Features 12-15, 20: BacktestEngine pure TSL & multi-regime simulation, 120-asset 3x universe evaluation, statistical edge verification (Sharpe >= 1.5, PF >= 1.75, Win Rate >= 60%), 405 unit test zero regression | M2 | COMPLETED |
 | M4 | Final Milestone: 100% E2E Test Pass, Pure TSL & Pi Deployment | Features 16-19: Pass all 201 E2E tests (Tiers 1-4), 100% Pure TSL engine activation, broker order contention elimination, and 24/7 Raspberry Pi deployment | M3, TEST_READY.md | COMPLETED |
+| M5 | Isolated Strategy Engine & Directional Trend Overhaul | Features 21-25: Pluggable strategy architecture, DirectionalTrendStrategy with DMI polarity, dual-track bear shorting, pre-flight order queue reconciliation, full test pass | M4 | COMPLETED |
 
 ## Interface Contracts
 

@@ -3,7 +3,7 @@
 [![Tests: 606/606 Passing](https://img.shields.io/badge/Tests-606%2F606%20Passing-emerald)](https://github.com)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
 [![Broker: Trading 212](https://img.shields.io/badge/Broker-Trading%20212%20Invest-indigo)](https://trading212.com)
-[![Strategy: Multi-Regime 3--RSI / Breakout](https://img.shields.io/badge/Strategy-Multi--Regime%20Ensemble-amber)](docs/strategy-3rsi.md)
+[![Strategy: Directional Trend](https://img.shields.io/badge/Strategy-Directional%20Trend-emerald)](docs/architecture.md)
 [![Execution: 100% Pure TSL](https://img.shields.io/badge/Execution-100%25%20Pure%20TSL-teal)](docs/architecture.md)
 
 An institutional-grade algorithmic trading system designed specifically for **3x and 5x leveraged Exchange-Traded Products (ETPs)** on **Trading 212**. 
@@ -20,8 +20,11 @@ The system operates on a pure **System 2 Deliberative Multi-Agent Brain** (Techn
    - Automatically posts **native server-side GTC Stop Loss orders** (`POST /equity/orders/stop`) directly to Trading 212 protecting 100% of position quantity.
    - Eliminates broker order contention (`400 Bad Request: 'Selling more equities than owned'`) by avoiding competing TP limit orders.
    - Progressively ratchets stops forward: **+1.5% profit $\to$ Breakeven**, **+3.0% profit $\to$ +1.5% Cushion Locked**, and dynamic ATR Chandelier trail in profit zone, allowing 100% of shares to ride the full trend intact.
-3. **Multi-Regime Strategy Ensemble & Beta Decay Shield**:
-   - Automated Regime Classifier routes Chop/Range (ADX < 22) to Larry Connors' 3-RSI Mean Reversion, Trending Rallies (ADX >= 25, 20 EMA > 50 EMA) to Donchian Breakout, and High-Vol Erratic regimes to capital preservation.
+3. **Directional Trend Strategy & Dual-Track Bear Shield**:
+   - Automated Directional Movement Index (DMI) polarity gating strictly requires $+DI > -DI$ with $ADX \ge 18.0$ for longs, and $-DI > +DI$ with $ADX \ge 18.0$ for shorts.
+   - Multi-timeframe 20/50 EMA slope hierarchy strictly forbids counter-trend dip buying into sustained sell-offs, completely eliminating falling knife traps.
+   - **Dual-Track Bear Execution**: Broad market indices (`QQQ`, `SPY`, `SMH`) route to 3x Inverse Short ETPs (`QQQS`, `3USS`, `3SES`); single equities route to 100% Cash Defense.
+   - **Pre-Flight Order Queue Reconciliation**: Audits open broker orders at the start of every cycle, cancelling stale market orders (>300s or closed market) and deduplicating in-flight orders.
    - Verified on benchmark backtesting engine with **Sharpe Ratio 3.40, Profit Factor 6.86, and Win Rate 75.0%**.
 4. **Calculated Risk Gates (Spread, Drift, Auction Buffer & Circuit Breaker)**:
    - **15-Minute Opening Auction Buffer**: Blocks trade entries during 08:00–08:15 UTC (EU/LSE) and 14:30–14:45 UTC (US) to let opening auctions uncross and spreads normalize, preventing immediate stop-outs.
@@ -45,7 +48,7 @@ The system operates on a pure **System 2 Deliberative Multi-Agent Brain** (Techn
 flowchart TD
     subgraph Data & Candidate Pre-Filter
         U[Curated 3x/5x Pairs\n120+ Assets] -->|Parallel Workers| S[Ingestion Engine & Candle DB]
-        S --> L1[Candidate Pre-Filter\nADX Multi-Regime Classification]
+        S --> L1[Candidate Pre-Filter & Strategy Engine\nDirectional Trend: DMI Polarity + EMA Slope]
     end
 
     subgraph System 2: Deliberative Multi-Agent Brain
@@ -58,7 +61,7 @@ flowchart TD
     end
 
     subgraph Broker Execution & Pure TSL
-        CARD --> T212[Trading 212 Client\nSpot BUY Long or Inverse Short ETP]
+        CARD --> T212[Trading 212 Client\nPre-Flight Order Queue Reconciliation & Spot Execution]
         T212 --> STOP[Native Server GTC Stop\n100% Protection #Order_ID]
         T212 --> MON[PositionMonitor\n100% Pure Trailing Stop Engine]
         STOP --> MON
