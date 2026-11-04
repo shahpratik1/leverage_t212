@@ -122,18 +122,10 @@ class Settings:
     SCREENER_TOP_N: int = 15
     MIN_ADX_TREND: float = 18.0  # Trend strength gate for 3x leverage (relaxed from 20.0 to catch trends earlier)
 
-    # Active Pluggable Quantitative Strategy
-    ACTIVE_STRATEGY: str = "directional_trend"  # "directional_trend" or "3rsi_mean_reversion"
-
-    # 3-RSI Mean Reversion Strategy (High Win-Rate Institutional Dip Buying)
-    ENABLE_3RSI_MEAN_REVERSION: bool = True
-    RSI3_OVERSOLD: float = 28.0      # Broadened oversold trigger for shallow bull dips (was 15.0)
-    RSI3_OVERBOUGHT: float = 80.0    # Extreme overbought trigger for inverse short
-    RSI7_OVERSOLD: float = 45.0      # Medium-term momentum confirmation (was 35.0)
-    RSI7_OVERBOUGHT: float = 55.0
-    RSI14_OVERSOLD: float = 50.0     # Macro trend pullback confirmation
-    RSI14_OVERBOUGHT: float = 50.0
-    MR_MAX_HOLD_DAYS: int = 4        # Fast mean reversion holding period (eliminates beta decay)
+    # Quantitative Strategy (Directional Trend with Multi-Timeframe Gating & Dual-Track Short Execution)
+    ACTIVE_STRATEGY: str = "directional_trend"
+    MAX_SWING_HOLD_DAYS: int = 10
+    MR_MAX_HOLD_DAYS: int = 10  # Backward compatibility alias
 
     # Trailing Stop Loss & Schmitt Hysteresis Ratcheting
     PURE_TSL_MODE: bool = True            # Pure 100% Trailing Stop Loss mode (no partial TP trims, lets winners run fully)

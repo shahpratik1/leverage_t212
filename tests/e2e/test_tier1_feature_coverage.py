@@ -453,7 +453,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
     # ══════════════════════════════════════════════════════════════════════════
 
     def test_f09_chop_regime_routes_to_3rsi(self) -> None:
-        """F09.1: In CHOP_RANGE, candidate evaluates 3-RSI mean reversion."""
+        """F09.1: In CHOP_RANGE, candidate evaluates active directional trend strategy."""
         from trading_system.screener.laya_screener import TechnicalFallbackScreener
         s = TechnicalFallbackScreener()
         metrics = {
@@ -467,10 +467,10 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         }
         res = s.evaluate_candidate("QQQ", metrics)
         if res is not None:
-            self.assertEqual(res.strategy_type, "3rsi_mean_reversion")
+            self.assertEqual(res.strategy_type, "directional_trend")
 
     def test_f09_trending_regime_routes_to_breakout(self) -> None:
-        """F09.2: In TRENDING_BREAKOUT, candidate evaluates Donchian/EMA breakout."""
+        """F09.2: In TRENDING_BREAKOUT, candidate evaluates directional trend strategy."""
         from trading_system.screener.laya_screener import TechnicalFallbackScreener
         s = TechnicalFallbackScreener()
         metrics = {
@@ -486,7 +486,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         }
         res = s.evaluate_candidate("QQQ", metrics)
         if res is not None:
-            self.assertEqual(res.strategy_type, "momentum")
+            self.assertEqual(res.strategy_type, "directional_trend")
 
     def test_f09_high_vol_regime_blocks_or_reduces_size(self) -> None:
         """F09.3: In HIGH_VOL_ERRATIC, candidate is flagged for capital preservation."""

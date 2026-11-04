@@ -74,11 +74,6 @@ class StrategyRegistry:
     def _ensure_builtins_registered(cls) -> None:
         """Lazy-import built-in strategies to avoid circular imports during startup."""
         try:
-            import trading_system.strategies.rsi3_mean_reversion  # noqa: F401
-        except ImportError:
-            pass
-
-        try:
             import trading_system.strategies.directional_trend  # noqa: F401
         except ImportError:
             pass

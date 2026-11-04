@@ -38,7 +38,7 @@ class DecisionCard:
     risk_pct_of_equity: float           # Actual risk as % of equity
     conviction_score: float
     rationale: str                      # Brief text explaining the decision
-    strategy_type: str = "momentum"     # 'momentum' or '3rsi_mean_reversion'
+    strategy_type: str = "directional_trend"
     leverage: int = 3                   # 3 or 5 (ETP leverage multiplier)
     earnings_in_days: Optional[float] = None
     realized_vol: Optional[float] = None
@@ -474,7 +474,7 @@ class RiskManager:
         metrics: Dict[str, Any],
         debate_outcome: Any,
         account_equity: float,
-        strategy_type: str = "momentum",
+        strategy_type: str = "directional_trend",
         leverage: Optional[int] = None,
     ) -> DecisionCard:
         """Generate a complete DecisionCard from technical metrics and debate consensus."""

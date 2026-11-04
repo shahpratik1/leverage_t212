@@ -2,7 +2,7 @@
 
 Main Execution Pipeline:
 1. Data Ingestion: Ingests OHLCV for liquid 3x underlying assets (Indices, Tech Giants, Commodities).
-2. Quantitative Pre-Filtering: Scans universe metrics for directional momentum and 3-RSI mean-reversion candidates,
+2. Quantitative Pre-Filtering: Scans universe metrics for directional trend candidates with DMI polarity gating and multi-timeframe EMA slope filtering,
    rejecting choppy consolidation (ADX < 18) to prevent volatility decay.
 3. System 2 Deliberation: Deliberative multi-agent debate (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter) & Risk Manager compute position sizing, ATR Stop Loss, and 100% Pure Trailing Stop Loss.
 4. Automated Execution & Notifications: Places market entry orders on Trading 212 and dispatches
@@ -383,7 +383,7 @@ class Orchestrator:
         metrics = candidate.metrics
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         direction = "LONG" if candidate.bias == "bullish" else "SHORT"
-        strategy_type = getattr(candidate, "strategy_type", "momentum")
+        strategy_type = getattr(candidate, "strategy_type", "directional_trend")
         if getattr(candidate, "strategy_signal", None) is not None:
             metrics["strategy_signal"] = candidate.strategy_signal
 
@@ -1307,7 +1307,7 @@ def main() -> None:
     parser.add_argument("--backtest", action="store_true", help="Run historical strategy backtest simulator and benchmark report")
     parser.add_argument("--backtest-symbol", type=str, default="QQQ", help="Underlying asset symbol to backtest (default: QQQ)")
     parser.add_argument("--backtest-period", type=str, default="1y", help="Historical backtest period (default: 1y)")
-    parser.add_argument("--backtest-strategy", type=str, choices=["3rsi", "momentum", "both"], default="both", help="Strategy filter to backtest (default: both)")
+    parser.add_argument("--backtest-strategy", type=str, choices=["directional_trend", "both"], default="directional_trend", help="Strategy filter to backtest (default: directional_trend)")
     args = parser.parse_args()
 
     # Historical backtesting route

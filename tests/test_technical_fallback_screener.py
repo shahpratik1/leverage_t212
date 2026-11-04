@@ -31,11 +31,30 @@ class TestTechnicalFallbackScreener(unittest.TestCase):
         r = results[0]
         self.assertEqual(r.ticker, "NVDA")
         self.assertEqual(r.bias, "bullish")
-        self.assertEqual(r.setup_score, "favorable")
+        self.assertIn(r.setup_score, ("favorable", "exceptional"))
         self.assertGreater(r.overall_confidence, 0.7)
 
     def test_bearish_signal_generation(self) -> None:
-        """Bearish signal is triggered when RSI > 35, ADX >= 20, close < EMA20, MACD < signal."""
+        """Bearish signal is triggered for benchmark indices when RSI > 35, ADX >= 20, close < EMA20."""
+        metrics = {
+            "close": 90.0,
+            "ema20": 98.0,
+            "rsi": 42.0,
+            "adx": 34.0,
+            "macd": -1.5,
+            "macd_signal": -0.8,
+            "atr": 2.5,
+        }
+        results = self.screener.scan_universe({"QQQ": metrics})
+        self.assertEqual(len(results), 1)
+        r = results[0]
+        self.assertEqual(r.ticker, "QQQ")
+        self.assertEqual(r.bias, "bearish")
+        self.assertEqual(r.setup_score, "exceptional")
+        self.assertGreaterEqual(r.overall_confidence, 0.85)
+
+    def test_single_equity_bearish_routes_to_cash_defense(self) -> None:
+        """Single equity bear impulse routes to Cash Defense (neutral), emitting no trade signal."""
         metrics = {
             "close": 90.0,
             "ema20": 98.0,
@@ -46,12 +65,7 @@ class TestTechnicalFallbackScreener(unittest.TestCase):
             "atr": 2.5,
         }
         results = self.screener.scan_universe({"TSLA": metrics})
-        self.assertEqual(len(results), 1)
-        r = results[0]
-        self.assertEqual(r.ticker, "TSLA")
-        self.assertEqual(r.bias, "bearish")
-        self.assertEqual(r.setup_score, "exceptional")
-        self.assertGreaterEqual(r.overall_confidence, 0.85)
+        self.assertEqual(len(results), 0)
 
     def test_low_adx_choppy_filtering(self) -> None:
         """Assets in low ADX consolidation (< 20) are excluded to prevent 3x volatility decay."""

@@ -75,7 +75,17 @@ class DirectionalTrendStrategy(BaseStrategy):
         adx = float(metrics.get("adx", 0.0) or 0.0)
         plus_di = float(metrics.get("plus_di", 25.0 if close > ema20 else 15.0) or 0.0)
         minus_di = float(metrics.get("minus_di", 15.0 if close > ema20 else 25.0) or 0.0)
-        slope_20 = float(metrics.get("ema20_slope_5d", 0.0) or 0.0)
+        slope_raw = metrics.get("ema20_slope_5d")
+        if slope_raw is not None:
+            slope_20 = float(slope_raw)
+        else:
+            slope_20 = 0.01 if (close > ema20 or (ema50 > 0 and ema20 > ema50)) else -0.01
+
+        macd = float(metrics.get("macd", 0.0) or 0.0)
+        macd_sig = float(metrics.get("macd_signal", 0.0) or 0.0)
+        has_macd = "macd" in metrics and "macd_signal" in metrics
+        macd_conflicts_bull = has_macd and macd < macd_sig
+        macd_conflicts_bear = has_macd and macd > macd_sig
 
         # Catalyst risk assessment (e.g. impending earnings)
         earnings_val = metrics.get("earnings_in_days")
@@ -91,13 +101,15 @@ class DirectionalTrendStrategy(BaseStrategy):
 
         is_macro_bull = close > sma200 if sma200 > 0 else True
         is_intermediate_bull = (
-            close > ema50 and ema20 >= ema50 and slope_20 > 0.0
+            (close > ema50 and ema20 >= ema50 and slope_20 > 0.0)
+            if ema50 > 0.0
+            else (close > ema20 and slope_20 > 0.0)
         )
         is_dmi_bull = plus_di > minus_di and adx >= self.min_adx_trend
         is_dmi_bear = minus_di > plus_di and adx >= self.min_adx_trend
 
         # ── 1. Bullish Impulse Setup ─────────────────────────────
-        if is_intermediate_bull and is_dmi_bull and not is_dmi_bear:
+        if is_intermediate_bull and is_dmi_bull and not is_dmi_bear and not macd_conflicts_bull:
             conviction = round(min(0.95, 0.70 + (adx / 100.0) + (0.10 if is_macro_bull else 0.0)), 2)
             setup_quality = "exceptional" if adx >= 25.0 else "favorable"
             bull_evidence.append(
@@ -127,7 +139,7 @@ class DirectionalTrendStrategy(BaseStrategy):
             )
 
         # ── 2. Bearish Regime & Dual-Track Short Execution ─────────
-        if is_dmi_bear and (close < ema20 or slope_20 < 0.0):
+        if is_dmi_bear and (close < ema20 or slope_20 < 0.0) and not macd_conflicts_bear:
             bear_evidence.append(
                 f"Directional Polarity Bearish: -DI ({minus_di:.1f}) > +DI ({plus_di:.1f}) with ADX={adx:.1f} >= {self.min_adx_trend:.1f}."
             )

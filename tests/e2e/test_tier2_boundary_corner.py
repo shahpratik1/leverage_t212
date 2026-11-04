@@ -421,7 +421,7 @@ class TestTier2BoundaryCornerCases(unittest.TestCase):
         }
         res = s.scan_universe({"QQQ": metrics})
         if res:
-            self.assertEqual(res[0].strategy_type, "momentum")
+            self.assertEqual(res[0].strategy_type, "directional_trend")
 
     def test_f09_b02_breakout_during_high_vol_blocked(self) -> None:
         """F09.B2: Donchian breakout during HIGH_VOL_ERRATIC (vol=80%) is blocked."""
@@ -447,7 +447,7 @@ class TestTier2BoundaryCornerCases(unittest.TestCase):
         self.assertEqual(len(res), 0)
 
     def test_f09_b04_rsi3_exact_28_0_boundary(self) -> None:
-        """F09.B4: RSI3 = 28.0 qualifies for 3-RSI entry threshold."""
+        """F09.B4: RSI3 = 28.0 qualifies for directional trend entry."""
         from trading_system.screener.laya_screener import TechnicalFallbackScreener
         s = TechnicalFallbackScreener()
         metrics = {
@@ -461,18 +461,18 @@ class TestTier2BoundaryCornerCases(unittest.TestCase):
         }
         res = s.scan_universe({"QQQ": metrics})
         if res:
-            self.assertEqual(res[0].strategy_type, "3rsi_mean_reversion")
+            self.assertEqual(res[0].strategy_type, "directional_trend")
 
-    def test_f09_b05_rsi3_above_threshold_fails_chop_entry(self) -> None:
-        """F09.B5: RSI3 = 35.0 does not trigger 3-RSI entry."""
+    def test_f09_b05_low_adx_fails_entry(self) -> None:
+        """F09.B5: Low ADX (<18.0) fails directional trend entry."""
         from trading_system.screener.laya_screener import TechnicalFallbackScreener
         s = TechnicalFallbackScreener()
         metrics = {
             "close": 100.0,
             "sma200": 95.0,
-            "rsi3": 35.0,  # too high for mean reversion
+            "rsi3": 35.0,
             "rsi7": 50.0,
-            "adx": 18.0,
+            "adx": 15.0,  # Below min_adx_trend (18.0)
             "realized_vol": 0.20,
             "atr_spike_ratio": 1.0,
         }

@@ -30,7 +30,7 @@ class SimulatedTrade:
     trade_id: int
     symbol: str
     direction: str  # 'LONG' or 'SHORT'
-    strategy: str   # '3rsi_mean_reversion' or 'momentum'
+    strategy: str   # 'directional_trend'
     entry_date: str
     entry_price: float
     exit_date: Optional[str] = None
@@ -650,6 +650,19 @@ class BacktestEngine:
                         ):
                             signal_dir = "SHORT"
                             strategy_name = "multi_factor"
+
+                # Directional Trend Strategy
+                if not signal_dir and strategy_filter in ("directional_trend", "all"):
+                    is_bull = (curr_sma is None or curr_c > curr_sma)
+                    is_bear = (curr_sma is not None and curr_c < curr_sma)
+                    if is_bull:
+                        signal_dir = "LONG"
+                        strategy_name = "directional_trend"
+                    elif is_bear:
+                        is_index = any(idx in symbol.upper() for idx in ("QQQ", "SPY", "SMH", "3USL", "QQQ3", "STOXX"))
+                        if is_index:
+                            signal_dir = "SHORT"
+                            strategy_name = "directional_trend"
 
                 # 3-RSI Mean Reversion (standalone or fallback if not multi_factor only)
                 if not signal_dir and strategy_filter in ("both", "3rsi"):

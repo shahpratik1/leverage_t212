@@ -41,7 +41,7 @@ class ScreenerResult:
     setup_confidence: float = 0.85
     catalyst_risk: float = 0.0
     overall_confidence: float = 0.85
-    strategy_type: str = "momentum"  # "momentum" or "3rsi_mean_reversion"
+    strategy_type: str = "directional_trend"
     metrics: Dict[str, Any] = field(default_factory=dict)
     state_document: str = ""
     market_regime: str = "TRENDING_BREAKOUT"
@@ -421,13 +421,10 @@ class LayaScreener:
             return False
 
         # Volatility decay protection for 3x leverage
-        adx: float = result.metrics.get("adx", 0.0)
-        if result.strategy_type == "3rsi_mean_reversion":
-            if adx < 15.0:
-                return False
-        else:
-            if adx < 20.0:
-                return False
+        adx: float = float(result.metrics.get("adx", 0.0) or 0.0)
+        min_adx = float(getattr(settings, "MIN_ADX_TREND", 18.0))
+        if adx < min_adx:
+            return False
 
         result_rank: int = self._score_rank.get(result.setup_score, 0)
         min_rank: int = self._score_rank.get(self.min_setup_score, 0)
@@ -472,26 +469,20 @@ class TechnicalFallbackScreener:
     ) -> None:
         self.top_n = top_n
         self.min_adx = min_adx
-        self.strategy = strategy
+        if strategy is not None:
+            self.strategy = strategy
+        else:
+            from trading_system.strategies.registry import StrategyRegistry
+            self.strategy = StrategyRegistry.get("directional_trend")
 
     def evaluate_candidate(self, ticker: str, m: Dict[str, Any]) -> Optional[ScreenerResult]:
-        """Evaluate a single ticker candidate with multi-regime routing."""
+        """Evaluate a single ticker candidate using DirectionalTrendStrategy."""
         if not m or not m.get("close"):
             return None
         regime = LayaScreener.classify_regime(m)
         rsi: float = float(m.get("rsi", m.get("rsi14", 50.0)))
-        rsi3: float = float(m.get("rsi3", 50.0))
-        rsi7: float = float(m.get("rsi7", 50.0))
         adx: float = float(m.get("adx", 0.0))
         close: float = float(m.get("close", 0.0))
-        sma200: float = float(m.get("sma200", 0.0) or 0.0)
-        ema20: float = float(m.get("ema20", close))
-        ema50: float = float(m.get("ema50", close))
-        macd: float = float(m.get("macd", 0.0) or 0.0)
-        macd_signal: float = float(m.get("macd_signal", 0.0) or 0.0)
-        atr: float = float(m.get("atr", 0.0))
-        donchian_high = float(m.get("donchian_high_20", m.get("high_20d", close)))
-        donchian_low = float(m.get("donchian_low_20", close))
 
         if regime == "HIGH_VOL_ERRATIC":
             return ScreenerResult(
@@ -508,164 +499,32 @@ class TechnicalFallbackScreener:
                 state_document=f"[HighVol] {ticker} Vol/ATR spike exceeds risk tolerance",
             )
 
-        if self.strategy is not None:
-            try:
-                sig = self.strategy.evaluate_candidate(ticker, m)
-                if not sig.is_actionable or sig.direction == "NEUTRAL":
-                    return None
-                bias = "bullish" if sig.direction == "LONG" else "bearish"
-                return ScreenerResult(
-                    ticker=ticker,
-                    bias=bias,
-                    bias_confidence=sig.conviction,
-                    setup_score=sig.setup_quality,
-                    setup_confidence=sig.conviction,
-                    catalyst_risk=sig.catalyst_risk,
-                    overall_confidence=sig.conviction,
-                    strategy_type=sig.strategy_name,
-                    metrics=m,
-                    market_regime=regime,
-                    state_document=f"[Strategy:{sig.strategy_name}] {ticker} | Dir={sig.direction} Conv={sig.conviction:.2f}",
-                    close=close,
-                    trend=m.get("trend", "BULLISH" if bias == "bullish" else "BEARISH"),
-                    adx=adx,
-                    rsi=rsi,
-                    strategy_signal=sig,
-                )
-            except Exception:
-                logger.exception("Strategy evaluation failed in TechnicalFallbackScreener for %s", ticker)
+        try:
+            sig = self.strategy.evaluate_candidate(ticker, m)
+            if not sig.is_actionable or sig.direction == "NEUTRAL":
                 return None
-
-        if regime == "CHOP_RANGE":
-            # Connors 3-RSI Mean Reversion (Strict macro-aligned setups)
-            # Bullish: macro bull (close > sma200) with short-term pullback (rsi3 <= 28, rsi7 <= 45)
-            # Bearish: macro bear (close < sma200) with short-term exhaustion rally (rsi3 >= 78, rsi7 >= 55)
-            is_3rsi_bullish = close > sma200 and (rsi3 <= 28.0 and rsi7 <= 45.0)
-            is_3rsi_bearish = close < sma200 and (rsi3 >= 78.0 and rsi7 >= 55.0)
-            if is_3rsi_bullish:
-                sig = StrategySignal(
-                    symbol=ticker,
-                    direction="LONG",
-                    conviction=0.95,
-                    setup_quality="exceptional",
-                    strategy_name="3rsi_mean_reversion",
-                    rationale=f"3-RSI pullback (RSI3={rsi3:.1f} <= 28.0) above 200 SMA",
-                    bull_evidence=[f"RSI(3)={rsi3:.1f} <= 28.0", f"Price {close:.2f} > 200 SMA {sma200:.2f}"],
-                    catalyst_risk=0.05,
-                )
-                return ScreenerResult(
-                    ticker=ticker,
-                    bias="bullish",
-                    bias_confidence=0.95,
-                    setup_score="exceptional",
-                    setup_confidence=0.95,
-                    catalyst_risk=0.05,
-                    overall_confidence=0.95,
-                    strategy_type="3rsi_mean_reversion",
-                    metrics=m,
-                    market_regime="CHOP_RANGE",
-                    state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f}",
-                    close=close,
-                    trend=m.get("trend", "BULLISH"),
-                    adx=adx,
-                    rsi=rsi,
-                    strategy_signal=sig,
-                )
-            elif is_3rsi_bearish:
-                sig = StrategySignal(
-                    symbol=ticker,
-                    direction="SHORT",
-                    conviction=0.92,
-                    setup_quality="exceptional",
-                    strategy_name="3rsi_mean_reversion",
-                    rationale=f"3-RSI exhaustion (RSI3={rsi3:.1f} >= 78.0) below 200 SMA",
-                    bear_evidence=[f"RSI(3)={rsi3:.1f} >= 78.0", f"Price {close:.2f} < 200 SMA {sma200:.2f}"],
-                    catalyst_risk=0.05,
-                )
-                return ScreenerResult(
-                    ticker=ticker,
-                    bias="bearish",
-                    bias_confidence=0.92,
-                    setup_score="exceptional",
-                    setup_confidence=0.92,
-                    catalyst_risk=0.05,
-                    overall_confidence=0.92,
-                    strategy_type="3rsi_mean_reversion",
-                    metrics=m,
-                    market_regime="CHOP_RANGE",
-                    state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f}",
-                    close=close,
-                    trend=m.get("trend", "BEARISH"),
-                    adx=adx,
-                    rsi=rsi,
-                    strategy_signal=sig,
-                )
+            bias = "bullish" if sig.direction == "LONG" else "bearish"
+            return ScreenerResult(
+                ticker=ticker,
+                bias=bias,
+                bias_confidence=sig.conviction,
+                setup_score=sig.setup_quality,
+                setup_confidence=sig.conviction,
+                catalyst_risk=sig.catalyst_risk,
+                overall_confidence=sig.conviction,
+                strategy_type=sig.strategy_name,
+                metrics=m,
+                market_regime=regime,
+                state_document=f"[Strategy:{sig.strategy_name}] {ticker} | Dir={sig.direction} Conv={sig.conviction:.2f}",
+                close=close,
+                trend=m.get("trend", "BULLISH" if bias == "bullish" else "BEARISH"),
+                adx=adx,
+                rsi=rsi,
+                strategy_signal=sig,
+            )
+        except Exception:
+            logger.exception("Strategy evaluation failed in TechnicalFallbackScreener for %s", ticker)
             return None
-
-        # TRENDING_BREAKOUT: Donchian 20d & EMA Momentum Breakouts
-        if adx < self.min_adx and not (close >= donchian_high):
-            return None
-
-        # Determine MACD or EMA trend confirmation
-        if macd != 0.0 or macd_signal != 0.0:
-            macd_bullish = macd > macd_signal
-            macd_bearish = macd < macd_signal
-        else:
-            macd_bullish = ema20 > ema50
-            macd_bearish = ema20 < ema50
-
-        # Donchian breakout confirmation
-        has_donchian = "donchian_high_20" in m or "high_20d" in m
-        dh = float(m.get("donchian_high_20", m.get("high_20d", 0.0)) or 0.0)
-        dl = float(m.get("donchian_low_20", 0.0) or 0.0)
-
-        donchian_breakout_bull = has_donchian and dh > 0 and close >= dh
-        donchian_breakout_bear = has_donchian and dl > 0 and close <= dl
-
-        # Macro trend alignment rule: Never short above the 200 SMA in a bull market
-        macro_bull = (close >= sma200) if sma200 > 0 else True
-        macro_bear = (close < sma200) if sma200 > 0 else True
-
-        bullish = (donchian_breakout_bull or (rsi < 68.0 and close > ema20)) and macd_bullish and (macro_bull or donchian_breakout_bull)
-        bearish = (donchian_breakout_bear or (rsi > 32.0 and close < ema20)) and macd_bearish and macro_bear
-
-        if not bullish and not bearish:
-            return None
-
-        bias = "bullish" if bullish else "bearish"
-        setup_score = "exceptional" if adx > 30.0 else ("favorable" if adx > 25.0 else "mediocre")
-        confidence = min(1.0, max(0.65, adx / 35.0))
-
-        sig = StrategySignal(
-            symbol=ticker,
-            direction="LONG" if bias == "bullish" else "SHORT",
-            conviction=confidence,
-            setup_quality=setup_score,
-            strategy_name="momentum",
-            rationale=f"Breakout/Momentum alignment on {ticker} (ADX={adx:.1f})",
-            bull_evidence=[f"ADX={adx:.1f}", f"Close={close:.2f} > EMA20={ema20:.2f}"] if bias == "bullish" else [],
-            bear_evidence=[f"ADX={adx:.1f}", f"Close={close:.2f} < EMA20={ema20:.2f}"] if bias == "bearish" else [],
-            catalyst_risk=0.10,
-        )
-
-        return ScreenerResult(
-            ticker=ticker,
-            bias=bias,
-            bias_confidence=confidence,
-            setup_score=setup_score,
-            setup_confidence=confidence,
-            catalyst_risk=0.10,
-            overall_confidence=confidence,
-            strategy_type="momentum",
-            metrics=m,
-            market_regime="TRENDING_BREAKOUT",
-            state_document=f"[TechnicalFallback:Breakout] {ticker} | Close={close:.2f} DonchianHigh={donchian_high:.2f}",
-            close=close,
-            trend=m.get("trend", "BULLISH" if bias == "bullish" else "BEARISH"),
-            adx=adx,
-            rsi=rsi,
-            strategy_signal=sig,
-        )
 
     def scan_universe(
         self, universe_metrics: Dict[str, Dict[str, Any]]

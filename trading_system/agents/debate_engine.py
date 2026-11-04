@@ -57,7 +57,7 @@ class DebateEngine:
         technical_report: str,
         fundamental_report: str,
         date: Optional[str] = None,
-        strategy_type: str = "momentum",
+        strategy_type: str = "directional_trend",
     ) -> DebateOutcome:
         """
         Runs System 2 Deliberative Multi-Agent Debate:
@@ -137,7 +137,7 @@ class DebateEngine:
         metrics: Dict[str, Any],
         technical_report: str,
         fundamental_report: str,
-        strategy_type: str = "momentum",
+        strategy_type: str = "directional_trend",
     ) -> DebateOutcome:
         """Deep analytical arbiter fallback when TradingAgents package is unavailable."""
         logger.info(f"Running deep analytical deliberation for {ticker} (Strategy: {strategy_type})")
@@ -147,7 +147,6 @@ class DebateEngine:
         bull_risks = []
         bear_risks = []
         
-        rsi3 = metrics.get('rsi3', 50)
         rsi14 = metrics.get('rsi14', metrics.get('rsi', 50))
         ema20 = metrics.get('ema20', 0)
         ema50 = metrics.get('ema50', 0)
@@ -155,14 +154,12 @@ class DebateEngine:
         close = metrics.get('close', 0)
         adx = metrics.get('adx', 0)
         high_20d = metrics.get('high_20d', 0)
-        sma5 = metrics.get('sma5', close)
         plus_di = metrics.get('plus_di')
         minus_di = metrics.get('minus_di')
         slope_20 = metrics.get('ema20_slope_5d')
         strategy_sig = metrics.get('strategy_signal')
 
         from trading_system.config import settings
-        rsi3_thresh = getattr(settings, "RSI3_OVERSOLD", 28.0)
         adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
 
         # Ingest StrategySignal evidence if available
@@ -174,19 +171,11 @@ class DebateEngine:
                 if ev not in bear_evidence:
                     bear_evidence.append(ev)
 
-        # Strategy-specific technical evaluation
-        if strategy_type == "3rsi_mean_reversion":
-            if close > sma200 and rsi3 <= rsi3_thresh:
-                bull_evidence.append(f"Short-term 3-RSI pullback (RSI3={rsi3:.1f} <= {rsi3_thresh:.1f}) with price above 200 SMA.")
-                bull_evidence.append(f"5-day SMA at {sma5:.2f} provides strong magnetic reversion target.")
-            elif close < sma200 and rsi3 >= 78.0:
-                bear_evidence.append(f"Short-term 3-RSI exhaustion rally (RSI3={rsi3:.1f} >= 78.0) with price below 200 SMA.")
+        # Directional momentum evaluation
+        if rsi14 >= 50:
+            bull_evidence.append(f"RSI(14) at {rsi14:.1f} is above 50, indicating bullish momentum.")
         else:
-            # Directional / Momentum evaluation
-            if rsi14 >= 50:
-                bull_evidence.append(f"RSI(14) at {rsi14:.1f} is above 50, indicating bullish momentum.")
-            else:
-                bear_evidence.append(f"RSI(14) at {rsi14:.1f} is below 50, indicating bearish momentum.")
+            bear_evidence.append(f"RSI(14) at {rsi14:.1f} is below 50, indicating bearish momentum.")
 
         # Moving average alignment
         if ema20 > ema50:
