@@ -12,7 +12,9 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from trading_system.strategies.base import BaseStrategy, StrategySignal
 
 try:
     from laya import Router
@@ -48,6 +50,7 @@ class ScreenerResult:
     trend: str = "BULLISH"
     adx: float = 25.0
     rsi: float = 50.0
+    strategy_signal: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -80,12 +83,28 @@ class LayaScreener:
         min_setup_score: str = "favorable",
         max_catalyst_risk: float = 0.25,
         top_n: int = 5,
+        strategy_name: Optional[str] = None,
     ) -> None:
         self.router: Any = Router(preload=True) if (HAS_LAYA and Router is not None) else None
         self.min_setup_score: str = min_setup_score
         self.max_catalyst_risk: float = max_catalyst_risk
         self.top_n: int = top_n
         self._score_rank: Dict[str, int] = dict(self._SCORE_RANK)
+
+        # Resolve active pluggable trading strategy
+        from trading_system.strategies.registry import StrategyRegistry
+        from trading_system.config import settings
+
+        active_name = strategy_name or getattr(settings, "ACTIVE_STRATEGY", "directional_trend")
+        try:
+            self.strategy = StrategyRegistry.get(active_name)
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize strategy '%s' (%s), falling back to directional_trend",
+                active_name,
+                exc,
+            )
+            self.strategy = StrategyRegistry.get("directional_trend")
 
         # ----- Laya question bank -----
         self.questions: Dict[str, Dict[str, Any]] = {
@@ -204,7 +223,7 @@ class LayaScreener:
     def evaluate_single(
         self, ticker: str, metrics: Dict[str, Any]
     ) -> ScreenerResult:
-        """Screen a single asset and return a :class:`ScreenerResult`.
+        """Screen a single asset and return a :class:`ScreenerResult` using the active strategy.
 
         On any error the method returns a *neutral* result with zero
         confidence so that downstream filters safely exclude it.
@@ -218,87 +237,15 @@ class LayaScreener:
         """
         state: str = self.format_asset_state(ticker, metrics)
 
-        close = float(metrics.get("close", 0.0))
-        sma200 = float(metrics.get("sma200", 0.0))
-        ema20 = float(metrics.get("ema20", 0.0))
-        ema50 = float(metrics.get("ema50", 0.0))
-        rsi3 = float(metrics.get("rsi3", 50.0))
-        rsi7 = float(metrics.get("rsi7", 50.0))
-        rsi14 = float(metrics.get("rsi14", metrics.get("rsi", 50.0)))
-        adx = float(metrics.get("adx", 20.0))
+        close = float(metrics.get("close", 0.0) or 0.0)
+        adx = float(metrics.get("adx", 20.0) or 20.0)
+        rsi14 = float(metrics.get("rsi14", metrics.get("rsi", 50.0)) or 50.0)
 
-        # ── 1. Priority High Win-Rate Check: 3-RSI Multi-Timeframe Mean Reversion ──
-        earnings_val = metrics.get("earnings_in_days")
-        is_earnings_blackout = (
-            earnings_val is not None
-            and isinstance(earnings_val, (int, float))
-            and 0.0 <= earnings_val <= 2.0
-        )
-        base_catalyst_risk = 0.90 if is_earnings_blackout else 0.05
-
-        # Bullish Dip: Macro bull (close > sma200), short-term pullback (rsi3 <= 28, rsi7 <= 45)
-        from trading_system.config import settings
-        rsi3_oversold = getattr(settings, "RSI3_OVERSOLD", 28.0)
-        rsi7_oversold = getattr(settings, "RSI7_OVERSOLD", 45.0)
-        adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
-
-        if close > sma200 and rsi3 <= rsi3_oversold and rsi7 <= rsi7_oversold:
-            return ScreenerResult(
-                ticker=ticker,
-                bias="bullish",
-                bias_confidence=0.95,
-                setup_score="exceptional",
-                setup_confidence=0.95,
-                catalyst_risk=base_catalyst_risk,
-                overall_confidence=0.95,
-                strategy_type="3rsi_mean_reversion",
-                metrics=metrics,
-                state_document=state,
-            )
-        # Bearish Overbought: Macro bear (close < sma200), short-squeeze exhaustion (rsi3 >= 78, rsi7 >= 55)
-        elif close < sma200 and rsi3 >= 78.0 and rsi7 >= 55.0:
-            return ScreenerResult(
-                ticker=ticker,
-                bias="bearish",
-                bias_confidence=0.92,
-                setup_score="exceptional",
-                setup_confidence=0.92,
-                catalyst_risk=base_catalyst_risk,
-                overall_confidence=0.92,
-                strategy_type="3rsi_mean_reversion",
-                metrics=metrics,
-                state_document=state,
-            )
-
-        # ── 2. Rule-based evaluation fallback when Laya engine is unavailable ──
-        if self.router is None:
-            if close > sma200 and ema20 > ema50 and rsi14 >= 50.0:
-                bias = "bullish"
-                setup_score = "exceptional" if (rsi14 > 55.0 and adx >= adx_trend_min) else "favorable"
-            elif close < sma200 and ema20 < ema50 and rsi14 < 48.0:
-                bias = "bearish"
-                setup_score = "exceptional" if (rsi14 < 42.0 and adx >= adx_trend_min) else "favorable"
-            else:
-                bias = "neutral"
-                setup_score = "mediocre"
-
-            return ScreenerResult(
-                ticker=ticker,
-                bias=bias,
-                bias_confidence=0.85,
-                setup_score=setup_score,
-                setup_confidence=0.85,
-                catalyst_risk=base_catalyst_risk,
-                overall_confidence=0.85,
-                strategy_type="momentum",
-                metrics=metrics,
-                state_document=state,
-            )
-
+        # Delegate evaluation to the active pluggable strategy
         try:
-            raw: Dict[str, Any] = self.router.predict(state, self.questions)
+            signal = self.strategy.evaluate_candidate(ticker, metrics)
         except Exception:
-            logger.exception("Laya prediction failed for %s", ticker)
+            logger.exception("Strategy evaluation failed for %s", ticker)
             return ScreenerResult(
                 ticker=ticker,
                 bias="neutral",
@@ -311,33 +258,41 @@ class LayaScreener:
                 state_document=state,
             )
 
-        answers: Dict[str, Any] = raw.get("answers", {})
-        overall_confidence: float = float(raw.get("answer_confidence", 0.0))
+        bias = "bullish" if signal.direction == "LONG" else ("bearish" if signal.direction == "SHORT" else "neutral")
 
-        # --- Parse bias (choice question) ---
-        bias_answer: Dict[str, Any] = answers.get("bias", {})
-        bias: str = str(bias_answer.get("choice", "neutral"))
-        bias_confidence: float = float(bias_answer.get("confidence", 0.0))
+        # Refine catalyst risk with Laya NLI router if available
+        setup_score = signal.setup_quality
+        bias_confidence = signal.conviction
+        overall_confidence = signal.conviction
+        catalyst_risk = signal.catalyst_risk
 
-        # --- Parse setup_score (score question) ---
-        setup_answer: Dict[str, Any] = answers.get("setup_score", {})
-        setup_score: str = str(setup_answer.get("choice", "unfavorable"))
-        setup_confidence: float = float(setup_answer.get("confidence", 0.0))
-
-        # --- Parse catalyst_risk (noul question) ---
-        catalyst_answer: Dict[str, Any] = answers.get("catalyst_risk", {})
-        catalyst_risk: float = float(catalyst_answer.get("noul", 1.0))
+        if self.router is not None and signal.is_actionable:
+            try:
+                raw: Dict[str, Any] = self.router.predict(state, self.questions)
+                answers: Dict[str, Any] = raw.get("answers", {})
+                cat_answer: Dict[str, Any] = answers.get("catalyst_risk", {})
+                nli_cat_risk = float(cat_answer.get("noul", catalyst_risk))
+                catalyst_risk = max(catalyst_risk, nli_cat_risk)
+            except Exception:
+                logger.debug("Laya router prediction notice for %s", ticker)
 
         return ScreenerResult(
             ticker=ticker,
             bias=bias,
             bias_confidence=bias_confidence,
             setup_score=setup_score,
-            setup_confidence=setup_confidence,
+            setup_confidence=overall_confidence,
             catalyst_risk=catalyst_risk,
             overall_confidence=overall_confidence,
+            strategy_type=signal.strategy_name,
             metrics=metrics,
             state_document=state,
+            market_regime=self.classify_regime(metrics),
+            close=close,
+            trend=metrics.get("trend", "BULLISH"),
+            adx=adx,
+            rsi=rsi14,
+            strategy_signal=signal,
         )
 
     # ------------------------------------------------------------------
@@ -509,9 +464,15 @@ class TechnicalFallbackScreener:
         min_adx: Minimum ADX for a signal to be emitted.  Default ``20``.
     """
 
-    def __init__(self, top_n: int = 10, min_adx: float = 20.0) -> None:
+    def __init__(
+        self,
+        top_n: int = 10,
+        min_adx: float = 20.0,
+        strategy: Optional[BaseStrategy] = None,
+    ) -> None:
         self.top_n = top_n
         self.min_adx = min_adx
+        self.strategy = strategy
 
     def evaluate_candidate(self, ticker: str, m: Dict[str, Any]) -> Optional[ScreenerResult]:
         """Evaluate a single ticker candidate with multi-regime routing."""
@@ -547,6 +508,34 @@ class TechnicalFallbackScreener:
                 state_document=f"[HighVol] {ticker} Vol/ATR spike exceeds risk tolerance",
             )
 
+        if self.strategy is not None:
+            try:
+                sig = self.strategy.evaluate_candidate(ticker, m)
+                if not sig.is_actionable or sig.direction == "NEUTRAL":
+                    return None
+                bias = "bullish" if sig.direction == "LONG" else "bearish"
+                return ScreenerResult(
+                    ticker=ticker,
+                    bias=bias,
+                    bias_confidence=sig.conviction,
+                    setup_score=sig.setup_quality,
+                    setup_confidence=sig.conviction,
+                    catalyst_risk=sig.catalyst_risk,
+                    overall_confidence=sig.conviction,
+                    strategy_type=sig.strategy_name,
+                    metrics=m,
+                    market_regime=regime,
+                    state_document=f"[Strategy:{sig.strategy_name}] {ticker} | Dir={sig.direction} Conv={sig.conviction:.2f}",
+                    close=close,
+                    trend=m.get("trend", "BULLISH" if bias == "bullish" else "BEARISH"),
+                    adx=adx,
+                    rsi=rsi,
+                    strategy_signal=sig,
+                )
+            except Exception:
+                logger.exception("Strategy evaluation failed in TechnicalFallbackScreener for %s", ticker)
+                return None
+
         if regime == "CHOP_RANGE":
             # Connors 3-RSI Mean Reversion (Strict macro-aligned setups)
             # Bullish: macro bull (close > sma200) with short-term pullback (rsi3 <= 28, rsi7 <= 45)
@@ -554,6 +543,16 @@ class TechnicalFallbackScreener:
             is_3rsi_bullish = close > sma200 and (rsi3 <= 28.0 and rsi7 <= 45.0)
             is_3rsi_bearish = close < sma200 and (rsi3 >= 78.0 and rsi7 >= 55.0)
             if is_3rsi_bullish:
+                sig = StrategySignal(
+                    symbol=ticker,
+                    direction="LONG",
+                    conviction=0.95,
+                    setup_quality="exceptional",
+                    strategy_name="3rsi_mean_reversion",
+                    rationale=f"3-RSI pullback (RSI3={rsi3:.1f} <= 28.0) above 200 SMA",
+                    bull_evidence=[f"RSI(3)={rsi3:.1f} <= 28.0", f"Price {close:.2f} > 200 SMA {sma200:.2f}"],
+                    catalyst_risk=0.05,
+                )
                 return ScreenerResult(
                     ticker=ticker,
                     bias="bullish",
@@ -566,8 +565,23 @@ class TechnicalFallbackScreener:
                     metrics=m,
                     market_regime="CHOP_RANGE",
                     state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f}",
+                    close=close,
+                    trend=m.get("trend", "BULLISH"),
+                    adx=adx,
+                    rsi=rsi,
+                    strategy_signal=sig,
                 )
             elif is_3rsi_bearish:
+                sig = StrategySignal(
+                    symbol=ticker,
+                    direction="SHORT",
+                    conviction=0.92,
+                    setup_quality="exceptional",
+                    strategy_name="3rsi_mean_reversion",
+                    rationale=f"3-RSI exhaustion (RSI3={rsi3:.1f} >= 78.0) below 200 SMA",
+                    bear_evidence=[f"RSI(3)={rsi3:.1f} >= 78.0", f"Price {close:.2f} < 200 SMA {sma200:.2f}"],
+                    catalyst_risk=0.05,
+                )
                 return ScreenerResult(
                     ticker=ticker,
                     bias="bearish",
@@ -580,6 +594,11 @@ class TechnicalFallbackScreener:
                     metrics=m,
                     market_regime="CHOP_RANGE",
                     state_document=f"[TechnicalFallback:3RSI] {ticker} | RSI(3)={rsi3:.1f} RSI(7)={rsi7:.1f}",
+                    close=close,
+                    trend=m.get("trend", "BEARISH"),
+                    adx=adx,
+                    rsi=rsi,
+                    strategy_signal=sig,
                 )
             return None
 
@@ -617,6 +636,18 @@ class TechnicalFallbackScreener:
         setup_score = "exceptional" if adx > 30.0 else ("favorable" if adx > 25.0 else "mediocre")
         confidence = min(1.0, max(0.65, adx / 35.0))
 
+        sig = StrategySignal(
+            symbol=ticker,
+            direction="LONG" if bias == "bullish" else "SHORT",
+            conviction=confidence,
+            setup_quality=setup_score,
+            strategy_name="momentum",
+            rationale=f"Breakout/Momentum alignment on {ticker} (ADX={adx:.1f})",
+            bull_evidence=[f"ADX={adx:.1f}", f"Close={close:.2f} > EMA20={ema20:.2f}"] if bias == "bullish" else [],
+            bear_evidence=[f"ADX={adx:.1f}", f"Close={close:.2f} < EMA20={ema20:.2f}"] if bias == "bearish" else [],
+            catalyst_risk=0.10,
+        )
+
         return ScreenerResult(
             ticker=ticker,
             bias=bias,
@@ -629,6 +660,11 @@ class TechnicalFallbackScreener:
             metrics=m,
             market_regime="TRENDING_BREAKOUT",
             state_document=f"[TechnicalFallback:Breakout] {ticker} | Close={close:.2f} DonchianHigh={donchian_high:.2f}",
+            close=close,
+            trend=m.get("trend", "BULLISH" if bias == "bullish" else "BEARISH"),
+            adx=adx,
+            rsi=rsi,
+            strategy_signal=sig,
         )
 
     def scan_universe(

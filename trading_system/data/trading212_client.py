@@ -2136,16 +2136,18 @@ class MarketDataProvider:
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
 
-            # ADX(14)
+            # ADX(14) & DMI (+DI, -DI)
             plus_dm = pd.Series(daily_high).diff()
             minus_dm = -pd.Series(daily_low).diff()
             plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
             minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
             smooth_tr = tr.ewm(alpha=1/14, adjust=False).mean()
-            plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / (smooth_tr + 1e-9))
-            minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / (smooth_tr + 1e-9))
-            dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
+            plus_di_series = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / (smooth_tr + 1e-9))
+            minus_di_series = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / (smooth_tr + 1e-9))
+            dx = (100 * (plus_di_series - minus_di_series).abs() / (plus_di_series + minus_di_series + 1e-9))
             adx = float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+            plus_di = float(plus_di_series.iloc[-1])
+            minus_di = float(minus_di_series.iloc[-1])
 
             # Donchian 20d Channels
             donchian_high_20 = float(daily_data["high"].tail(20).max())
@@ -2172,8 +2174,14 @@ class MarketDataProvider:
             atr_20d_sma = float(atr_rolling.iloc[-1]) if not atr_rolling.empty else atr
             atr_spike_ratio = round(atr / (atr_20d_sma + 1e-9), 4) if atr_20d_sma > 0 else 1.0
 
-            # MACD (12, 26, 9)
+            # MACD (12, 26, 9) & Daily Trend Hierarchy
             daily_series = pd.Series(daily_close)
+            daily_ema20_series = daily_series.ewm(span=20, adjust=False).mean()
+            daily_ema50_series = daily_series.ewm(span=50, adjust=False).mean()
+            daily_ema20 = float(daily_ema20_series.iloc[-1])
+            daily_ema50 = float(daily_ema50_series.iloc[-1])
+            ema20_slope_5d = float((daily_ema20_series.iloc[-1] - daily_ema20_series.iloc[-min(5, len(daily_ema20_series))]) / (daily_ema20_series.iloc[-min(5, len(daily_ema20_series))] + 1e-9) * 100.0) if len(daily_ema20_series) >= 5 else 0.0
+
             ema12 = daily_series.ewm(span=12, adjust=False).mean()
             ema26 = daily_series.ewm(span=26, adjust=False).mean()
             macd_series = ema12 - ema26
@@ -2201,6 +2209,11 @@ class MarketDataProvider:
                 "rsi7": round(rsi7, 2),
                 "rsi14": round(rsi14, 2),
                 "adx": round(adx, 2),
+                "plus_di": round(plus_di, 2),
+                "minus_di": round(minus_di, 2),
+                "ema20_daily": round(daily_ema20, 2),
+                "ema50_daily": round(daily_ema50, 2),
+                "ema20_slope_5d": round(ema20_slope_5d, 4),
                 "atr": round(atr, 2),
                 "atr_20d_sma": round(atr_20d_sma, 4),
                 "atr_spike_ratio": round(atr_spike_ratio, 4),
@@ -2343,6 +2356,11 @@ class MarketDataProvider:
             "rsi7": round(rsi7, 2),
             "rsi14": round(rsi14, 2),
             "adx": round(adx, 2),
+            "plus_di": 25.0 if trend == "up" else 15.0,
+            "minus_di": 15.0 if trend == "up" else 25.0,
+            "ema20_daily": round(ema20, 2),
+            "ema50_daily": round(ema50, 2),
+            "ema20_slope_5d": 0.5 if trend == "up" else -0.5,
             "atr": round(atr, 2),
             "atr_20d_sma": round(atr_20d_sma, 4),
             "atr_spike_ratio": round(atr_spike_ratio, 4),

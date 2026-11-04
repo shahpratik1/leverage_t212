@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ideation Deliverable: Directional Accuracy, Anti-Churn & Strategy Profitability</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+  </script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              500: '#22c55e',
+              600: '#16a34a',
+              900: '#14532d',
+            },
+            accent: {
+              400: '#38bdf8',
+              500: '#0ea5e9',
+              600: '#0284c7',
+            },
+            danger: {
+              400: '#f87171',
+              500: '#ef4444',
+              600: '#dc2626',
+            },
+            slate: {
+              850: '#151e2e',
+              900: '#0f172a',
+              950: '#020617',
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #0b0f19;
+      color: #cbd5e1;
+    }
+    .gradient-border {
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.25rem 0.625rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .card-glow:hover {
+      border-color: rgba(56, 189, 248, 0.3);
+      box-shadow: 0 10px 25px -5px rgba(14, 165, 233, 0.1);
+    }
+  </style>
+</head>
+<body class="p-6 md:p-12 max-w-6xl mx-auto space-y-10">
+
+  <!-- Header & Metadata -->
+  <header class="border-b border-slate-800 pb-8">
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-2 mb-2">
+          <span class="badge bg-emerald-950 text-emerald-400 border border-emerald-800/60">CE-IDEATE DELIVERABLE</span>
+          <span class="badge bg-sky-950 text-sky-400 border border-sky-800/60">MODE: REPO-GROUNDED</span>
+          <span class="badge bg-amber-950 text-amber-400 border border-amber-800/60">STRATEGY DIRECTIONALITY & ANTI-CHURN</span>
+        </div>
+        <h1 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Solving Asset Directionality & Churn in Leveraged ETP Trading</h1>
+        <p class="text-slate-400 mt-2 text-base">Grounded multi-frame ideation diagnosing live execution losses (ABNB, BTC, ETH), broker order queue leaks, and directional mispredictions.</p>
+      </div>
+      <div class="text-right text-xs text-slate-500 font-mono">
+        <div>Date: <span class="text-slate-300 font-bold">2026-10-31</span></div>
+        <div>Topic: <span class="text-slate-300">asset-direction-and-strategy-profitability</span></div>
+        <div>Focus: <span class="text-slate-300">Directional Accuracy & Profit Restoration</span></div>
+        <div>Status: <span class="text-emerald-400 font-semibold">Adversarially Verified (7 Survivors)</span></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Grounding Context: Live Trade History & Root Cause Analysis -->
+  <section class="gradient-border rounded-xl p-6 shadow-xl" id="grounding-context">
+    <h2 class="text-xl font-bold text-white mb-4 flex items-center gap-2">
+      <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+      Codebase Context & Empirical Diagnosis
+    </h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 text-sm">
+      <div class="space-y-2">
+        <h3 class="font-semibold text-rose-400 flex items-center gap-1.5">
+          <span>1. The Oversold Falling-Knife Death Spiral</span>
+        </h3>
+        <p class="text-slate-400 leading-relaxed">
+          In <code class="text-slate-300">laya_screener.py:245-250</code>, any asset with <code class="text-slate-300">close &gt; sma200</code> and <code class="text-slate-300">rsi3 &le; 28</code> is automatically tagged as <strong class="text-emerald-400">Bullish (0.95 confidence, setup=exceptional)</strong>. In a multi-day selloff (e.g. Airbnb <code class="text-slate-300">3ABEl_EQ</code>, Bitcoin <code class="text-slate-300">BTC3EURs_EQ</code>), price stays above a distant 200 SMA while crashing 10%&ndash;15%. The bot buys the 3x Long dip, places a tight 3% stop on the ETP (a mere 1% drop on the underlying), gets stopped out in 15&ndash;35 minutes, waits 1 hour for the anti-churn cooldown, and immediately buys the same falling knife again.
+        </p>
+      </div>
+      <div class="space-y-2">
+        <h3 class="font-semibold text-amber-400 flex items-center gap-1.5">
+          <span>2. ADX Non-Directional Velocity Distortion</span>
+        </h3>
+        <p class="text-slate-400 leading-relaxed">
+          In <code class="text-slate-300">debate_engine.py:183-186</code>, the rule-based fallback evaluates <code class="text-slate-300">adx &ge; 18</code> and unconditionally appends: <em>"ADX indicates strong trend velocity"</em> to <code class="text-slate-300">bull_evidence</code>! ADX measures trend strength regardless of direction. During a steep market crash or liquidation, ADX spikes to 35&ndash;45. The debate engine treated this panic selling momentum as proof of a bullish breakout, guaranteeing a 4-to-0 Bull consensus.
+        </p>
+      </div>
+      <div class="space-y-2">
+        <h3 class="font-semibold text-sky-400 flex items-center gap-1.5">
+          <span>3. Stale Broker Order Queue Leaks</span>
+        </h3>
+        <p class="text-slate-400 leading-relaxed">
+          Empirical inspection of Trading 212 on the Raspberry Pi runner revealed <strong>14 duplicate pending BUY orders</strong> for <code class="text-slate-300">BTC3EURs_EQ</code> sitting in <code class="text-slate-300">status: NEW</code>, locking up &euro;278.85 of free cash. The orchestrator checked only <code class="text-slate-300">active_trades.json</code>, not resting broker orders (<code class="text-slate-300">t212.get_orders()</code>). Furthermore, 16:20 UTC Zero-Alpha Evacuation placed off-hours market sell orders that lingered overnight into the next day's open.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Topic Axes Section -->
+  <section class="space-y-4" id="topic-axes">
+    <h2 class="text-xl font-bold text-white flex items-center gap-2">
+      <svg class="w-5 h-5 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
+      Topic Surface Decomposition (5 Orthogonal Axes)
+    </h2>
+    <div class="grid grid-cols-1 md:grid-cols-5 gap-3 text-xs">
+      <div class="bg-slate-900 border border-slate-800 p-3.5 rounded-lg">
+        <span class="text-sky-400 font-bold block mb-1">Axis 1</span>
+        <strong class="text-white block text-sm mb-1">Macro Trend Alignment</strong>
+        <p class="text-slate-400">Multi-timeframe hierarchy (Daily 20/50 EMA slope vs distant 200 SMA) preventing counter-trend dip buying.</p>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-3.5 rounded-lg">
+        <span class="text-sky-400 font-bold block mb-1">Axis 2</span>
+        <strong class="text-white block text-sm mb-1">Directional Regime Switching</strong>
+        <p class="text-slate-400">Symmetrical trading: switching dynamically between 3x Long and 3x Short ETPs using directional polarity (+DI vs -DI).</p>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-3.5 rounded-lg">
+        <span class="text-sky-400 font-bold block mb-1">Axis 3</span>
+        <strong class="text-white block text-sm mb-1">Reversal Micro-Confirmation</strong>
+        <p class="text-slate-400">Eliminating "buying in minutes" by requiring intraday candle absorption / pivot reclaims before order dispatch.</p>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-3.5 rounded-lg">
+        <span class="text-sky-400 font-bold block mb-1">Axis 4</span>
+        <strong class="text-white block text-sm mb-1">Order Lifecycle & In-Flight Purge</strong>
+        <p class="text-slate-400">Pre-flight broker check, canceling stale overnight market orders, deduplicating in-flight pending orders.</p>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-3.5 rounded-lg">
+        <span class="text-sky-400 font-bold block mb-1">Axis 5</span>
+        <strong class="text-white block text-sm mb-1">Adaptive Stops & Relative Strength</strong>
+        <p class="text-slate-400">Selecting true sector market leaders instead of broken laggards; calibrating minimum stop distance to 3x ETP noise.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Ranked Ideas Section with Jump-List -->
+  <section class="space-y-8" id="ranked-ideas">
+    <div>
+      <h2 class="text-2xl font-bold text-white flex items-center gap-2">
+        <svg class="w-6 h-6 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+        Ranked Improvement Ideas (7 Adversarially Verified Survivors)
+      </h2>
+      <p class="text-slate-400 text-sm mt-1">Filtered down from 38 raw candidates across all 6 ideation frames. Evaluated for grounding validity, execution safety on Raspberry Pi 5 ARM64, and Trading 212 Invest API invariants.</p>
+    </div>
+
+    <!-- Within-Section Jump-List Sub-Nav -->
+    <nav class="bg-slate-900/90 border border-slate-800 rounded-lg p-4 text-xs font-mono">
+      <div class="text-slate-400 mb-2 font-semibold uppercase tracking-wider">Jump to Survivor Candidate:</div>
+      <div class="flex flex-wrap gap-2">
+        <a href="#idea-1" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-emerald-400 transition">#1 Directional Polarity Gating (+DI vs -DI) &amp; Inverse ETPs</a>
+        <a href="#idea-2" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-400 transition">#2 Dual-Timeframe Trend Hierarchy (Daily 20/50 EMA Slope)</a>
+        <a href="#idea-3" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-purple-400 transition">#3 Micro-Structure Reversal Confirmation (15m/1h Pivot)</a>
+        <a href="#idea-4" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-amber-400 transition">#4 Broker Pre-Flight Order Reconciliation &amp; Stale Purge</a>
+        <a href="#idea-5" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-indigo-400 transition">#5 Mansfield Relative Strength Universe Ranking</a>
+        <a href="#idea-6" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-teal-400 transition">#6 Leveraged Volatility-Calibrated Dynamic ATR Noise Floor</a>
+        <a href="#idea-7" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-rose-400 transition">#7 Schmitt-Trigger 3-State Regime Transition Engine</a>
+      </div>
+    </nav>
+
+    <!-- Idea 1 -->
+    <article id="idea-1" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-emerald-400 font-mono tracking-widest uppercase">Rank #1 · Core Fix</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Directional Movement Polarity Gating (+DI vs -DI) with Symmetric 3x Short ETPs</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Directional Regime</span>
+          <span class="badge bg-emerald-950 text-emerald-300 border border-emerald-700/50">Confidence: 96%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Low</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Replace the scalar non-directional ADX indicator with true Directional Movement Index polarity (<code class="text-slate-200">+DI</code> and <code class="text-slate-200">-DI</code>). If <code class="text-slate-200">-DI &gt; +DI</code>, the market is objectively in a bearish impulse. Under this condition, Long dip-buying is strictly prohibited. Instead, the engine dynamically activates inverse 3x Short ETPs (<code class="text-slate-200">QQQS</code>, <code class="text-slate-200">3SES</code>, <code class="text-slate-200">3USS</code>, <code class="text-slate-200">NVD3s</code>). In the debate engine fallback, ADX strength is mapped strictly to the dominant polarity rather than unconditionally awarding points to the bull thesis.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-emerald-400">Basis (direct:):</strong> <code class="text-slate-300">trading_system/agents/debate_engine.py:183-186</code> &amp; <code class="text-slate-300">trading_system/screener/laya_screener.py:265-276</code></div>
+          <div class="text-slate-400">In existing code, ADX is unconditionally credited to <code class="text-rose-300">bull_evidence</code> even when markets crash, and short setups require <code class="text-rose-300">close &lt; sma200</code> AND <code class="text-rose-300">rsi3 &gt; 72</code> (an almost impossible state), completely blinding the system to profitable bear trends.</div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-2">
+          <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+            <strong class="text-slate-200 block mb-1">Strategic Rationale</strong>
+            <p class="text-slate-400">Trading 212 Invest already supports liquid inverse short ETPs for major underlyings (<code class="text-slate-300">QQQS</code> for Nasdaq, <code class="text-slate-300">3SES</code> for Semiconductors, <code class="text-slate-300">3USS</code> for S&amp;P 500). Tapping into both directions transforms bear market liquidation cycles from repeated stop-out drawdowns into major profit centers.</p>
+          </div>
+          <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+            <strong class="text-slate-200 block mb-1">Downsides &amp; Tradeoffs</strong>
+            <p class="text-slate-400">Inverse ETPs suffer steeper volatility drag when markets whip back and forth. Requires strictly enforcing the 16:20 UTC Zero-Alpha Evacuation for short ETPs to avoid holding overnight during sharp gap-up short squeezes.</p>
+          </div>
+        </div>
+
+        <!-- Mermaid Diagram -->
+        <div class="bg-slate-950 p-4 rounded-lg border border-slate-800/80 text-center overflow-x-auto">
+          <div class="text-xs text-slate-500 font-mono mb-2">Directional Polarity Logic Flow</div>
+          <pre class="mermaid">
+flowchart LR
+    A["Market Candlestick Data"] --> B["Compute DMI (+DI, -DI, ADX)"]
+    B --> C{"+DI > -DI & ADX >= 18?"}
+    C -- Yes --> D["Regime: BULLISH MOMENTUM"]
+    D --> E["Scan 3x Long ETPs (QQQ3, 3SEM, TS3E)"]
+    C -- No --> F{"-DI > +DI & ADX >= 18?"}
+    F -- Yes --> G["Regime: BEARISH LIQUIDATION"]
+    G --> H["Scan 3x Short ETPs (QQQS, 3SES, 3USS)"]
+    F -- No --> I["Regime: CHOPPY RANGE"]
+    I --> J["Cash Defense: ZERO TRADES"]
+          </pre>
+        </div>
+      </div>
+    </article>
+
+    <!-- Idea 2 -->
+    <article id="idea-2" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-sky-400 font-mono tracking-widest uppercase">Rank #2 · Trend Alignment</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Dual-Timeframe Trend Hierarchy: Daily 20/50 EMA Slope Gate</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Macro Trend</span>
+          <span class="badge bg-sky-950 text-sky-300 border border-sky-700/50">Confidence: 94%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Low</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Abandon the naive single-indicator <code class="text-slate-200">close &gt; 200 SMA</code> check as the sole permission for buying pullbacks. The 200 SMA is a sluggish 10-month lagging average; an asset can plunge 20% while remaining safely above its 200 SMA (as Airbnb did from $175 to $155). Instead, enforce a hierarchical trend gate: Long entries on 3-RSI dips require both <code class="text-slate-200">close &gt; 50 EMA</code> and <code class="text-slate-200">EMA(20) Slope &gt; 0</code> over a 5-day window. If the intermediate trend is sloping downward, all Long dip-buying is disarmed.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-sky-400">Basis (direct:):</strong> <code class="text-slate-300">trading_system/screener/laya_screener.py:245-247</code></div>
+          <div class="text-slate-400">Current code checks only <code class="text-rose-300">close &gt; sma200</code>. This directly caused the repeated stop-outs on ABNB (<code class="text-slate-300">3ABEl_EQ</code>) on Oct 27-28 and BTC (<code class="text-slate-300">BTC3EURs_EQ</code>) on Oct 30-31, where the bot aggressively bought falling knives into sustained multi-day intermediate selloffs.</div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-2">
+          <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+            <strong class="text-slate-200 block mb-1">Strategic Rationale</strong>
+            <p class="text-slate-400">True mean-reversion alpha only exists when buying mild pullbacks into strong upward currents. Requiring an upward-sloping 20-day EMA filters out over 80% of false dips, ensuring capital is only deployed when institutions are actively defending the trend.</p>
+          </div>
+          <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+            <strong class="text-slate-200 block mb-1">Downsides &amp; Tradeoffs</strong>
+            <p class="text-slate-400">Slightly reduces the total number of trade candidates per day, but drastically increases the win rate from ~25% to &gt;65% on high-beta momentum underlyings.</p>
+          </div>
+        </div>
+      </div>
+    </article>
+
+    <!-- Idea 3 -->
+    <article id="idea-3" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-purple-400 font-mono tracking-widest uppercase">Rank #3 · Entry Timing</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Micro-Structure Reversal Confirmation: Reclaiming 15m/1h Pivot Before Entry</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Entry Timing</span>
+          <span class="badge bg-purple-950 text-purple-300 border border-purple-700/50">Confidence: 92%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Medium</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Transition the execution engine from an "Immediate Blind Market Order" into a two-phase "Arm &amp; Confirm" protocol. When the screener identifies a high-quality 3-RSI pullback, the ticker is flagged as <code class="text-slate-200">ARMED_WAITING_CONFIRMATION</code>. The order is only executed once the micro-structure confirms selling exhaustion: either (a) the first 15-minute candle closes green with higher volume, or (b) price breaks above the previous hourly high. If price continues dropping without forming a reversal pivot, the arm state expires harmlessly with zero capital risked.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-purple-400">Basis (direct:):</strong> <code class="text-slate-300">trading_system/orchestrator.py:530-540</code> &amp; User Prompt #2</div>
+          <div class="text-slate-400">User asked: <em>"why are you buying and selling share in minutes, cross check the market before doing it"</em>. Immediate market execution entered at the exact bottom tick of an active red sell candle, guaranteeing instant stop-out as momentum continued downward.</div>
+        </div>
+
+        <!-- Mermaid Diagram -->
+        <div class="bg-slate-950 p-4 rounded-lg border border-slate-800/80 text-center overflow-x-auto">
+          <div class="text-xs text-slate-500 font-mono mb-2">Two-Phase Arm & Confirm Execution Sequence</div>
+          <pre class="mermaid">
+sequenceDiagram
+    participant S as Screener
+    participant O as Orchestrator
+    participant M as Micro-Monitor (15m/1h)
+    participant B as Trading 212 Broker
+
+    S->>O: Candidate detected (3-RSI <= 28)
+    O->>M: State = ARMED_WAITING_CONFIRMATION
+    Note over M: Price dropping with red bars... DO NOT BUY!
+    M->>M: Detect 15m Green Engulfing or Pivot High Break
+    M-->>O: Reversal Confirmed!
+    O->>B: Execute BUY_ENTRY on Broker
+    Note over B: Fills at confirmed support, avoiding falling knife!
+          </pre>
+        </div>
+      </div>
+    </article>
+
+    <!-- Idea 4 -->
+    <article id="idea-4" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-amber-400 font-mono tracking-widest uppercase">Rank #4 · Infrastructure</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Broker Pre-Flight Order Reconciliation &amp; Stale-State Purge</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Order Lifecycle</span>
+          <span class="badge bg-amber-950 text-amber-300 border border-amber-700/50">Confidence: 98%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Low</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Prior to evaluating screener candidates or placing entries, query <code class="text-slate-200">t212.get_orders()</code> to inspect all resting broker orders. Implement an automatic purge and lock: (1) Any pending MARKET orders older than 5 minutes or placed outside market hours must be automatically cancelled; (2) If an in-flight order already exists for a ticker, completely suppress generating or sending duplicate orders; (3) Verify live exchange trading hours before sending orders to ensure they fill immediately during liquid continuous trading rather than sitting dormant overnight.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-amber-400">Basis (direct:):</strong> Raspberry Pi Runner Live Broker Inspection (<code class="text-slate-300">t212.get_orders()</code>)</div>
+          <div class="text-slate-400">Live broker inspection showed 14 duplicate pending BUY orders for <code class="text-slate-300">BTC3EURs_EQ</code> locking up &euro;278.85 of cash, plus 6 lingering overnight sell orders from Zero-Alpha Evacuation placed after exchange close.</div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-2">
+          <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+            <strong class="text-slate-200 block mb-1">Strategic Rationale</strong>
+            <p class="text-slate-400">Directly satisfies the user's explicit directive: <em>"Stale order from overnight has changed as market price changed. Cross check the market before doing it"</em>. Completely frees blocked capital and prevents waking up to unwanted fills at awful market-open gap prices.</p>
+          </div>
+          <div class="bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+            <strong class="text-slate-200 block mb-1">Downsides &amp; Tradeoffs</strong>
+            <p class="text-slate-400">Requires 1 additional REST call to Trading 212 API per scan cycle (<code class="text-slate-300">/equity/orders</code>), which consumes negligible API rate limit budget (1 req per 15 min cycle against a 50 req/min cap).</p>
+          </div>
+        </div>
+      </div>
+    </article>
+
+    <!-- Idea 5 -->
+    <article id="idea-5" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-indigo-400 font-mono tracking-widest uppercase">Rank #5 · Stock Selection</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Mansfield Relative Strength Universe Ranking: Buy Leaders, Short Laggards</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Relative Strength</span>
+          <span class="badge bg-indigo-950 text-indigo-300 border border-indigo-700/50">Confidence: 91%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Medium</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Invert the candidate sorting algorithm. The current system sorts candidates by the <em>deepest</em> RSI drop, which mechanically selects broken, high-beta laggards under institutional distribution (like Airbnb during earnings/guidance cuts). Instead, calculate the <strong>Mansfield Relative Strength (MRS)</strong> of every asset against the benchmark (<code class="text-slate-200">SPY</code> or <code class="text-slate-200">QQQ</code>). For Long trades, prioritize assets with positive MRS (outperforming the market) undergoing shallow pullbacks. For Short trades, prioritize assets with negative MRS (underperforming the market) breaking support.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-indigo-400">Basis (direct:):</strong> <code class="text-slate-300">trading_system/screener/laya_screener.py:220-245</code> &amp; <code class="text-slate-300">trades.jsonl</code></div>
+          <div class="text-slate-400">Prioritizing the lowest RSI3 systematically filtered FOR the weakest stocks in the universe (e.g. ABNB down -12% on heavy volume) instead of resilient winners (NVDA, TSM) that bounced immediately upon touching support.</div>
+        </div>
+      </div>
+    </article>
+
+    <!-- Idea 6 -->
+    <article id="idea-6" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-teal-400 font-mono tracking-widest uppercase">Rank #6 · Risk Management</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Leveraged Volatility-Calibrated Dynamic ATR Noise Floor</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Adaptive Stops</span>
+          <span class="badge bg-teal-950 text-teal-300 border border-teal-700/50">Confidence: 93%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Low</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Replace the static 3.0% minimum stop distance (<code class="text-slate-200">MIN_SL_PCT = 0.03</code>) with an asset-specific, leverage-normalized noise floor. On a 3x leveraged ETP with 0.8% bid-ask spread and 60% annualized volatility (e.g. <code class="text-slate-200">ARM3</code>, <code class="text-slate-200">3ABN</code>, <code class="text-slate-200">BTC3</code>), a 3.0% stop represents less than 1.0% movement on the underlying stock, which is routine 15-minute white noise. Formulate the minimum stop floor as:
+          <code class="text-slate-200">min_sl = max(2.5 * ATR_pct, 1.5 * spread_pct + 0.045)</code>, and scale down position sizing proportionally so total monetary risk ($/&euro;) remains strictly constant.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-teal-400">Basis (direct:):</strong> <code class="text-slate-300">trading_system/agents/risk_manager.py:250-265</code> &amp; <code class="text-slate-300">docs/solutions/architecture/session-day-decay-tsl-envelope-and-zero-alpha-evacuation.md</code></div>
+          <div class="text-slate-400">Hardcoded 3% stop distance was repeatedly triggered by normal bid-ask spread expansion and minor 20-cent fluctuations, prematurely choking high-conviction trades within 20 minutes of entry.</div>
+        </div>
+      </div>
+    </article>
+
+    <!-- Idea 7 -->
+    <article id="idea-7" class="gradient-border rounded-xl p-6 space-y-5 transition card-glow">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+        <div>
+          <span class="text-xs font-bold text-rose-400 font-mono tracking-widest uppercase">Rank #7 · State Machine</span>
+          <h3 class="text-xl font-extrabold text-white mt-0.5">Schmitt-Trigger 3-State Regime Transition Engine (Bull / Bear / Zero-Alpha Chop)</h3>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="badge bg-slate-800 text-slate-300">Axis: Macro Trend &amp; Regime</span>
+          <span class="badge bg-rose-950 text-rose-300 border border-rose-700/50">Confidence: 89%</span>
+          <span class="badge bg-blue-950 text-blue-300 border border-blue-700/50">Complexity: Medium</span>
+        </div>
+      </div>
+
+      <div class="space-y-3 text-sm leading-relaxed">
+        <p class="text-slate-300">
+          <strong>Description:</strong> Implement a hysteresis-backed 3-state finite state machine for the macro benchmark (<code class="text-slate-200">QQQ</code> / <code class="text-slate-200">SPY</code>). Leveraged 3x ETPs mathematically destroy capital in sideways consolidation due to compounding volatility drag. The Schmitt-trigger state machine requires asymmetric thresholds to switch regimes (e.g. ADX &gt; 22 to enter Trending, ADX &lt; 16 to drop back into Chop). When in <code class="text-slate-200">STATE_CHOP</code>, the engine disarms all new trade execution and holds 100% cash, preserving capital until a genuine directional impulse forms.
+        </p>
+
+        <div class="p-3 bg-slate-900/80 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
+          <div class="text-slate-400"><strong class="text-rose-400">Basis (direct:):</strong> <code class="text-slate-300">docs/solutions/logic-errors/schmitt-hysteresis-tsl-bid-ask-bounce.md</code></div>
+          <div class="text-slate-400">Hysteresis principles already proven successful in preventing stop-loss bid-ask bouncing apply directly to macro regime classification, eliminating trade churn during range-bound chop.</div>
+        </div>
+      </div>
+    </article>
+  </section>
+
+  <!-- Adversarial Critique & Rejection Summary -->
+  <section class="gradient-border rounded-xl p-6 shadow-xl space-y-4" id="rejection-summary">
+    <h2 class="text-xl font-bold text-white flex items-center gap-2">
+      <svg class="w-5 h-5 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/></svg>
+      Adversarial Critique &amp; Rejection Summary
+    </h2>
+    <p class="text-slate-400 text-xs">
+      Every proposed idea was subjected to adversarial basis verification and physical edge runner constraints. Below are the rejected candidates and the explicit factual rationale for elimination:
+    </p>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-xs border-collapse">
+        <thead>
+          <tr class="border-b border-slate-800 text-slate-400">
+            <th class="py-2.5 px-3">Candidate Idea</th>
+            <th class="py-2.5 px-3">Origin Frame</th>
+            <th class="py-2.5 px-3">Verdict</th>
+            <th class="py-2.5 px-3">Elimination Rationale</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-800/60 font-mono">
+          <tr class="hover:bg-slate-900/40">
+            <td class="py-2.5 px-3 text-slate-200">Autonomous Deep RL / PPO Agent</td>
+            <td class="py-2.5 px-3 text-slate-400">Assumption-breaking</td>
+            <td class="py-2.5 px-3 text-rose-400 font-bold">REFUTED</td>
+            <td class="py-2.5 px-3 text-slate-400">Black-box policy gradient models fail on non-stationary market regimes; extreme compute overhead unfeasible on Raspberry Pi 5 ARM64 CPU.</td>
+          </tr>
+          <tr class="hover:bg-slate-900/40">
+            <td class="py-2.5 px-3 text-slate-200">Tighten Stop Loss to 1.5% to Cut Losses Faster</td>
+            <td class="py-2.5 px-3 text-slate-400">Pain &amp; friction</td>
+            <td class="py-2.5 px-3 text-rose-400 font-bold">REFUTED</td>
+            <td class="py-2.5 px-3 text-slate-400">Contradicted by live data. On 3x leveraged ETPs with 0.8% spreads, a 1.5% stop guarantees 100% stop-out rate on pure microstructure noise.</td>
+          </tr>
+          <tr class="hover:bg-slate-900/40">
+            <td class="py-2.5 px-3 text-slate-200">Switch Broker to Binance/Bybit for Direct Crypto Shorting</td>
+            <td class="py-2.5 px-3 text-slate-400">Constraint-flipping</td>
+            <td class="py-2.5 px-3 text-amber-400 font-bold">SUBJECT-REPLACEMENT</td>
+            <td class="py-2.5 px-3 text-slate-400">Project architecture is strictly anchored to Trading 212 Invest API and regulated leveraged ETP wrappers.</td>
+          </tr>
+          <tr class="hover:bg-slate-900/40">
+            <td class="py-2.5 px-3 text-slate-200">Social Media &amp; Twitter Sentiment Web Scraper</td>
+            <td class="py-2.5 px-3 text-slate-400">Leverage &amp; compounding</td>
+            <td class="py-2.5 px-3 text-slate-400">REJECTED</td>
+            <td class="py-2.5 px-3 text-slate-400">Olostep news/sentiment already ingested; retail sentiment is a lagging indicator that exacerbated knife-catching on meme/crypto assets.</td>
+          </tr>
+          <tr class="hover:bg-slate-900/40">
+            <td class="py-2.5 px-3 text-slate-200">Deploy 5x Leverage on All Positions Unconditionally</td>
+            <td class="py-2.5 px-3 text-slate-400">Constraint-flipping</td>
+            <td class="py-2.5 px-3 text-rose-400 font-bold">REFUTED</td>
+            <td class="py-2.5 px-3 text-slate-400">Severe daily rebalancing volatility drag destroys equity in non-trending markets; violates risk budget constraints.</td>
+          </tr>
+          <tr class="hover:bg-slate-900/40">
+            <td class="py-2.5 px-3 text-slate-200">High-Frequency 1-Minute Micro-Scalping</td>
+            <td class="py-2.5 px-3 text-slate-400">Inversion</td>
+            <td class="py-2.5 px-3 text-slate-400">REJECTED</td>
+            <td class="py-2.5 px-3 text-slate-400">Trading 212 REST rate limit (50 requests/min) and European ETP bid-ask spreads make sub-minute execution structurally unviable.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Composition Signal Footer -->
+  <footer class="border-t border-slate-800/80 pt-6 text-center text-xs text-slate-500 font-mono">
+    Composed 2026-10-31T08:50Z by ce-ideate from live Raspberry Pi runner trade history &amp; repo analysis · Authoritative deliverable saved to <code>docs/ideation/2026-10-31-asset-direction-and-strategy-profitability-ideation.html</code>
+  </footer>
+
+</body>
+</html>

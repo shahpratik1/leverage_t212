@@ -79,3 +79,26 @@ An automated risk exit triggered on stagnant leveraged positions that fail to ac
 A risk management rule that exempts strongly trending, profitable positions (e.g. >= +3.0% unrealized gain with Cushion locked) from time-decay stop tightening, preserving full ATR trailing distance for multi-week momentum moves.
 *Avoid: Universal decay choking, premature profit choking*
 
+### Pluggable Strategy Engine
+An architectural pattern decoupling quantitative signal generation, technical indicator computation, and setup qualification from the orchestrator, risk manager, and broker layers into self-contained strategy modules conforming to a unified `BaseStrategy` interface.
+*Avoid: Monolithic indicator screening, tightly coupled strategy logic*
+
+New quantitative strategies can be developed, backtested, and activated via configuration (`ACTIVE_STRATEGY`) without altering broker transport, position monitoring, or stop-loss governance.
+
+### Directional Polarity Gating
+A regime filtering protocol using Directional Movement Index ($+DI$ vs $-DI$) and intermediate moving average slope (e.g. Daily 20/50 EMA) to determine directional market regime before allowing dip-buying or breakout trades.
+*Avoid: Non-directional ADX attribution, static 200 SMA dip-buying*
+
+Forbids buying oversold dips when $-DI > +DI$ or when the 20 EMA slope is negative, preventing counter-trend knife catching during sustained intermediate sell-offs.
+
+### Dual-Track Bear Regime Execution
+A risk-managed short execution protocol that trades 3x inverse short ETPs (`QQQS`, `3USS`, `3SES`) exclusively on highly liquid benchmark indices during confirmed bear impulses ($-DI > +DI$, $ADX \ge 18$), while enforcing 100% Cash Defense for single equities.
+*Avoid: Full equity shorting, unhedged bear drift*
+
+By confining inverse short exposure to broad market indices, the portfolio captures downside liquidity while eliminating borrow costs and violent short-squeeze gap risks on individual high-beta stocks.
+
+### Pre-Flight Order Queue Reconciliation
+A cycle initialization safeguard that queries the broker's resting order book (`get_orders()`) before evaluating new signals, canceling stale market orders ($> 5$ minutes old or placed outside continuous market hours) and suppressing duplicate in-flight orders for the same instrument.
+*Avoid: Blind order dispatch, open-loop execution*
+
+

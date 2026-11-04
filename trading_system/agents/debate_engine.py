@@ -156,34 +156,82 @@ class DebateEngine:
         adx = metrics.get('adx', 0)
         high_20d = metrics.get('high_20d', 0)
         sma5 = metrics.get('sma5', close)
-        
+        plus_di = metrics.get('plus_di')
+        minus_di = metrics.get('minus_di')
+        slope_20 = metrics.get('ema20_slope_5d')
+        strategy_sig = metrics.get('strategy_signal')
+
         from trading_system.config import settings
         rsi3_thresh = getattr(settings, "RSI3_OVERSOLD", 28.0)
         adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
 
-        # 3-RSI check
-        if strategy_type == "3rsi_mean_reversion" or (close > sma200 and rsi3 <= rsi3_thresh):
-            bull_evidence.append(f"Short-term 3-RSI pullback (RSI3={rsi3:.1f} <= {rsi3_thresh:.1f}) with price above 200 SMA.")
-            bull_evidence.append(f"5-day SMA at {sma5:.2f} provides strong magnetic reversion target.")
-        elif rsi14 >= 50:
-            bull_evidence.append(f"RSI(14) at {rsi14:.1f} is above 50, indicating bullish momentum.")
+        # Ingest StrategySignal evidence if available
+        if strategy_sig is not None:
+            for ev in getattr(strategy_sig, "bull_evidence", []):
+                if ev not in bull_evidence:
+                    bull_evidence.append(ev)
+            for ev in getattr(strategy_sig, "bear_evidence", []):
+                if ev not in bear_evidence:
+                    bear_evidence.append(ev)
+
+        # Strategy-specific technical evaluation
+        if strategy_type == "3rsi_mean_reversion":
+            if close > sma200 and rsi3 <= rsi3_thresh:
+                bull_evidence.append(f"Short-term 3-RSI pullback (RSI3={rsi3:.1f} <= {rsi3_thresh:.1f}) with price above 200 SMA.")
+                bull_evidence.append(f"5-day SMA at {sma5:.2f} provides strong magnetic reversion target.")
+            elif close < sma200 and rsi3 >= 78.0:
+                bear_evidence.append(f"Short-term 3-RSI exhaustion rally (RSI3={rsi3:.1f} >= 78.0) with price below 200 SMA.")
         else:
-            bear_evidence.append(f"RSI(14) at {rsi14:.1f} is below 50, indicating bearish momentum.")
-            
+            # Directional / Momentum evaluation
+            if rsi14 >= 50:
+                bull_evidence.append(f"RSI(14) at {rsi14:.1f} is above 50, indicating bullish momentum.")
+            else:
+                bear_evidence.append(f"RSI(14) at {rsi14:.1f} is below 50, indicating bearish momentum.")
+
+        # Moving average alignment
         if ema20 > ema50:
             bull_evidence.append(f"20 EMA ({ema20:.2f}) > 50 EMA ({ema50:.2f}), short-term uptrend.")
         else:
             bear_evidence.append(f"20 EMA ({ema20:.2f}) < 50 EMA ({ema50:.2f}), short-term downtrend.")
-            
+
+        # 20 EMA slope check if present
+        if slope_20 is not None:
+            s_val = float(slope_20)
+            if s_val > 0.0:
+                bull_evidence.append(f"Daily 20 EMA upward slope ({s_val:+.2f}%) confirms positive momentum.")
+            elif s_val < 0.0:
+                bear_evidence.append(f"Daily 20 EMA downward slope ({s_val:+.2f}%) warns of deteriorating momentum.")
+
+        # Macro 200 SMA check
         if close > sma200:
             bull_evidence.append(f"Price ({close:.2f}) > 200 SMA ({sma200:.2f}), long-term uptrend.")
         else:
             bear_evidence.append(f"Price ({close:.2f}) < 200 SMA ({sma200:.2f}), long-term downtrend.")
 
-        if adx >= adx_trend_min:
-            bull_evidence.append(f"ADX at {adx:.1f} indicates strong trend velocity.")
+        # Directional Movement Index (DMI) and Trend Strength (ADX)
+        if plus_di is not None and minus_di is not None:
+            p_di = float(plus_di)
+            m_di = float(minus_di)
+            if p_di > m_di:
+                bull_evidence.append(f"Directional Polarity Bullish: +DI ({p_di:.1f}) > -DI ({m_di:.1f}).")
+                if adx >= adx_trend_min:
+                    bull_evidence.append(f"ADX at {adx:.1f} confirms strong bullish trend velocity.")
+                else:
+                    bear_evidence.append(f"ADX at {adx:.1f} indicates low directional momentum.")
+            else:
+                bear_evidence.append(f"Directional Polarity Bearish: -DI ({m_di:.1f}) > +DI ({p_di:.1f}).")
+                if adx >= adx_trend_min:
+                    bear_evidence.append(f"ADX at {adx:.1f} confirms strong bearish trend velocity.")
+                else:
+                    bear_evidence.append(f"ADX at {adx:.1f} indicates low directional momentum.")
         else:
-            bear_evidence.append(f"ADX at {adx:.1f} indicates low directional momentum.")
+            if adx >= adx_trend_min:
+                if ema20 > ema50 or close > ema20:
+                    bull_evidence.append(f"ADX at {adx:.1f} indicates strong trend velocity.")
+                else:
+                    bear_evidence.append(f"ADX at {adx:.1f} indicates strong downward trend velocity.")
+            else:
+                bear_evidence.append(f"ADX at {adx:.1f} indicates low directional momentum.")
 
         if high_20d > 0 and close >= high_20d * 0.98:
             bull_evidence.append("Price is testing 20-day high, potential breakout.")

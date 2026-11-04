@@ -122,6 +122,9 @@ class Settings:
     SCREENER_TOP_N: int = 15
     MIN_ADX_TREND: float = 18.0  # Trend strength gate for 3x leverage (relaxed from 20.0 to catch trends earlier)
 
+    # Active Pluggable Quantitative Strategy
+    ACTIVE_STRATEGY: str = "directional_trend"  # "directional_trend" or "3rsi_mean_reversion"
+
     # 3-RSI Mean Reversion Strategy (High Win-Rate Institutional Dip Buying)
     ENABLE_3RSI_MEAN_REVERSION: bool = True
     RSI3_OVERSOLD: float = 28.0      # Broadened oversold trigger for shallow bull dips (was 15.0)

@@ -23,7 +23,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from trading_system.config import settings
 from trading_system.data.leveraged_universe import LeveragedUniverse
@@ -67,12 +67,13 @@ class Orchestrator:
         enable_dashboard: Optional[bool] = None,
         dashboard_port: Optional[int] = None,
         open_browser: bool = False,
+        t212_client: Optional[Trading212Client] = None,
     ) -> None:
         settings.validate()
         self.dry_run = dry_run
 
         # ── 1. Trading 212 API Client ─────────────────────────────
-        self.t212 = Trading212Client(
+        self.t212 = t212_client or Trading212Client(
             api_key=settings.TRADING212_API_KEY,
             api_secret=settings.TRADING212_API_SECRET,
             base_url=settings.api_base_url,
@@ -150,6 +151,7 @@ class Orchestrator:
         )
         self.session_start_equity: Optional[float] = None
         self._last_reconciliation_time: float = 0.0
+        self.in_flight_tickers: Set[str] = set()
         self._scan_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="universe_scan")
         self._scan_future: Optional[concurrent.futures.Future] = None
         # Synchronize broker-native GTC Stop Loss / Limit orders for active positions
@@ -382,6 +384,8 @@ class Orchestrator:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         direction = "LONG" if candidate.bias == "bullish" else "SHORT"
         strategy_type = getattr(candidate, "strategy_type", "momentum")
+        if getattr(candidate, "strategy_signal", None) is not None:
+            metrics["strategy_signal"] = candidate.strategy_signal
 
         logger.info("═══ System 2 Deliberation for %s (%s | %s) ═══", underlying, direction, strategy_type)
 
@@ -551,6 +555,23 @@ class Orchestrator:
         ):
             logger.warning("Execution rejected for %s — system is currently HALTED following panic flatten", card.ticker)
             self._log_trade(card, executed=False, reason="System is HALTED")
+            return False
+
+        # ── In-Flight Order & Active Position Deduplication Check ────────
+        if card.trading212_ticker in self.in_flight_tickers:
+            logger.warning(
+                "Execution rejected for %s: in-flight broker order already pending for %s. Skipping duplicate order.",
+                card.ticker, card.trading212_ticker
+            )
+            self._log_trade(card, executed=False, reason="In-flight order already pending")
+            return False
+
+        if self.position_monitor and card.trading212_ticker in self.position_monitor.positions:
+            logger.warning(
+                "Execution rejected for %s: position for %s is already active in position monitor. Skipping duplicate order.",
+                card.ticker, card.trading212_ticker
+            )
+            self._log_trade(card, executed=False, reason="Position already active")
             return False
 
         # ── Pre-trade validation ─────────────────────────────────
@@ -733,6 +754,7 @@ class Orchestrator:
                     ticker=card.trading212_ticker,
                     quantity=order_qty,
                 )
+                self.in_flight_tickers.add(card.trading212_ticker)
                 order_id = entry_order.id
                 logger.info("Order executed successfully: id=%s", order_id)
                 raw_fill_px = getattr(entry_order, "fill_price", 0.0)
@@ -999,6 +1021,67 @@ class Orchestrator:
 
         return candidate_cards
 
+    def reconcile_pending_orders(self) -> None:
+        """Audit open broker orders, cancel stale market orders, and track in-flight tickers."""
+        self.in_flight_tickers.clear()
+        if self.dry_run:
+            return
+
+        try:
+            open_orders = self.t212.get_orders(force_refresh=True)
+            now_utc = datetime.now(timezone.utc)
+            for order in open_orders:
+                if not isinstance(order, dict):
+                    continue
+                order_id = str(order.get("id", ""))
+                ticker = str(order.get("ticker", ""))
+                order_type = str(order.get("type", "")).upper()
+                status = str(order.get("status", "")).upper()
+
+                if not ticker or not order_id:
+                    continue
+
+                # Only examine pending/unfilled market orders
+                if status in ("NEW", "LOCAL", "UNCONFIRMED") and order_type == "MARKET":
+                    is_stale = False
+                    reason = ""
+
+                    # 1. Market closed check
+                    if hasattr(self.t212, "is_market_open") and not self.t212.is_market_open(ticker):
+                        is_stale = True
+                        reason = f"market for {ticker} is closed"
+
+                    # 2. Age threshold (>300 seconds)
+                    creation_time_raw = order.get("creationTime") or order.get("created") or order.get("dateCreated")
+                    if creation_time_raw and not is_stale:
+                        try:
+                            ts_str = str(creation_time_raw).replace("Z", "+00:00")
+                            created_dt = datetime.fromisoformat(ts_str)
+                            age_sec = (now_utc - created_dt).total_seconds()
+                            if age_sec > 300.0:
+                                is_stale = True
+                                reason = f"order age {age_sec:.1f}s > 300s threshold"
+                        except Exception as dt_exc:
+                            logger.debug("Failed parsing order creation time '%s': %s", creation_time_raw, dt_exc)
+
+                    if is_stale:
+                        logger.warning(
+                            "Stale Order Purge: Cancelling lingering %s market order %s for %s (%s)",
+                            status, order_id, ticker, reason,
+                        )
+                        cancelled = self.t212.cancel_order(order_id)
+                        if cancelled:
+                            continue
+
+                # Active/pending order remains in-flight
+                if status in ("NEW", "LOCAL", "UNCONFIRMED"):
+                    self.in_flight_tickers.add(ticker)
+
+            if self.in_flight_tickers:
+                logger.info("Active in-flight broker orders tracked: %s", sorted(self.in_flight_tickers))
+        except Exception as exc:
+            logger.warning("Broker order reconciliation warning: %s", exc)
+
     def run_cycle(self) -> List[DecisionCard]:
         """Execute one complete Scan → Filter → Debate → Execute cycle."""
         logger.info("━━━ Starting 3x Quantitative Cycle at %s ━━━",
@@ -1022,6 +1105,9 @@ class Orchestrator:
                 self.position_monitor.sync_broker_orders()
         except Exception as recon_exc:
             logger.debug("Initial broker reconciliation notice: %s", recon_exc)
+
+        # Step 0b: Broker Pre-Flight Order Queue Reconciliation & Deduplication
+        self.reconcile_pending_orders()
 
         candidate_cards = self._scan_and_deliberate()
         if not candidate_cards:
