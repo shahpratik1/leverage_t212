@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
 
 from trading_system.config import settings
+from trading_system.strategies.base import read_config_value
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -49,6 +50,10 @@ class _SnapshotProxy:
     def __getattr__(self, name: str) -> Any:
         if name in self._overrides:
             return self._overrides[name]
+        if isinstance(self._base, Mapping):
+            if name in self._base:
+                return self._base[name]
+            raise AttributeError(name)
         return getattr(self._base, name)
 
 
@@ -203,10 +208,10 @@ class StrategyImprovementAgent:
         """Record candidate yield of a universe scan cycle and run directional diagnostics."""
         now_str = datetime.now(timezone.utc).isoformat()
         source: Any = config_snapshot if config_snapshot is not None else settings
-        epoch_id = getattr(config_snapshot, "config_epoch_id", None) if config_snapshot is not None else None
-        active_strategy = str(getattr(source, "ACTIVE_STRATEGY", "directional_trend"))
-        current_min_adx = float(getattr(source, "MIN_ADX_TREND", 18.0))
-        current_max_cat = float(getattr(source, "SCREENER_MAX_CATALYST_RISK", 0.25))
+        epoch_id = read_config_value(config_snapshot, "config_epoch_id", None) if config_snapshot is not None else None
+        active_strategy = str(read_config_value(source, "ACTIVE_STRATEGY", "directional_trend"))
+        current_min_adx = float(read_config_value(source, "MIN_ADX_TREND", 18.0))
+        current_max_cat = float(read_config_value(source, "SCREENER_MAX_CATALYST_RISK", 0.25))
 
         if candidate_count > 0:
             self.consecutive_zero_cycles = 0
@@ -300,9 +305,11 @@ class StrategyImprovementAgent:
                     for key in keys:
                         if key == "MIN_ADX_TREND":
                             continue
-                        cur_val = getattr(source, key, None)
+                        cur_val = read_config_value(source, key, None)
                         if cur_val is None and config_snapshot is not None:
-                            cur_val = config_snapshot.dynamic_parameters.get(key)
+                            dyn = read_config_value(config_snapshot, "dynamic_parameters", {}) or {}
+                            if isinstance(dyn, Mapping):
+                                cur_val = dyn.get(key)
                         parameter_recommendations.append(
                             {
                                 "param_key": str(key),
@@ -371,12 +378,12 @@ class StrategyImprovementAgent:
             min_adx = float(
                 candidate_adx_threshold
                 if candidate_adx_threshold is not None
-                else getattr(source, "MIN_ADX_TREND", 18.0)
+                else read_config_value(source, "MIN_ADX_TREND", 18.0)
             )
             max_cat_risk = float(
                 candidate_max_catalyst_risk
                 if candidate_max_catalyst_risk is not None
-                else getattr(source, "SCREENER_MAX_CATALYST_RISK", 0.25)
+                else read_config_value(source, "SCREENER_MAX_CATALYST_RISK", 0.25)
             )
 
             candles = candidate_candles

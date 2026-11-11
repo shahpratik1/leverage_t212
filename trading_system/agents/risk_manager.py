@@ -11,7 +11,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -19,6 +19,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TradeDecision = Literal["BUY_ENTRY", "SELL_ENTRY", "DO_NOT_TRADE", "EXIT"]
+
+
+def _read_cfg(source: Any, key: str, default: Any = None) -> Any:
+    """Read configuration value uniformly from a ConfigSnapshot, Settings, or Mapping."""
+    if source is None:
+        return default
+    if isinstance(source, Mapping):
+        val = source.get(key, default)
+    else:
+        val = getattr(source, key, default)
+    return default if val is None else val
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -218,7 +229,7 @@ class RiskManager:
     ) -> Any:
         """Resolve a risk setting from snapshot first, preserving explicit legacy overrides."""
         if config_snapshot is not None:
-            return getattr(config_snapshot, setting_key, default)
+            return _read_cfg(config_snapshot, setting_key, default)
         current_val = getattr(self, attr, default)
         if attr in self._explicit_args or current_val != self._init_snapshot_values.get(attr, current_val):
             return current_val
@@ -234,14 +245,14 @@ class RiskManager:
 
         source = config_snapshot if config_snapshot is not None else settings
         return {
-            "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None) if config_snapshot is not None else None,
+            "config_epoch_id": _read_cfg(config_snapshot, "config_epoch_id", None) if config_snapshot is not None else None,
             "max_risk_per_trade": float(self._resolve_field("max_risk_per_trade", "MAX_RISK_PER_TRADE", 0.015, config_snapshot)),
             "max_position_pct": float(self._resolve_field("max_position_pct", "MAX_POSITION_PCT", 0.20, config_snapshot)),
             "atr_sl_multiplier": float(self._resolve_field("atr_sl_multiplier", "ATR_SL_MULTIPLIER", 1.5, config_snapshot)),
             "min_sl_pct": float(self._resolve_field("min_sl_pct", "MIN_SL_PCT", 0.005, config_snapshot)),
             "max_sl_pct": float(self._resolve_field("max_sl_pct", "MAX_SL_PCT", 0.03, config_snapshot)),
-            "etp_min_sl_pct": float(getattr(source, "ETP_MIN_SL_PCT", 0.025)),
-            "etp_max_sl_pct": float(getattr(source, "ETP_MAX_SL_PCT", 0.080)),
+            "etp_min_sl_pct": float(_read_cfg(source, "ETP_MIN_SL_PCT", 0.025)),
+            "etp_max_sl_pct": float(_read_cfg(source, "ETP_MAX_SL_PCT", 0.080)),
             "tp1_r": float(self._resolve_field("tp1_r", "TP1_R_MULTIPLE", 1.5, config_snapshot)),
             "tp2_r": float(self._resolve_field("tp2_r", "TP2_R_MULTIPLE", 2.5, config_snapshot)),
             "tp3_r": float(self._resolve_field("tp3_r", "TP3_R_MULTIPLE", 3.5, config_snapshot)),
@@ -257,11 +268,11 @@ class RiskManager:
             "enforce_daily_circuit_breaker": bool(self._resolve_field("enforce_daily_circuit_breaker", "ENFORCE_DAILY_CIRCUIT_BREAKER", True, config_snapshot)),
             "daily_max_drawdown_pct": float(self._resolve_field("daily_max_drawdown_pct", "DAILY_MAX_DRAWDOWN_PCT", 0.02, config_snapshot)),
             "trade_loss_cooldown_seconds": float(self._resolve_field("trade_loss_cooldown_seconds", "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0, config_snapshot)),
-            "enable_5x_leverage": bool(getattr(source, "ENABLE_5X_LEVERAGE", False)),
-            "prefer_5x_leverage": bool(getattr(source, "PREFER_5X_LEVERAGE", False)),
-            "use_leveraged_3x": bool(getattr(source, "USE_LEVERAGED_3X", True)),
-            "max_leverage": int(getattr(source, "MAX_LEVERAGE", 3)),
-            "pure_tsl_mode": bool(getattr(source, "PURE_TSL_MODE", True)),
+            "enable_5x_leverage": bool(_read_cfg(source, "ENABLE_5X_LEVERAGE", False)),
+            "prefer_5x_leverage": bool(_read_cfg(source, "PREFER_5X_LEVERAGE", False)),
+            "use_leveraged_3x": bool(_read_cfg(source, "USE_LEVERAGED_3X", True)),
+            "max_leverage": int(_read_cfg(source, "MAX_LEVERAGE", 3)),
+            "pure_tsl_mode": bool(_read_cfg(source, "PURE_TSL_MODE", True)),
         }
 
     def get_etp_sl_bounds(
@@ -467,13 +478,13 @@ class RiskManager:
             from trading_system.config import settings
             source = settings
 
-        runner_mult = float(getattr(source, "TSL_DECAY_RUNNER_MULT", 2.00))
+        runner_mult = float(_read_cfg(source, "TSL_DECAY_RUNNER_MULT", 2.00))
         if is_runner:
             return round(runner_mult, 2)
 
-        day1_mult = float(getattr(source, "TSL_DECAY_DAY1_MULT", 2.20))
-        step_mult = float(getattr(source, "TSL_DECAY_STEP_MULT", 0.35))
-        floor_mult = float(getattr(source, "TSL_DECAY_FLOOR_MULT", 1.15))
+        day1_mult = float(_read_cfg(source, "TSL_DECAY_DAY1_MULT", 2.20))
+        step_mult = float(_read_cfg(source, "TSL_DECAY_STEP_MULT", 0.35))
+        floor_mult = float(_read_cfg(source, "TSL_DECAY_FLOOR_MULT", 1.15))
         decayed = day1_mult - (step_mult * max(0, session_count - 1))
         return round(max(floor_mult, decayed), 2)
 
@@ -498,7 +509,12 @@ class RiskManager:
             is_runner=is_runner,
             config_snapshot=config_snapshot,
         )
-        distance = max(effective_mult * atr, peak_price * 0.02)
+        min_floor_pct = (
+            float(_read_cfg(config_snapshot, "ETP_MIN_SL_PCT", 0.02))
+            if config_snapshot is not None
+            else 0.02
+        )
+        distance = max(effective_mult * atr, peak_price * min_floor_pct)
         is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
         if is_cfd_short:
             new_tsl = peak_price + distance

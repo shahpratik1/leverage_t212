@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import json
 
 from trading_system.config import settings
+from trading_system.strategies.base import read_config_value
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -80,20 +81,20 @@ class DebateEngine:
     ) -> Dict[str, Any]:
         """Resolve debate configuration dynamically from a ConfigSnapshot or legacy defaults."""
         if config_snapshot is not None:
-            spec_flag = getattr(
+            spec_flag = read_config_value(
                 config_snapshot,
                 "ENABLE_SPECULATIVE_ROUTING",
-                getattr(config_snapshot, "SPECULATIVE_ROUTING", self.speculative_routing),
+                read_config_value(config_snapshot, "SPECULATIVE_ROUTING", self.speculative_routing),
             )
             return {
-                "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None),
-                "adx_trend_min": float(getattr(config_snapshot, "MIN_ADX_TREND", 18.0)),
-                "model": str(getattr(config_snapshot, "LLM_DEEP_MODEL", self.model)),
-                "quick_model": str(getattr(config_snapshot, "LLM_QUICK_MODEL", self.quick_model)),
-                "debate_rounds": int(getattr(config_snapshot, "DEBATE_ROUNDS", self.debate_rounds)),
+                "config_epoch_id": read_config_value(config_snapshot, "config_epoch_id", None),
+                "adx_trend_min": float(read_config_value(config_snapshot, "MIN_ADX_TREND", 18.0)),
+                "model": str(read_config_value(config_snapshot, "LLM_DEEP_MODEL", self.model)),
+                "quick_model": str(read_config_value(config_snapshot, "LLM_QUICK_MODEL", self.quick_model)),
+                "debate_rounds": int(read_config_value(config_snapshot, "DEBATE_ROUNDS", self.debate_rounds)),
                 "speculative_routing": bool(spec_flag),
                 "speculative_threshold": float(
-                    getattr(config_snapshot, "SPECULATIVE_CONFIDENCE_THRESHOLD", self.speculative_threshold)
+                    read_config_value(config_snapshot, "SPECULATIVE_CONFIDENCE_THRESHOLD", self.speculative_threshold)
                 ),
             }
         return {

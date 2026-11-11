@@ -21,7 +21,7 @@ from trading_system.config_schema import (
     ALLOWLISTED_SCREENER_METRICS,
     evaluate_screener_metric_gate,
 )
-from trading_system.strategies.base import BaseStrategy, StrategySignal
+from trading_system.strategies.base import BaseStrategy, StrategySignal, read_config_value
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -207,8 +207,8 @@ def _evaluate_dynamic_snapshot_gates(
     if config_snapshot is None:
         return rejections
 
-    specs = getattr(config_snapshot, "dynamic_parameter_specs", ()) or ()
-    dyn_values = getattr(config_snapshot, "dynamic_parameters", {}) or {}
+    specs = read_config_value(config_snapshot, "dynamic_parameter_specs", ()) or ()
+    dyn_values = read_config_value(config_snapshot, "dynamic_parameters", {}) or {}
     for spec in specs:
         gate = getattr(spec, "screener_metric_gate", None)
         if gate is None:
@@ -413,23 +413,23 @@ class LayaScreener:
         """Resolve screening cutoffs from a ConfigSnapshot or legacy constructor/settings."""
         if config_snapshot is not None:
             return {
-                "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None),
+                "config_epoch_id": read_config_value(config_snapshot, "config_epoch_id", None),
                 "min_setup_score": str(
-                    getattr(config_snapshot, "SCREENER_MIN_SETUP_SCORE", self.min_setup_score)
+                    read_config_value(config_snapshot, "SCREENER_MIN_SETUP_SCORE", self.min_setup_score)
                 ).lower(),
                 "max_catalyst_risk": float(
-                    getattr(config_snapshot, "SCREENER_MAX_CATALYST_RISK", self.max_catalyst_risk)
+                    read_config_value(config_snapshot, "SCREENER_MAX_CATALYST_RISK", self.max_catalyst_risk)
                 ),
-                "top_n": int(getattr(config_snapshot, "SCREENER_TOP_N", self.top_n)),
+                "top_n": int(read_config_value(config_snapshot, "SCREENER_TOP_N", self.top_n)),
                 "max_per_category": int(
-                    getattr(config_snapshot, "SCREENER_MAX_PER_CATEGORY", 2)
+                    read_config_value(config_snapshot, "SCREENER_MAX_PER_CATEGORY", 2)
                 ),
-                "min_adx_trend": float(getattr(config_snapshot, "MIN_ADX_TREND", 18.0)),
+                "min_adx_trend": float(read_config_value(config_snapshot, "MIN_ADX_TREND", 18.0)),
                 "fallback_min_adx": float(
-                    getattr(config_snapshot, "FALLBACK_SCREENER_MIN_ADX", 20.0)
+                    read_config_value(config_snapshot, "FALLBACK_SCREENER_MIN_ADX", 20.0)
                 ),
                 "active_strategy": str(
-                    getattr(config_snapshot, "ACTIVE_STRATEGY", self._init_strategy_name)
+                    read_config_value(config_snapshot, "ACTIVE_STRATEGY", self._init_strategy_name)
                 ),
             }
 
@@ -489,9 +489,9 @@ class LayaScreener:
         - CHOP_RANGE: Low ADX or range-bound moving averages
         """
         if config_snapshot is not None:
-            max_vol = float(getattr(config_snapshot, "HIGH_VOL_MAX_REALIZED_VOL", 0.65))
-            max_atr_spike = float(getattr(config_snapshot, "HIGH_VOL_MAX_ATR_SPIKE_RATIO", 1.50))
-            breakout_adx_min = float(getattr(config_snapshot, "REGIME_BREAKOUT_ADX_MIN", 25.0))
+            max_vol = float(read_config_value(config_snapshot, "HIGH_VOL_MAX_REALIZED_VOL", 0.65))
+            max_atr_spike = float(read_config_value(config_snapshot, "HIGH_VOL_MAX_ATR_SPIKE_RATIO", 1.50))
+            breakout_adx_min = float(read_config_value(config_snapshot, "REGIME_BREAKOUT_ADX_MIN", 25.0))
         else:
             max_vol = float(getattr(settings, "HIGH_VOL_MAX_REALIZED_VOL", 0.65))
             max_atr_spike = float(getattr(settings, "HIGH_VOL_MAX_ATR_SPIKE_RATIO", 1.50))
@@ -889,15 +889,15 @@ class TechnicalFallbackScreener:
         """Resolve fallback screener thresholds from a ConfigSnapshot or legacy defaults."""
         if config_snapshot is not None:
             return {
-                "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None),
-                "top_n": int(getattr(config_snapshot, "SCREENER_TOP_N", self.top_n)),
-                "min_adx": float(getattr(config_snapshot, "FALLBACK_SCREENER_MIN_ADX", self.min_adx)),
-                "max_per_category": int(getattr(config_snapshot, "SCREENER_MAX_PER_CATEGORY", 2)),
+                "config_epoch_id": read_config_value(config_snapshot, "config_epoch_id", None),
+                "top_n": int(read_config_value(config_snapshot, "SCREENER_TOP_N", self.top_n)),
+                "min_adx": float(read_config_value(config_snapshot, "FALLBACK_SCREENER_MIN_ADX", self.min_adx)),
+                "max_per_category": int(read_config_value(config_snapshot, "SCREENER_MAX_PER_CATEGORY", 2)),
                 "min_setup_score": str(
-                    getattr(config_snapshot, "SCREENER_MIN_SETUP_SCORE", "favorable")
+                    read_config_value(config_snapshot, "SCREENER_MIN_SETUP_SCORE", "favorable")
                 ).lower(),
                 "max_catalyst_risk": float(
-                    getattr(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)
+                    read_config_value(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)
                 ),
             }
         return {
@@ -1137,7 +1137,7 @@ def build_cycle_funnel_report(
 ) -> CycleFunnelReport:
     """Aggregate per-stage cycle counts, gate rejection attribution, and compact metrics."""
     epoch_id = config_epoch_id or (
-        getattr(config_snapshot, "config_epoch_id", None)
+        read_config_value(config_snapshot, "config_epoch_id", None)
         if config_snapshot is not None
         else None
     )
@@ -1148,10 +1148,15 @@ def build_cycle_funnel_report(
         compact_indicators = extract_compact_indicators(universe_metrics)
     else:
         for seq in (screener_results or (), strategy_signals or ()):
-            sym = getattr(seq, "ticker", None) or getattr(seq, "symbol", None)
-            m = getattr(seq, "metrics", None)
-            if sym and sym not in compact_indicators and isinstance(m, Mapping):
-                compact_indicators[str(sym)] = _compact_metric_row(m)
+            for item in seq:
+                if isinstance(item, Mapping):
+                    sym = item.get("ticker") or item.get("symbol")
+                    m = item.get("metrics")
+                else:
+                    sym = getattr(item, "ticker", None) or getattr(item, "symbol", None)
+                    m = getattr(item, "metrics", None)
+                if sym and sym not in compact_indicators and isinstance(m, Mapping):
+                    compact_indicators[str(sym)] = _compact_metric_row(m)
 
     percentiles = compute_metric_percentiles(compact_indicators)
 
@@ -1223,7 +1228,7 @@ def build_cycle_funnel_report(
         debate_count = sum(
             1
             for d in debate_outcomes
-            if getattr(d, "consensus_decision", None) in ("BUY_ENTRY", "SHORT_ENTRY")
+            if getattr(d, "consensus_decision", None) in ("BUY_ENTRY", "SELL_ENTRY", "SHORT_ENTRY")
             or bool(getattr(d, "approved", False))
         )
     else:
@@ -1279,13 +1284,13 @@ def simulate_screener_gate_impact(
 
     sanitized_universe = extract_compact_indicators(compact_universe_indicators)
     strategy = DirectionalTrendStrategy()
-    epoch_id = getattr(snapshot, "config_epoch_id", None)
+    epoch_id = read_config_value(snapshot, "config_epoch_id", None)
 
-    min_setup_score = str(getattr(snapshot, "SCREENER_MIN_SETUP_SCORE", "favorable")).lower()
-    max_catalyst_risk = float(getattr(snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25))
-    min_adx = float(getattr(snapshot, "MIN_ADX_TREND", 18.0))
-    top_n = int(getattr(snapshot, "SCREENER_TOP_N", 5))
-    max_per_category = int(getattr(snapshot, "SCREENER_MAX_PER_CATEGORY", 2))
+    min_setup_score = str(read_config_value(snapshot, "SCREENER_MIN_SETUP_SCORE", "favorable")).lower()
+    max_catalyst_risk = float(read_config_value(snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25))
+    min_adx = float(read_config_value(snapshot, "MIN_ADX_TREND", 18.0))
+    top_n = int(read_config_value(snapshot, "SCREENER_TOP_N", 5))
+    max_per_category = int(read_config_value(snapshot, "SCREENER_MAX_PER_CATEGORY", 2))
     score_rank = LayaScreener._SCORE_RANK
 
     all_rejections: List[Dict[str, Any]] = []

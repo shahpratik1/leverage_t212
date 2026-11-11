@@ -404,6 +404,33 @@ class TestScreenerAndFunnelReport(unittest.TestCase):
             self.assertEqual(sim["universe_count"], 3)
             self.assertEqual(sim["passed_count"], 3)
 
+    def test_cycle_funnel_report_fallback_from_results_and_sell_entry_debate(self):
+        screener = LayaScreener()
+        results = [
+            screener.evaluate_single("NVDA", _bullish_metrics(adx=22.0)),
+            screener.evaluate_single("AAPL", _bullish_metrics(adx=28.0)),
+        ]
+        # universe_metrics=None falls back to extracting metrics per item in screener_results
+        report = build_cycle_funnel_report(
+            universe_metrics=None,
+            screener_results=results,
+            debate_outcomes=[
+                SimpleNamespace(consensus_decision="BUY_ENTRY", approved=False),
+                SimpleNamespace(consensus_decision="SELL_ENTRY", approved=False),
+                SimpleNamespace(consensus_decision="DO_NOT_TRADE", approved=False),
+            ],
+        )
+        self.assertEqual(set(report._compact_indicators.keys()), {"NVDA", "AAPL"})
+        self.assertEqual(report.metric_percentiles["adx"]["min"], 22.0)
+        self.assertEqual(report.metric_percentiles["adx"]["max"], 28.0)
+        self.assertEqual(report.stage_counts["debate"], 2)
+
+        # Also verifies strategy_signals fallback when screener_results=None
+        signals = [r.strategy_signal for r in results if r.strategy_signal is not None]
+        sig_report = build_cycle_funnel_report(universe_metrics=None, strategy_signals=signals)
+        self.assertEqual(set(sig_report._compact_indicators.keys()), {"NVDA", "AAPL"})
+        self.assertEqual(sig_report.metric_percentiles["adx"]["count"], 2)
+
 
 class TestDebateEngineEpochAdaptation(unittest.TestCase):
     def test_reused_debate_engine_uses_snapshot_thresholds_and_models(self):
@@ -615,6 +642,56 @@ class TestRiskManagerEpochAndStatePreservation(unittest.TestCase):
                 config_snapshot=snap2,
             )
             self.assertGreaterEqual(ratchet, 100.0)
+
+    def test_dict_config_snapshot_and_trailing_stop_etp_min_sl_alignment(self):
+        dict_snap = {
+            "config_epoch_id": "epoch-dict-7",
+            "TSL_DECAY_DAY1_MULT": 2.40,
+            "TSL_DECAY_RUNNER_MULT": 2.35,
+            "ETP_MIN_SL_PCT": 0.035,
+            "ETP_MAX_SL_PCT": 0.090,
+            "MIN_ADX_TREND": 30.0,
+        }
+        self.assertAlmostEqual(
+            RiskManager.get_decay_atr_multiplier(1, False, dict_snap),
+            2.40,
+        )
+        self.assertAlmostEqual(
+            RiskManager.get_decay_atr_multiplier(1, True, dict_snap),
+            2.35,
+        )
+
+        rm = RiskManager()
+        self.assertEqual(rm.get_etp_sl_bounds(dict_snap), (0.035, 0.090))
+
+        # Trailing stop honors ETP_MIN_SL_PCT when snapshot is provided vs 0.02 when None
+        self.assertAlmostEqual(
+            rm.calculate_trailing_stop(
+                current_price=100.0,
+                peak_price=100.0,
+                atr=0.5,
+                current_tsl=90.0,
+                config_snapshot=dict_snap,
+            ),
+            96.50,
+        )
+        self.assertAlmostEqual(
+            rm.calculate_trailing_stop(
+                current_price=100.0,
+                peak_price=100.0,
+                atr=0.5,
+                current_tsl=90.0,
+                config_snapshot=None,
+            ),
+            98.00,
+        )
+
+        # Dict snapshot also works cleanly in strategy evaluation
+        sig = DirectionalTrendStrategy().evaluate_candidate(
+            "NVDA", _bullish_metrics(adx=25.0), config_snapshot=dict_snap
+        )
+        self.assertEqual(sig.direction, "NEUTRAL")
+        self.assertEqual(sig.config_epoch_id, "epoch-dict-7")
 
 
 class TestStrategyImprovementAndBacktestEpoch(unittest.TestCase):

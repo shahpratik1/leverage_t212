@@ -9,10 +9,21 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
+
+
+def read_config_value(source: Any, key: str, default: Any = None) -> Any:
+    """Read a config value uniformly from a ConfigSnapshot, Settings, or Mapping."""
+    if source is None:
+        return default
+    if isinstance(source, Mapping):
+        val = source.get(key, default)
+    else:
+        val = getattr(source, key, default)
+    return default if val is None else val
 
 
 @dataclass(frozen=True)

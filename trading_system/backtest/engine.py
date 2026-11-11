@@ -411,12 +411,13 @@ class BacktestEngine:
         forecast_5d = self._calculate_rolling_nixtla_forecast(closes, 5)
         sentiment_score = self._calculate_sentiment_proxy(closes, 14)
 
+        from trading_system.strategies.base import read_config_value
         from trading_system.strategies.directional_trend import DirectionalTrendStrategy
 
         directional_strategy = DirectionalTrendStrategy()
         if config_snapshot is not None:
             max_catalyst_risk = float(
-                getattr(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)
+                read_config_value(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)
             )
         elif settings is not None:
             max_catalyst_risk = float(

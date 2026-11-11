@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from trading_system.config import settings
 from trading_system.config_schema import evaluate_screener_metric_gate
-from trading_system.strategies.base import BaseStrategy, StrategySignal
+from trading_system.strategies.base import BaseStrategy, StrategySignal, read_config_value
 from trading_system.strategies.registry import StrategyRegistry
 
 if TYPE_CHECKING:
@@ -81,19 +81,19 @@ class DirectionalTrendStrategy(BaseStrategy):
     ) -> Dict[str, Any]:
         """Resolve strategy thresholds from a ConfigSnapshot or runtime settings."""
         if config_snapshot is not None:
-            raw_indices = getattr(config_snapshot, "BROAD_INDICES", None)
+            raw_indices = read_config_value(config_snapshot, "BROAD_INDICES", None)
             broad_set = set(raw_indices) if raw_indices is not None else self.broad_indices
             return {
-                "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None),
-                "min_adx_trend": float(getattr(config_snapshot, "MIN_ADX_TREND", 18.0)),
-                "max_catalyst_risk": float(getattr(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)),
-                "exceptional_adx": float(getattr(config_snapshot, "STRATEGY_EXCEPTIONAL_ADX", 25.0)),
-                "min_ema20_slope_pct": float(getattr(config_snapshot, "MIN_EMA20_SLOPE_PCT", 0.0)),
-                "earnings_blackout_days": float(getattr(config_snapshot, "ENTRY_EARNINGS_BLACKOUT_DAYS", 2.0)),
-                "base_conviction": float(getattr(config_snapshot, "STRATEGY_BASE_CONVICTION", 0.70)),
-                "short_base_conviction": float(getattr(config_snapshot, "STRATEGY_SHORT_BASE_CONVICTION", 0.75)),
-                "macro_tailwind_bonus": float(getattr(config_snapshot, "STRATEGY_MACRO_TAILWIND_BONUS", 0.10)),
-                "max_conviction": float(getattr(config_snapshot, "DIRECTIONAL_MAX_CONVICTION", 0.95)),
+                "config_epoch_id": read_config_value(config_snapshot, "config_epoch_id", None),
+                "min_adx_trend": float(read_config_value(config_snapshot, "MIN_ADX_TREND", 18.0)),
+                "max_catalyst_risk": float(read_config_value(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)),
+                "exceptional_adx": float(read_config_value(config_snapshot, "STRATEGY_EXCEPTIONAL_ADX", 25.0)),
+                "min_ema20_slope_pct": float(read_config_value(config_snapshot, "MIN_EMA20_SLOPE_PCT", 0.0)),
+                "earnings_blackout_days": float(read_config_value(config_snapshot, "ENTRY_EARNINGS_BLACKOUT_DAYS", 2.0)),
+                "base_conviction": float(read_config_value(config_snapshot, "STRATEGY_BASE_CONVICTION", 0.70)),
+                "short_base_conviction": float(read_config_value(config_snapshot, "STRATEGY_SHORT_BASE_CONVICTION", 0.75)),
+                "macro_tailwind_bonus": float(read_config_value(config_snapshot, "STRATEGY_MACRO_TAILWIND_BONUS", 0.10)),
+                "max_conviction": float(read_config_value(config_snapshot, "DIRECTIONAL_MAX_CONVICTION", 0.95)),
                 "broad_indices": broad_set,
             }
 
@@ -140,8 +140,8 @@ class DirectionalTrendStrategy(BaseStrategy):
         if config_snapshot is None:
             return rejections
 
-        specs = getattr(config_snapshot, "dynamic_parameter_specs", ()) or ()
-        dyn_values = getattr(config_snapshot, "dynamic_parameters", {}) or {}
+        specs = read_config_value(config_snapshot, "dynamic_parameter_specs", ()) or ()
+        dyn_values = read_config_value(config_snapshot, "dynamic_parameters", {}) or {}
         for spec in specs:
             gate = getattr(spec, "screener_metric_gate", None)
             if gate is None:
