@@ -1453,6 +1453,13 @@ class ScreenerMetricGate:
         }
 
 
+def _to_sequence_tuple(value: Any, field_name: str) -> Tuple[Any, ...]:
+    """Convert a non-string iterable to a tuple, raising ValueError otherwise."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ValueError(f"{field_name} must be a sequence")
+    return tuple(value)
+
+
 _DYNAMIC_SPEC_ALLOWED_KEYS: FrozenSet[str] = frozenset({
     "key",
     "label",
@@ -1553,10 +1560,9 @@ class DynamicParameterSpec:
             object.__setattr__(self, "step", float(step_val))
 
         if self.allowed_values is not None:
-            if isinstance(self.allowed_values, (str, bytes)) or not isinstance(self.allowed_values, Iterable):
-                raise ValueError("allowed_values must be a sequence")
+            raw_allowed = _to_sequence_tuple(self.allowed_values, "allowed_values")
             coerced_allowed: List[Any] = []
-            for item in self.allowed_values:
+            for item in raw_allowed:
                 coerced_item, err = validate_value_against_spec(self, item, ignore_allowed=True)
                 if err is not None:
                     raise ValueError(f"Invalid allowed_values entry {item!r}: {err['message']}")
@@ -1565,10 +1571,9 @@ class DynamicParameterSpec:
                 raise ValueError("allowed_values cannot be empty if provided")
             object.__setattr__(self, "allowed_values", tuple(coerced_allowed))
 
-        if isinstance(self.gate_tags, (str, bytes)) or not isinstance(self.gate_tags, Iterable):
-            raise ValueError("gate_tags must be a sequence of strings")
+        raw_tags = _to_sequence_tuple(self.gate_tags, "gate_tags")
         tags_list: List[str] = []
-        for tag in self.gate_tags:
+        for tag in raw_tags:
             _check_string_length(tag, "gate_tags[]")
             tags_list.append(tag)
         object.__setattr__(self, "gate_tags", tuple(tags_list))
@@ -1621,7 +1626,18 @@ class DynamicParameterSpec:
             raise ValueError(f"Dynamic parameter of type {param_type!r} requires 'default'")
 
         label = data["label"] if "label" in data else str(data["key"])
+        raw_allowed = data.get("allowed_values")
+        allowed_values_tuple: Optional[Tuple[Any, ...]] = (
+            _to_sequence_tuple(raw_allowed, "allowed_values")
+            if raw_allowed is not None
+            else None
+        )
         gate_tags_raw = data.get("gate_tags", ("dynamic_metric_gate",))
+        gate_tags_tuple: Tuple[str, ...] = (
+            _to_sequence_tuple(gate_tags_raw, "gate_tags")
+            if gate_tags_raw is not None
+            else ()
+        )
 
         return cls(
             key=data["key"],
@@ -1634,11 +1650,11 @@ class DynamicParameterSpec:
             min=data.get("min"),
             max=data.get("max"),
             step=data.get("step"),
-            allowed_values=tuple(data["allowed_values"]) if data.get("allowed_values") is not None else None,
+            allowed_values=allowed_values_tuple,
             reload_mode=data.get("reload_mode", "hot_reload"),
             revalidation_scope=data.get("revalidation_scope", "abort_stale_scan"),
             impact_hint=data.get("impact_hint", ""),
-            gate_tags=tuple(gate_tags_raw) if gate_tags_raw is not None else (),
+            gate_tags=gate_tags_tuple,
         )
 
     def to_dict(self) -> Dict[str, Any]:

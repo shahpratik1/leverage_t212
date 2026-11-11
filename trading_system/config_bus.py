@@ -607,6 +607,7 @@ class ConfigBus:
         is_process_env: bool,
         testing: bool,
     ) -> None:
+        applied_keys = set()
         for key, spec in SCHEMA_BY_KEY.items():
             if is_process_env and testing and key == "FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE":
                 continue
@@ -618,6 +619,20 @@ class ConfigBus:
             coerced, err = validate_value_against_spec(spec, parsed)
             if err is None:
                 target[key] = _to_snapshot_value(key, coerced)
+                applied_keys.add(key)
+
+        # Mirror Settings.__post_init__ 5x <-> MAX_LEVERAGE parity when env leaves MAX_LEVERAGE unset.
+        if "ENABLE_5X_LEVERAGE" in applied_keys and "MAX_LEVERAGE" not in applied_keys:
+            if target["ENABLE_5X_LEVERAGE"] and target["MAX_LEVERAGE"] < 5:
+                target["MAX_LEVERAGE"] = 5
+            elif not target["ENABLE_5X_LEVERAGE"] and target["MAX_LEVERAGE"] > 3:
+                target["MAX_LEVERAGE"] = 3
+        if (
+            "ENABLE_5X_LEVERAGE" in applied_keys
+            and not target["ENABLE_5X_LEVERAGE"]
+            and "PREFER_5X_LEVERAGE" not in applied_keys
+        ):
+            target["PREFER_5X_LEVERAGE"] = False
 
     def _boot(self) -> None:
         warnings: List[str] = []

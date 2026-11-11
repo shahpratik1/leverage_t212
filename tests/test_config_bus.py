@@ -241,6 +241,23 @@ class TestConfigSchemaAndSettings(unittest.TestCase):
                 _valid_dynamic_spec(label="x" * (MAX_DYNAMIC_STRING_LENGTH + 1))
             )
 
+        # Bare string or non-sequence values must not coerce into character tuples
+        with self.assertRaises(ValueError):
+            DynamicParameterSpec.from_dict(_valid_dynamic_spec(gate_tags="my_tag"))
+        with self.assertRaises(ValueError):
+            DynamicParameterSpec.from_dict(
+                _valid_dynamic_spec(
+                    type="str",
+                    default="fast",
+                    min=None,
+                    max=None,
+                    step=None,
+                    allowed_values="fast",
+                )
+            )
+        with self.assertRaises(ValueError):
+            DynamicParameterSpec.from_dict(_valid_dynamic_spec(gate_tags=123))
+
 
 class TestConfigSnapshot(unittest.TestCase):
     def test_snapshot_is_deeply_immutable_and_roundtrips(self) -> None:
@@ -361,6 +378,38 @@ class TestConfigBusPersistenceAndPrecedence(unittest.TestCase):
             self.assertAlmostEqual(
                 snap4.MAX_RISK_PER_TRADE,
                 BUILTIN_PROFILES["conservative"]["values"]["MAX_RISK_PER_TRADE"],
+            )
+
+    def test_env_5x_leverage_parity_without_max_leverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Enabling 5x in env without MAX_LEVERAGE promotes MAX_LEVERAGE to 5 like Settings
+            bus = ConfigBus(data_dir=root, environ={"ENABLE_5X_LEVERAGE": "true"})
+            snap = bus.active_snapshot()
+            self.assertTrue(snap.ENABLE_5X_LEVERAGE)
+            self.assertEqual(snap.MAX_LEVERAGE, 5)
+            preview = bus.preview_patch({"MIN_ADX_TREND": 20.0}, expected_epoch_id="epoch-0")
+            self.assertTrue(preview["valid"])
+            committed = bus.commit_patch({"MIN_ADX_TREND": 20.0}, expected_epoch_id="epoch-0")
+            self.assertAlmostEqual(committed.MIN_ADX_TREND, 20.0)
+
+            # Reverse parity: .env enables 5x (+prefer_5x), process env disables ENABLE_5X_LEVERAGE
+            env_path = root / ".env"
+            env_path.write_text(
+                "ENABLE_5X_LEVERAGE=true\nPREFER_5X_LEVERAGE=true\n",
+                encoding="utf-8",
+            )
+            bus_rev = ConfigBus(
+                data_dir=root / "rev",
+                env_file=env_path,
+                environ={"ENABLE_5X_LEVERAGE": "false"},
+            )
+            snap_rev = bus_rev.active_snapshot()
+            self.assertFalse(snap_rev.ENABLE_5X_LEVERAGE)
+            self.assertFalse(snap_rev.PREFER_5X_LEVERAGE)
+            self.assertEqual(snap_rev.MAX_LEVERAGE, 3)
+            self.assertTrue(
+                bus_rev.preview_patch({"MIN_ADX_TREND": 21.0}, expected_epoch_id="epoch-0")["valid"]
             )
 
 
