@@ -18,3 +18,14 @@ notifications.jsonl
 *.db-*
 data/*.db*
 .agents/
+
+# Control-plane runtime persistence, halt markers, and auth tokens
+data/
+*.halted
+.dashboard_token
+config_overrides.json
+dynamic_parameters.json
+config_epochs.jsonl
+audit_history.jsonl
+funnel_state.json
+active_trades.json*

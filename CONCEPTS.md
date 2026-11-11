@@ -101,4 +101,15 @@ By confining inverse short exposure to broad market indices, the portfolio captu
 A cycle initialization safeguard that queries the broker's resting order book (`get_orders()`) before evaluating new signals, canceling stale market orders ($> 5$ minutes old or placed outside continuous market hours) and suppressing duplicate in-flight orders for the same instrument.
 *Avoid: Blind order dispatch, open-loop execution*
 
+### Config Epoch
+An immutable, generation-stamped configuration snapshot (`config_epoch_id`) pinned to each scan cycle and open position entry record (`TrackedPosition`).
+*Avoid: Mutable global settings, silent retroactive stop mutation*
+
+Pinning an epoch prevents parallel ingestion and deliberation workers from evaluating assets under mixed settings mid-scan, while preserving each open position's entry exit policy until explicitly migrated via a safety-checked Re-Epoch action.
+
+### Decision Funnel Attribution
+A structured per-cycle diagnostic record capturing stage pass/reject counts, cross-sectional universe indicator distributions, and parameter deep-link tags (`param_keys`) explaining why candidates passed or were rejected.
+*Avoid: Unstructured log scraping, opaque zero-trade cycles*
+
+Linking each gate rejection directly to empirical cross-sectional metrics and its governing schema parameter allows operators to diagnose starved scans and stage evidence-based parameter adjustments in the web console.
 

@@ -51,12 +51,21 @@ rsync -avz --delete \
   --exclude '*.pyc' \
   --exclude '.DS_Store' \
   --exclude 'active_trades.json' \
+  --exclude 'active_trades.json*' \
   --exclude 'trades.jsonl' \
   --exclude 'notifications.jsonl' \
   --exclude '*.log' \
   --exclude '.env' \
   --exclude 'venv' \
   --exclude '.t212_rate_limit.json' \
+  --exclude 'data/' \
+  --exclude '*.halted' \
+  --exclude 'config_overrides.json' \
+  --exclude 'dynamic_parameters.json' \
+  --exclude 'config_epochs.jsonl' \
+  --exclude 'audit_history.jsonl' \
+  --exclude 'funnel_state.json' \
+  --exclude '.dashboard_token' \
   ./ "$PI_DEST:$REMOTE_DIR/"
 
 # 5. Make scripts executable on Pi
