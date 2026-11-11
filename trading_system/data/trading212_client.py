@@ -11,18 +11,20 @@ Supports:
 from __future__ import annotations
 
 import base64
-import email.utils
+import copy
 import csv
+import email.utils
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import httpx
@@ -146,29 +148,65 @@ def _get_rate_limit_state_path() -> str:
     return os.path.join(os.getcwd(), ".t212_rate_limit.json")
 
 
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely convert numeric values (including None/mocks/NaN) to float."""
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        num = float(val)
+        return num if num == num else default
+    except (ValueError, TypeError):
+        return default
+
+
 def _read_cross_process_state(file_path: str) -> Dict[str, Any]:
-    """Read shared rate limit state safely across processes."""
-    if not os.path.exists(file_path):
-        return {}
+    """Read shared rate limit state safely across processes and threads."""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
-    except Exception:
-        pass
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.debug("Failed reading cross-process rate limit state %s: %s", file_path, exc)
     return {}
 
 
-def _write_cross_process_state(file_path: str, state: Dict[str, Any]) -> None:
-    """Write shared rate limit state atomically using a temporary file."""
+def _atomic_write_json(file_path: str, payload: Any) -> None:
+    """Atomically write JSON to disk using a thread-unique NamedTemporaryFile + fsync + os.replace."""
+    target_abs = os.path.abspath(file_path)
+    target_dir = os.path.dirname(target_abs)
+    tmp_path: Optional[str] = None
     try:
-        tmp_file = f"{file_path}.tmp.{os.getpid()}"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp_file, file_path)
-    except Exception:
-        pass
+        os.makedirs(target_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_dir,
+            prefix=f".{os.path.basename(target_abs)}.tmp.",
+            suffix=f".{os.getpid()}.{threading.get_ident()}",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = tmp_file.name
+            json.dump(payload, tmp_file)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, target_abs)
+        tmp_path = None
+    except Exception as exc:
+        logger.debug("Failed atomic JSON write to %s: %s", file_path, exc)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _write_cross_process_state(file_path: str, state: Dict[str, Any]) -> None:
+    """Write shared rate limit state atomically using a thread-unique temporary file."""
+    _atomic_write_json(file_path, state)
 
 
 def _get_instruments_cache_path() -> str:
@@ -194,6 +232,13 @@ class Trading212Client:
     _global_last_request_time = 0.0
     _global_next_allowed_time = 0.0
     _endpoint_next_allowed_time: Dict[str, float] = {}
+    _telemetry_wait_count: int = 0
+    _telemetry_cumulative_wait_ms: float = 0.0
+    _telemetry_max_wait_ms: float = 0.0
+    _telemetry_429_count: int = 0
+    _telemetry_last_429_at: Optional[str] = None
+    _trade_active: bool = False
+    _trade_active_timestamp: float = 0.0
 
     # Official Trading 212 per-endpoint minimum pacing intervals (in seconds)
     ENDPOINT_MIN_DELAYS: Dict[str, float] = {
@@ -239,10 +284,13 @@ class Trading212Client:
     def set_trade_active(cls, active: bool) -> None:
         """Set or clear cross-process trade active flag to synchronize execution across daemons."""
         state_file = _get_rate_limit_state_path()
+        now = time.time()
         with cls._global_rate_lock:
+            cls._trade_active = bool(active)
+            cls._trade_active_timestamp = now if active else 0.0
             state = _read_cross_process_state(state_file)
             state["trade_executing"] = bool(active)
-            state["trade_timestamp"] = time.time() if active else 0.0
+            state["trade_timestamp"] = now if active else 0.0
             _write_cross_process_state(state_file, state)
 
     @classmethod
@@ -251,10 +299,125 @@ class Trading212Client:
         state_file = _get_rate_limit_state_path()
         state = _read_cross_process_state(state_file)
         if state.get("trade_executing"):
-            ts = float(state.get("trade_timestamp", 0.0))
+            ts = _safe_float(state.get("trade_timestamp", 0.0))
             if (time.time() - ts) < window_seconds:
                 return True
         return False
+
+    @classmethod
+    def _advance_rate_targets_locked(
+        cls,
+        endpoint_cat: str,
+        target_global: float,
+        target_endpoint: float,
+        state_file: Optional[str] = None,
+        trade_active_ts: Optional[float] = None,
+    ) -> None:
+        """Update in-memory and optional cross-process pacing targets while holding _global_rate_lock."""
+        cls._global_next_allowed_time = max(cls._global_next_allowed_time, target_global)
+        cls._endpoint_next_allowed_time[endpoint_cat] = max(
+            cls._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
+            target_endpoint,
+        )
+        if trade_active_ts is not None:
+            cls._trade_active = True
+            cls._trade_active_timestamp = trade_active_ts
+        if state_file:
+            state = _read_cross_process_state(state_file)
+            state["global_next_allowed_time"] = max(
+                _safe_float(state.get("global_next_allowed_time", 0.0)),
+                target_global,
+            )
+            if not isinstance(state.get("endpoints"), dict):
+                state["endpoints"] = {}
+            state["endpoints"][endpoint_cat] = max(
+                _safe_float(state["endpoints"].get(endpoint_cat, 0.0)),
+                target_endpoint,
+            )
+            if trade_active_ts is not None:
+                state["trade_executing"] = True
+                state["trade_timestamp"] = trade_active_ts
+            _write_cross_process_state(state_file, state)
+
+    @classmethod
+    def _record_request_completion(
+        cls,
+        endpoint_cat: str,
+        completion_time: float,
+        inter_call_delay: float,
+        endpoint_min_delay: float,
+        state_file: Optional[str] = None,
+    ) -> None:
+        """Record request completion time and update global/endpoint pacing targets under lock."""
+        next_global = completion_time + inter_call_delay
+        next_endpoint = completion_time + endpoint_min_delay
+        with cls._global_rate_lock:
+            cls._global_last_request_time = completion_time
+            cls._advance_rate_targets_locked(
+                endpoint_cat,
+                next_global,
+                next_endpoint,
+                state_file=state_file,
+            )
+
+    @classmethod
+    def _record_wait_telemetry(cls, wait_seconds: float) -> None:
+        """Record a pacing or backoff wait duration into lock-protected telemetry accumulators."""
+        if wait_seconds <= 0.0:
+            return
+        wait_ms = float(wait_seconds) * 1000.0
+        with cls._global_rate_lock:
+            cls._telemetry_wait_count += 1
+            cls._telemetry_cumulative_wait_ms += wait_ms
+            if wait_ms > cls._telemetry_max_wait_ms:
+                cls._telemetry_max_wait_ms = wait_ms
+
+    @classmethod
+    def get_rate_limit_telemetry(cls) -> Dict[str, Any]:
+        """Return lock-protected in-memory rate-limit contention telemetry with zero HTTP or disk I/O."""
+        with cls._global_rate_lock:
+            now = time.time()
+            endpoint_cooldowns = {
+                ep: round(max(0.0, ts - now), 3)
+                for ep, ts in cls._endpoint_next_allowed_time.items()
+            }
+            global_cooldown = round(max(0.0, cls._global_next_allowed_time - now), 3)
+            trade_active = bool(
+                cls._trade_active and (now - cls._trade_active_timestamp) < 30.0
+            )
+            last_request_at = (
+                datetime.fromtimestamp(cls._global_last_request_time, tz=timezone.utc).isoformat()
+                if cls._global_last_request_time > 0.0
+                else None
+            )
+            return {
+                "wait_count": int(cls._telemetry_wait_count),
+                "cumulative_wait_ms": round(float(cls._telemetry_cumulative_wait_ms), 3),
+                "max_wait_ms": round(float(cls._telemetry_max_wait_ms), 3),
+                "rate_limit_429_count": int(cls._telemetry_429_count),
+                "last_429_at": cls._telemetry_last_429_at,
+                "endpoint_cooldown_remaining": endpoint_cooldowns,
+                "global_cooldown_remaining": global_cooldown,
+                "trade_active": trade_active,
+                "last_request_at": last_request_at,
+                "captured_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            }
+
+    @classmethod
+    def reset_rate_limit_telemetry(cls, reset_timers: bool = False) -> None:
+        """Reset rate-limit contention telemetry accumulators (and optionally pacing timers)."""
+        with cls._global_rate_lock:
+            cls._telemetry_wait_count = 0
+            cls._telemetry_cumulative_wait_ms = 0.0
+            cls._telemetry_max_wait_ms = 0.0
+            cls._telemetry_429_count = 0
+            cls._telemetry_last_429_at = None
+            if reset_timers:
+                cls._global_last_request_time = 0.0
+                cls._global_next_allowed_time = 0.0
+                cls._endpoint_next_allowed_time.clear()
+                cls._trade_active = False
+                cls._trade_active_timestamp = 0.0
 
     def __init__(
         self,
@@ -296,6 +459,7 @@ class Trading212Client:
                 default_delay = 1.25
             self.rate_limit_delay = float(default_delay)
 
+        self._cache_lock = threading.RLock()
         self._instruments_cache: Optional[List[Instrument]] = None
         self._instruments_cache_time = 0.0
         self._portfolio_cache: Optional[List[Position]] = None
@@ -304,6 +468,8 @@ class Trading212Client:
         self._account_cash_cache_time = 0.0
         self._orders_cache: Optional[List[Dict[str, Any]]] = None
         self._orders_cache_time = 0.0
+        self._history_orders_cache: Optional[Dict[str, Any]] = None
+        self._history_orders_cache_time = 0.0
 
     @staticmethod
     def _build_auth_header(api_key: str, api_secret: Optional[str] = None) -> str:
@@ -359,91 +525,87 @@ class Trading212Client:
                         )
                         target_time = now + pause_wait
                         with cls._global_rate_lock:
-                            cls._global_next_allowed_time = max(
-                                cls._global_next_allowed_time,
-                                target_time,
-                            )
-                            cls._endpoint_next_allowed_time[endpoint_cat] = max(
-                                cls._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
-                                target_time,
-                            )
+                            cls._advance_rate_targets_locked(endpoint_cat, target_time, target_time)
             except (ValueError, TypeError):
                 pass
 
     def _invalidate_caches(self) -> None:
         """Clear portfolio, cash, and order caches after any state-changing order action."""
-        self._portfolio_cache = None
-        self._account_cash_cache = None
-        self._orders_cache = None
+        with self._cache_lock:
+            self._portfolio_cache = None
+            self._account_cash_cache = None
+            self._orders_cache = None
 
     def _update_cache_post_order(self, ticker: str, quantity: float, fill_price: float = 0.0) -> None:
         """Optimistically update cash and portfolio cache without forcing a cold network hit."""
         now = time.time()
-        if fill_price <= 0.0 and isinstance(self._portfolio_cache, list):
-            for p in self._portfolio_cache:
-                if isinstance(p, Position) and p.ticker == ticker and p.current_price > 0:
-                    fill_price = p.current_price
-                    break
+        with self._cache_lock:
+            if fill_price <= 0.0 and isinstance(self._portfolio_cache, list):
+                for p in self._portfolio_cache:
+                    if isinstance(p, Position) and p.ticker == ticker and p.current_price > 0:
+                        fill_price = p.current_price
+                        break
 
-        notional = abs(quantity) * (fill_price if fill_price > 0 else 0.0)
+            notional = abs(quantity) * (fill_price if fill_price > 0 else 0.0)
 
-        # 1. Update cash cache if valid AccountCash instance
-        if isinstance(self._account_cash_cache, AccountCash) and notional > 0:
-            if quantity > 0:  # BUY
-                new_free = max(0.0, self._account_cash_cache.free - notional)
-                new_invested = self._account_cash_cache.invested + notional
-            else:  # SELL
-                new_free = self._account_cash_cache.free + notional
-                new_invested = max(0.0, self._account_cash_cache.invested - notional)
+            # 1. Update cash cache if valid AccountCash instance
+            if isinstance(self._account_cash_cache, AccountCash) and notional > 0:
+                if quantity > 0:  # BUY
+                    new_free = max(0.0, self._account_cash_cache.free - notional)
+                    new_invested = self._account_cash_cache.invested + notional
+                else:  # SELL
+                    new_free = self._account_cash_cache.free + notional
+                    new_invested = max(0.0, self._account_cash_cache.invested - notional)
 
-            self._account_cash_cache = AccountCash(
-                free=new_free,
-                invested=new_invested,
-                total=self._account_cash_cache.total,
-                blocked=self._account_cash_cache.blocked,
-                result=self._account_cash_cache.result,
-                ppl_result=self._account_cash_cache.ppl_result,
-            )
-            self._account_cash_cache_time = now
-        else:
-            self._account_cash_cache = None
+                self._account_cash_cache = AccountCash(
+                    free=new_free,
+                    invested=new_invested,
+                    total=self._account_cash_cache.total,
+                    blocked=self._account_cash_cache.blocked,
+                    result=self._account_cash_cache.result,
+                    ppl_result=self._account_cash_cache.ppl_result,
+                )
+                self._account_cash_cache_time = now
+            else:
+                self._account_cash_cache = None
 
-        # 2. Update portfolio cache if valid list of Positions
-        if isinstance(self._portfolio_cache, list) and all(isinstance(p, Position) for p in self._portfolio_cache):
-            updated_positions = []
-            found = False
-            for p in self._portfolio_cache:
-                if p.ticker == ticker:
-                    found = True
-                    new_qty = p.quantity + quantity
-                    if abs(new_qty) > 1e-6:
-                        updated_positions.append(Position(
-                            ticker=p.ticker,
-                            quantity=new_qty,
-                            average_price=fill_price if fill_price > 0 else p.average_price,
-                            current_price=fill_price if fill_price > 0 else p.current_price,
-                            ppl=p.ppl,
-                            max_buy=p.max_buy,
-                            max_sell=p.max_sell,
-                        ))
-                else:
-                    updated_positions.append(p)
-            if not found and quantity > 0:
-                updated_positions.append(Position(
-                    ticker=ticker,
-                    quantity=quantity,
-                    average_price=fill_price,
-                    current_price=fill_price,
-                    ppl=0.0,
-                    max_buy=0.0,
-                    max_sell=0.0,
-                ))
-            self._portfolio_cache = updated_positions
-            self._portfolio_cache_time = now
-        else:
-            self._portfolio_cache = None
+            # 2. Update portfolio cache if valid list of Positions
+            if isinstance(self._portfolio_cache, list) and all(isinstance(p, Position) for p in self._portfolio_cache):
+                updated_positions = []
+                found = False
+                for p in self._portfolio_cache:
+                    if p.ticker == ticker:
+                        found = True
+                        new_qty = p.quantity + quantity
+                        if abs(new_qty) > 1e-6:
+                            updated_positions.append(Position(
+                                ticker=p.ticker,
+                                quantity=new_qty,
+                                average_price=fill_price if fill_price > 0 else p.average_price,
+                                current_price=fill_price if fill_price > 0 else p.current_price,
+                                ppl=p.ppl,
+                                max_buy=p.max_buy,
+                                max_sell=p.max_sell,
+                                currency=p.currency,
+                            ))
+                    else:
+                        updated_positions.append(p)
+                if not found and quantity > 0:
+                    updated_positions.append(Position(
+                        ticker=ticker,
+                        quantity=quantity,
+                        average_price=fill_price,
+                        current_price=fill_price,
+                        ppl=0.0,
+                        max_buy=0.0,
+                        max_sell=0.0,
+                    ))
+                self._portfolio_cache = updated_positions
+                self._portfolio_cache_time = now
+            else:
+                self._portfolio_cache = None
 
-        self._orders_cache = None
+            self._orders_cache = None
 
     def _request(
         self,
@@ -463,16 +625,18 @@ class Trading212Client:
             is_429 = False
             headers_dict: Dict[str, str] = {}
             inter_call_delay = self.rate_limit_delay if is_test_mode else 1.25
+            active_state_file = state_file if (not is_test_mode and state_file) else None
 
             # ── Step 1: Reserve time slot atomically under lock (held for < 0.1ms) ──
             with self._global_rate_lock:
                 now = time.time()
                 file_global_target = 0.0
                 file_endpoint_target = 0.0
-                if not is_test_mode and state_file:
-                    state = _read_cross_process_state(state_file)
-                    file_global_target = state.get("global_next_allowed_time", 0.0)
-                    file_endpoint_target = state.get("endpoints", {}).get(endpoint_cat, 0.0)
+                if active_state_file:
+                    state = _read_cross_process_state(active_state_file)
+                    file_global_target = _safe_float(state.get("global_next_allowed_time", 0.0))
+                    endpoints_map = state.get("endpoints") if isinstance(state.get("endpoints"), dict) else {}
+                    file_endpoint_target = _safe_float(endpoints_map.get(endpoint_cat, 0.0))
 
                 # Earliest time this specific endpoint can run:
                 endpoint_ready = max(
@@ -493,24 +657,22 @@ class Trading212Client:
                 # Reserve slot for next callers
                 next_global = target_time + inter_call_delay
                 next_endpoint = target_time + endpoint_min_delay
-                Trading212Client._global_next_allowed_time = next_global
-                Trading212Client._endpoint_next_allowed_time[endpoint_cat] = next_endpoint
-
-                if not is_test_mode and state_file:
-                    state = _read_cross_process_state(state_file)
-                    state["global_next_allowed_time"] = max(state.get("global_next_allowed_time", 0.0), next_global)
-                    if "endpoints" not in state or not isinstance(state["endpoints"], dict):
-                        state["endpoints"] = {}
-                    state["endpoints"][endpoint_cat] = max(state["endpoints"].get(endpoint_cat, 0.0), next_endpoint)
-                    if endpoint_cat == "orders_mutation":
-                        state["trade_executing"] = True
-                        state["trade_timestamp"] = target_time
-                    _write_cross_process_state(state_file, state)
+                trade_ts = target_time if (active_state_file and endpoint_cat == "orders_mutation") else None
+                Trading212Client._advance_rate_targets_locked(
+                    endpoint_cat,
+                    next_global,
+                    next_endpoint,
+                    state_file=active_state_file,
+                    trade_active_ts=trade_ts,
+                )
 
             # ── Step 2: Sleep OUTSIDE lock so other threads/endpoints don't block ──
             wait_needed = target_time - time.time()
             if wait_needed > 0:
+                sleep_start = time.monotonic()
                 time.sleep(wait_needed)
+                actual_wait = max(0.0, time.monotonic() - sleep_start)
+                self._record_wait_telemetry(max(wait_needed, actual_wait))
 
             logger.debug("%s %s params=%s json=%s", method, path, params, json_data)
 
@@ -521,25 +683,13 @@ class Trading212Client:
                     headers_dict = _extract_response_headers(response)
                     completion_time = time.time()
                     self.last_request_time = completion_time
-                    with self._global_rate_lock:
-                        Trading212Client._global_last_request_time = completion_time
-                        next_global = completion_time + inter_call_delay
-                        next_endpoint = completion_time + endpoint_min_delay
-                        Trading212Client._global_next_allowed_time = max(
-                            Trading212Client._global_next_allowed_time,
-                            next_global,
-                        )
-                        Trading212Client._endpoint_next_allowed_time[endpoint_cat] = max(
-                            Trading212Client._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
-                            next_endpoint,
-                        )
-                        if not is_test_mode and state_file:
-                            state = _read_cross_process_state(state_file)
-                            state["global_next_allowed_time"] = max(state.get("global_next_allowed_time", 0.0), next_global)
-                            if "endpoints" not in state or not isinstance(state["endpoints"], dict):
-                                state["endpoints"] = {}
-                            state["endpoints"][endpoint_cat] = max(state["endpoints"].get(endpoint_cat, 0.0), next_endpoint)
-                            _write_cross_process_state(state_file, state)
+                    self._record_request_completion(
+                        endpoint_cat,
+                        completion_time,
+                        inter_call_delay,
+                        endpoint_min_delay,
+                        state_file=active_state_file,
+                    )
 
                     if response.status_code == 429:
                         is_429 = True
@@ -570,25 +720,13 @@ class Trading212Client:
                             headers_dict = _extract_response_headers(resp)
                             completion_time = time.time()
                             self.last_request_time = completion_time
-                            with self._global_rate_lock:
-                                Trading212Client._global_last_request_time = completion_time
-                                next_global = completion_time + inter_call_delay
-                                next_endpoint = completion_time + endpoint_min_delay
-                                Trading212Client._global_next_allowed_time = max(
-                                    Trading212Client._global_next_allowed_time,
-                                    next_global,
-                                )
-                                Trading212Client._endpoint_next_allowed_time[endpoint_cat] = max(
-                                    Trading212Client._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
-                                    next_endpoint,
-                                )
-                                if not is_test_mode and state_file:
-                                    state = _read_cross_process_state(state_file)
-                                    state["global_next_allowed_time"] = max(state.get("global_next_allowed_time", 0.0), next_global)
-                                    if "endpoints" not in state or not isinstance(state["endpoints"], dict):
-                                        state["endpoints"] = {}
-                                    state["endpoints"][endpoint_cat] = max(state["endpoints"].get(endpoint_cat, 0.0), next_endpoint)
-                                    _write_cross_process_state(state_file, state)
+                            self._record_request_completion(
+                                endpoint_cat,
+                                completion_time,
+                                inter_call_delay,
+                                endpoint_min_delay,
+                                state_file=active_state_file,
+                            )
 
                             self._check_proactive_rate_limit(headers_dict, endpoint_cat)
                             raw = resp.read().decode("utf-8")
@@ -599,25 +737,13 @@ class Trading212Client:
                         headers_dict = _extract_response_headers(err)
                         completion_time = time.time()
                         self.last_request_time = completion_time
-                        with self._global_rate_lock:
-                            Trading212Client._global_last_request_time = completion_time
-                            next_global = completion_time + inter_call_delay
-                            next_endpoint = completion_time + endpoint_min_delay
-                            Trading212Client._global_next_allowed_time = max(
-                                Trading212Client._global_next_allowed_time,
-                                next_global,
-                            )
-                            Trading212Client._endpoint_next_allowed_time[endpoint_cat] = max(
-                                Trading212Client._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
-                                next_endpoint,
-                            )
-                            if not is_test_mode and state_file:
-                                state = _read_cross_process_state(state_file)
-                                state["global_next_allowed_time"] = max(state.get("global_next_allowed_time", 0.0), next_global)
-                                if "endpoints" not in state or not isinstance(state["endpoints"], dict):
-                                    state["endpoints"] = {}
-                                state["endpoints"][endpoint_cat] = max(state["endpoints"].get(endpoint_cat, 0.0), next_endpoint)
-                                _write_cross_process_state(state_file, state)
+                        self._record_request_completion(
+                            endpoint_cat,
+                            completion_time,
+                            inter_call_delay,
+                            endpoint_min_delay,
+                            state_file=active_state_file,
+                        )
 
                         if err.code == 429:
                             is_429 = True
@@ -629,25 +755,13 @@ class Trading212Client:
             except Exception as exc:
                 completion_time = time.time()
                 self.last_request_time = completion_time
-                with self._global_rate_lock:
-                    Trading212Client._global_last_request_time = completion_time
-                    next_global = completion_time + inter_call_delay
-                    next_endpoint = completion_time + endpoint_min_delay
-                    Trading212Client._global_next_allowed_time = max(
-                        Trading212Client._global_next_allowed_time,
-                        next_global,
-                    )
-                    Trading212Client._endpoint_next_allowed_time[endpoint_cat] = max(
-                        Trading212Client._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
-                        next_endpoint,
-                    )
-                    if not is_test_mode and state_file:
-                        state = _read_cross_process_state(state_file)
-                        state["global_next_allowed_time"] = max(state.get("global_next_allowed_time", 0.0), next_global)
-                        if "endpoints" not in state or not isinstance(state["endpoints"], dict):
-                            state["endpoints"] = {}
-                        state["endpoints"][endpoint_cat] = max(state["endpoints"].get(endpoint_cat, 0.0), next_endpoint)
-                        _write_cross_process_state(state_file, state)
+                self._record_request_completion(
+                    endpoint_cat,
+                    completion_time,
+                    inter_call_delay,
+                    endpoint_min_delay,
+                    state_file=active_state_file,
+                )
                 raise Trading212Error(500, str(exc))
 
             if is_429:
@@ -700,37 +814,192 @@ class Trading212Client:
 
                 target_time = now + backoff_wait
                 with self._global_rate_lock:
-                    Trading212Client._global_next_allowed_time = max(
-                        Trading212Client._global_next_allowed_time,
+                    Trading212Client._advance_rate_targets_locked(
+                        endpoint_cat,
                         target_time,
-                    )
-                    Trading212Client._endpoint_next_allowed_time[endpoint_cat] = max(
-                        Trading212Client._endpoint_next_allowed_time.get(endpoint_cat, 0.0),
                         target_time,
+                        state_file=active_state_file,
                     )
-                    if not is_test_mode and state_file:
-                        state = _read_cross_process_state(state_file)
-                        state["global_next_allowed_time"] = max(state.get("global_next_allowed_time", 0.0), target_time)
-                        if "endpoints" not in state or not isinstance(state["endpoints"], dict):
-                            state["endpoints"] = {}
-                        state["endpoints"][endpoint_cat] = max(state["endpoints"].get(endpoint_cat, 0.0), target_time)
-                        _write_cross_process_state(state_file, state)
+                    Trading212Client._telemetry_429_count += 1
+                    Trading212Client._telemetry_last_429_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
 
                 if attempt < max_retries:
                     logger.info(
                         "Trading 212 rate limit threshold reached (429) on %s. Retrying in %.1fs (attempt %d/%d)…",
                         endpoint_cat, backoff_wait, attempt + 1, max_retries
                     )
+                    sleep_start = time.monotonic()
                     time.sleep(backoff_wait)
+                    actual_wait = max(0.0, time.monotonic() - sleep_start)
+                    self._record_wait_telemetry(max(backoff_wait, actual_wait))
                     retry_delay = backoff_wait * 2
                     continue
                 raise Trading212Error(429, f"Too Many Requests on {path} (max retries exceeded)")
 
-    def get_account_cash(self, fallback_equity: Optional[float] = None, force_refresh: bool = False) -> AccountCash:
-        """Get account cash summary with optional fallback if 403 Forbidden and short-lived caching."""
+    def get_cached_account_cash(self) -> Optional[AccountCash]:
+        """Return a copy of the last cached AccountCash without making any HTTP request."""
+        with self._cache_lock:
+            if self._account_cash_cache is None:
+                return None
+            return copy.copy(self._account_cash_cache)
+
+    def get_cached_portfolio(self) -> Optional[List[Position]]:
+        """Return a copy of the last cached portfolio positions without making any HTTP request."""
+        with self._cache_lock:
+            if self._portfolio_cache is None:
+                return None
+            return [copy.copy(p) for p in self._portfolio_cache]
+
+    def get_cached_orders(self) -> Optional[List[Dict[str, Any]]]:
+        """Return a deep copy of the last cached open orders without making any HTTP request."""
+        with self._cache_lock:
+            if self._orders_cache is None:
+                return None
+            return copy.deepcopy(self._orders_cache)
+
+    def get_cached_historical_orders(self) -> Optional[Dict[str, Any]]:
+        """Return a deep copy of the last cached historical orders without making any HTTP request."""
+        with self._cache_lock:
+            if self._history_orders_cache is None:
+                return None
+            return copy.deepcopy(self._history_orders_cache)
+
+    def get_cached_broker_snapshot(self) -> Dict[str, Any]:
+        """Return a JSON-ready snapshot of cached cash, portfolio, orders, historical summary, and rate telemetry with ZERO HTTP calls."""
         now = time.time()
-        if not force_refresh and self._account_cash_cache is not None and (now - self._account_cash_cache_time) < 15.0:
-            return self._account_cash_cache
+        with self._cache_lock:
+            cash = copy.copy(self._account_cash_cache) if self._account_cash_cache is not None else None
+            cash_time = self._account_cash_cache_time
+            portfolio = [copy.copy(p) for p in self._portfolio_cache] if self._portfolio_cache is not None else None
+            portfolio_time = self._portfolio_cache_time
+            orders = copy.deepcopy(self._orders_cache) if self._orders_cache is not None else None
+            orders_time = self._orders_cache_time
+            history = copy.deepcopy(self._history_orders_cache) if self._history_orders_cache is not None else None
+            history_time = self._history_orders_cache_time
+
+        telemetry = self.get_rate_limit_telemetry()
+
+        cash_dict: Optional[Dict[str, float]] = None
+        if cash is not None:
+            cash_dict = {
+                "free": _safe_float(getattr(cash, "free", 0.0)),
+                "invested": _safe_float(getattr(cash, "invested", 0.0)),
+                "total": _safe_float(getattr(cash, "total", 0.0)),
+                "blocked": _safe_float(getattr(cash, "blocked", 0.0)),
+                "result": _safe_float(getattr(cash, "result", 0.0)),
+                "ppl_result": _safe_float(getattr(cash, "ppl_result", 0.0)),
+            }
+
+        portfolio_list: Optional[List[Dict[str, Any]]] = None
+        if portfolio is not None:
+            portfolio_list = [
+                {
+                    "ticker": str(getattr(p, "ticker", "") or ""),
+                    "quantity": _safe_float(getattr(p, "quantity", 0.0)),
+                    "average_price": _safe_float(getattr(p, "average_price", 0.0)),
+                    "current_price": _safe_float(getattr(p, "current_price", 0.0)),
+                    "ppl": _safe_float(getattr(p, "ppl", 0.0)),
+                    "max_buy": _safe_float(getattr(p, "max_buy", 0.0)),
+                    "max_sell": _safe_float(getattr(p, "max_sell", 0.0)),
+                    "currency": getattr(p, "currency", None),
+                }
+                for p in portfolio
+            ]
+
+        open_orders_count: Optional[int] = len(orders) if orders is not None else None
+        active_stops_count: Optional[int] = None
+        if orders is not None:
+            active_stops_count = sum(
+                1 for o in orders
+                if "STOP" in str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
+            )
+
+        items = history.get("items", []) if isinstance(history, dict) else []
+        if not isinstance(items, list):
+            items = []
+        filled_count = 0
+        realised_pnl_total = 0.0
+        latest_fill_at: Optional[str] = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            order_obj = item.get("order") if isinstance(item.get("order"), dict) else {}
+            fill_obj = item.get("fill") if isinstance(item.get("fill"), dict) else {}
+            status = str(order_obj.get("status") or item.get("status") or "").upper()
+            if status == "FILLED" or fill_obj:
+                filled_count += 1
+            wallet = fill_obj.get("walletImpact") if isinstance(fill_obj.get("walletImpact"), dict) else {}
+            rpnl = wallet.get("realisedProfitLoss")
+            if rpnl is not None:
+                realised_pnl_total += _safe_float(rpnl)
+            ts_candidate = fill_obj.get("filledAt") or order_obj.get("createdAt") or item.get("dateModified")
+            if isinstance(ts_candidate, str) and ts_candidate:
+                if latest_fill_at is None or ts_candidate > latest_fill_at:
+                    latest_fill_at = ts_candidate
+
+        historical_summary = {
+            "cached": history is not None,
+            "item_count": len(items),
+            "filled_count": filled_count,
+            "realised_pnl_total": round(realised_pnl_total, 2),
+            "latest_order_at": latest_fill_at,
+        }
+
+        def _ts_to_iso(ts: float) -> Optional[str]:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts > 0.0 else None
+
+        return {
+            "cash": cash_dict,
+            "portfolio": portfolio_list,
+            "orders": orders,
+            "historical_orders": history,
+            "historical_summary": historical_summary,
+            "open_orders_count": open_orders_count,
+            "active_server_stops_count": active_stops_count,
+            "cache_timestamps": {
+                "cash_at": _ts_to_iso(cash_time) if cash is not None else None,
+                "portfolio_at": _ts_to_iso(portfolio_time) if portfolio is not None else None,
+                "orders_at": _ts_to_iso(orders_time) if orders is not None else None,
+                "historical_orders_at": _ts_to_iso(history_time) if history is not None else None,
+            },
+            "cache_ages_seconds": {
+                "cash": round(max(0.0, now - cash_time), 3) if (cash is not None and cash_time > 0.0) else None,
+                "portfolio": round(max(0.0, now - portfolio_time), 3) if (portfolio is not None and portfolio_time > 0.0) else None,
+                "orders": round(max(0.0, now - orders_time), 3) if (orders is not None and orders_time > 0.0) else None,
+                "historical_orders": round(max(0.0, now - history_time), 3) if (history is not None and history_time > 0.0) else None,
+            },
+            "rate_limit_telemetry": telemetry,
+            "captured_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        }
+
+    def get_account_cash(
+        self,
+        fallback_equity: Optional[float] = None,
+        force_refresh: bool = False,
+        cached_only: bool = False,
+    ) -> Optional[AccountCash]:
+        """Get account cash summary with optional fallback if 403 Forbidden and short-lived caching."""
+        if cached_only:
+            if force_refresh:
+                raise ValueError("Cannot combine force_refresh=True and cached_only=True")
+            cached = self.get_cached_account_cash()
+            if cached is not None:
+                return cached
+            if fallback_equity is not None:
+                return AccountCash(
+                    free=float(fallback_equity),
+                    invested=0.0,
+                    total=float(fallback_equity),
+                    blocked=0.0,
+                    result=0.0,
+                    ppl_result=0.0,
+                )
+            return None
+
+        now = time.time()
+        with self._cache_lock:
+            if not force_refresh and self._account_cash_cache is not None and (now - self._account_cash_cache_time) < 15.0:
+                return self._account_cash_cache
 
         try:
             data = self._request("GET", "/equity/account/cash")
@@ -742,8 +1011,9 @@ class Trading212Client:
                 result=float(data.get("result", 0.0)),
                 ppl_result=float(data.get("ppl", 0.0)),
             )
-            self._account_cash_cache = cash
-            self._account_cash_cache_time = now
+            with self._cache_lock:
+                self._account_cash_cache = cash
+                self._account_cash_cache_time = time.time()
             return cash
         except Trading212Error as exc:
             if exc.status_code == 403 and fallback_equity is not None:
@@ -760,16 +1030,24 @@ class Trading212Client:
                     result=0.0,
                     ppl_result=0.0,
                 )
-                self._account_cash_cache = cash
-                self._account_cash_cache_time = now
+                with self._cache_lock:
+                    self._account_cash_cache = cash
+                    self._account_cash_cache_time = time.time()
                 return cash
             raise
 
-    def get_portfolio(self, force_refresh: bool = False) -> List[Position]:
+    def get_portfolio(self, force_refresh: bool = False, cached_only: bool = False) -> List[Position]:
         """Get all current open positions with short-lived TTL caching."""
+        if cached_only:
+            if force_refresh:
+                raise ValueError("Cannot combine force_refresh=True and cached_only=True")
+            cached = self.get_cached_portfolio()
+            return cached if cached is not None else []
+
         now = time.time()
-        if not force_refresh and self._portfolio_cache is not None and (now - self._portfolio_cache_time) < 10.0:
-            return self._portfolio_cache
+        with self._cache_lock:
+            if not force_refresh and self._portfolio_cache is not None and (now - self._portfolio_cache_time) < 10.0:
+                return self._portfolio_cache
 
         data = self._request("GET", "/equity/portfolio")
         if not isinstance(data, list):
@@ -796,50 +1074,78 @@ class Trading212Client:
             )
             for p in data
         ]
-        self._portfolio_cache = positions
-        self._portfolio_cache_time = now
+        with self._cache_lock:
+            self._portfolio_cache = positions
+            self._portfolio_cache_time = time.time()
         return positions
 
-    def get_orders(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    def get_orders(self, force_refresh: bool = False, cached_only: bool = False) -> List[Dict[str, Any]]:
         """Get all open orders with short-lived TTL caching."""
+        if cached_only:
+            if force_refresh:
+                raise ValueError("Cannot combine force_refresh=True and cached_only=True")
+            cached = self.get_cached_orders()
+            return cached if cached is not None else []
+
         now = time.time()
-        if not force_refresh and self._orders_cache is not None and (now - self._orders_cache_time) < 15.0:
-            return self._orders_cache
+        with self._cache_lock:
+            if not force_refresh and self._orders_cache is not None and (now - self._orders_cache_time) < 15.0:
+                return self._orders_cache
 
         data = self._request("GET", "/equity/orders")
         if not isinstance(data, list):
             data = []
-        self._orders_cache = data
-        self._orders_cache_time = now
+        with self._cache_lock:
+            self._orders_cache = data
+            self._orders_cache_time = time.time()
         return data
 
-    def get_historical_orders(self, limit: int = 50, force_refresh: bool = False) -> Dict[str, Any]:
+    def get_historical_orders(
+        self,
+        limit: int = 50,
+        force_refresh: bool = False,
+        cached_only: bool = False,
+    ) -> Dict[str, Any]:
         """Get historical filled, cancelled, or rejected orders from Trading 212."""
+        if cached_only:
+            if force_refresh:
+                raise ValueError("Cannot combine force_refresh=True and cached_only=True")
+            cached = self.get_cached_historical_orders()
+            return cached if cached is not None else {"items": []}
+
         now = time.time()
-        if (
-            not force_refresh
-            and hasattr(self, "_history_orders_cache")
-            and self._history_orders_cache is not None
-            and (now - getattr(self, "_history_orders_cache_time", 0.0)) < 15.0
-        ):
-            return self._history_orders_cache
+        with self._cache_lock:
+            if (
+                not force_refresh
+                and self._history_orders_cache is not None
+                and (now - self._history_orders_cache_time) < 15.0
+            ):
+                return self._history_orders_cache
 
         try:
             data = self._request("GET", f"/equity/history/orders?limit={limit}")
             if not isinstance(data, dict):
                 data = {"items": []}
-            self._history_orders_cache = data
-            self._history_orders_cache_time = now
+            with self._cache_lock:
+                self._history_orders_cache = data
+                self._history_orders_cache_time = time.time()
             return data
         except Exception as exc:
             logger.warning("Failed to fetch historical orders: %s", exc)
             return {"items": []}
 
-    def get_instruments(self, force_refresh: bool = False) -> List[Instrument]:
+    def get_instruments(self, force_refresh: bool = False, cached_only: bool = False) -> List[Instrument]:
         """Get all tradeable instruments, cached in memory (1h) and on disk (24h)."""
+        if cached_only:
+            if force_refresh:
+                raise ValueError("Cannot combine force_refresh=True and cached_only=True")
+            with self._cache_lock:
+                return list(self._instruments_cache) if self._instruments_cache is not None else []
+
         now = time.time()
-        if not force_refresh and self._instruments_cache is not None and (now - self._instruments_cache_time) < 3600.0:
-            return self._instruments_cache
+        with self._cache_lock:
+            if not force_refresh and self._instruments_cache is not None and (now - self._instruments_cache_time) < 3600.0:
+                return self._instruments_cache
 
         is_test_mode = getattr(self, "rate_limit_delay", 1.25) < 0.5
         cache_path = _get_instruments_cache_path()
@@ -866,8 +1172,9 @@ class Trading212Client:
                             )
                             for i in cached_raw
                         ]
-                        self._instruments_cache = instruments
-                        self._instruments_cache_time = now
+                        with self._cache_lock:
+                            self._instruments_cache = instruments
+                            self._instruments_cache_time = time.time()
                         logger.debug("Loaded %d instruments from persistent disk cache: %s", len(instruments), cache_path)
                         return instruments
             except Exception as exc:
@@ -891,19 +1198,14 @@ class Trading212Client:
             )
             for i in data
         ]
-        self._instruments_cache = instruments
-        self._instruments_cache_time = now
+        with self._cache_lock:
+            self._instruments_cache = instruments
+            self._instruments_cache_time = time.time()
 
         # 3. Persist to disk cache atomically if not in test mode
         if not is_test_mode and data:
-            try:
-                tmp_path = f"{cache_path}.tmp.{os.getpid()}"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f)
-                os.replace(tmp_path, cache_path)
-                logger.debug("Persisted %d instruments to disk cache: %s", len(data), cache_path)
-            except Exception as exc:
-                logger.debug("Failed writing instruments cache file: %s", exc)
+            _atomic_write_json(cache_path, data)
+            logger.debug("Persisted %d instruments to disk cache: %s", len(data), cache_path)
 
         return instruments
 
@@ -980,7 +1282,8 @@ class Trading212Client:
             payload["takeProfit"] = take_profit
 
         data = self._request("POST", "/equity/orders/limit", json_data=payload)
-        self._orders_cache = None
+        with self._cache_lock:
+            self._orders_cache = None
         return self._parse_order_result(data)
 
     def place_stop_order(
@@ -999,14 +1302,16 @@ class Trading212Client:
             "timeValidity": validity,
         }
         data = self._request("POST", "/equity/orders/stop", json_data=payload)
-        self._orders_cache = None
+        with self._cache_lock:
+            self._orders_cache = None
         return self._parse_order_result(data)
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order by ID."""
         try:
             self._request("DELETE", f"/equity/orders/{order_id}")
-            self._orders_cache = None
+            with self._cache_lock:
+                self._orders_cache = None
             return True
         except Trading212Error:
             return False
