@@ -7,13 +7,46 @@ risk and universe management parameters, and API base URL resolution.
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 
 logger = logging.getLogger(__name__)
+
+_TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_VALID_SETUP_SCORES = ("unfavorable", "mediocre", "favorable", "exceptional")
+_VALID_LEVERAGE_CAPS = (1, 3, 5)
+
+
+def parse_env_file(path: Union[str, Path]) -> Dict[str, str]:
+    """Parse a dotenv-formatted file into a ``{key: value}`` dictionary."""
+    parsed: Dict[str, str] = {}
+    p = Path(path)
+    if not p.exists():
+        return parsed
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k:
+                        parsed[k] = v
+    except Exception:
+        pass
+    return parsed
+
+
+def _parse_bool_env(raw: str) -> bool:
+    """Parse common boolean environment variable representations."""
+    return raw.strip().lower() in ("1", "true", "yes", "t")
 
 
 def _load_env_file() -> None:
@@ -25,21 +58,256 @@ def _load_env_file() -> None:
     ]
     for p in env_paths:
         if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            k, v = k.strip(), v.strip().strip("'\"")
-                            if k and k not in os.environ:
-                                os.environ[k] = v
-            except Exception:
-                pass
+            for k, v in parse_env_file(p).items():
+                if k not in os.environ:
+                    os.environ[k] = v
             break
 
 
 _load_env_file()
+
+
+def collect_settings_invariant_errors(source: Any) -> List[Dict[str, str]]:
+    """Validate numeric finiteness, bounds, and cross-field Settings invariants.
+
+    Args:
+        source: Either a ``Settings`` instance or a mapping of configuration keys.
+
+    Returns:
+        List of ``{"key": str, "code": str, "message": str}`` error dictionaries.
+    """
+    is_mapping = isinstance(source, Mapping)
+
+    def _val(key: str, default: Any = None) -> Any:
+        if is_mapping:
+            return source.get(key, default)
+        return getattr(source, key, default)
+
+    errors: List[Dict[str, str]] = []
+
+    def _err(key: str, code: str, message: str) -> None:
+        errors.append({"key": key, "code": code, "message": message})
+
+    float_keys = (
+        "DEFAULT_ACCOUNT_EQUITY",
+        "SPECULATIVE_CONFIDENCE_THRESHOLD",
+        "MAX_RISK_PER_TRADE",
+        "MAX_POSITION_PCT",
+        "ATR_SL_MULTIPLIER",
+        "MIN_SL_PCT",
+        "MAX_SL_PCT",
+        "ETP_MIN_SL_PCT",
+        "ETP_MAX_SL_PCT",
+        "TP1_R_MULTIPLE",
+        "TP2_R_MULTIPLE",
+        "TP3_R_MULTIPLE",
+        "TARGET_ANNUAL_VOLATILITY",
+        "SCREENER_MAX_CATALYST_RISK",
+        "MIN_ADX_TREND",
+        "STRATEGY_EXCEPTIONAL_ADX",
+        "MIN_EMA20_SLOPE_PCT",
+        "ENTRY_EARNINGS_BLACKOUT_DAYS",
+        "STRATEGY_BASE_CONVICTION",
+        "STRATEGY_SHORT_BASE_CONVICTION",
+        "STRATEGY_MACRO_TAILWIND_BONUS",
+        "DIRECTIONAL_MAX_CONVICTION",
+        "REGIME_BREAKOUT_ADX_MIN",
+        "HIGH_VOL_MAX_REALIZED_VOL",
+        "HIGH_VOL_MAX_ATR_SPIKE_RATIO",
+        "FALLBACK_SCREENER_MIN_ADX",
+        "TSL_ATR_MULTIPLIER",
+        "TSL_HYSTERESIS_ATR_MULT",
+        "TSL_DECAY_DAY1_MULT",
+        "TSL_DECAY_STEP_MULT",
+        "TSL_DECAY_FLOOR_MULT",
+        "TSL_DECAY_RUNNER_MULT",
+        "TP1_TRIM_PCT",
+        "TP2_TRIM_PCT",
+        "TP3_TRIM_PCT",
+        "MIN_OVERNIGHT_PROFIT_CUSHION_PCT",
+        "RATE_LIMIT_INTER_CALL_DELAY",
+        "MAX_BID_ASK_SPREAD_PCT",
+        "MAX_SPREAD_TO_STOP_RATIO",
+        "TRADE_LOSS_COOLDOWN_SECONDS",
+        "MIN_HOLD_SECONDS",
+        "MAX_PORTFOLIO_BETA_HEAT",
+        "DAILY_MAX_DRAWDOWN_PCT",
+    )
+    non_finite_keys: set[str] = set()
+    for fk in float_keys:
+        v = _val(fk)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            non_finite_keys.add(fk)
+            _err(fk, "non_finite_float", f"{fk} must be a finite number, got {v!r}")
+
+    max_risk = _val("MAX_RISK_PER_TRADE", 0.015)
+    max_pos = _val("MAX_POSITION_PCT", 0.20)
+    if "MAX_RISK_PER_TRADE" not in non_finite_keys and not (0.0 < max_risk <= 1.0):
+        _err("MAX_RISK_PER_TRADE", "out_of_bounds", f"MAX_RISK_PER_TRADE must be in (0.0, 1.0], got {max_risk}")
+    if "MAX_POSITION_PCT" not in non_finite_keys and not (0.0 < max_pos <= 1.0):
+        _err("MAX_POSITION_PCT", "out_of_bounds", f"MAX_POSITION_PCT must be in (0.0, 1.0], got {max_pos}")
+    if (
+        "MAX_RISK_PER_TRADE" not in non_finite_keys
+        and "MAX_POSITION_PCT" not in non_finite_keys
+        and max_risk > max_pos
+    ):
+        _err(
+            "MAX_RISK_PER_TRADE",
+            "cross_field_error",
+            f"MAX_RISK_PER_TRADE ({max_risk}) cannot exceed MAX_POSITION_PCT ({max_pos})",
+        )
+
+    atr_mult = _val("ATR_SL_MULTIPLIER", 2.2)
+    if "ATR_SL_MULTIPLIER" not in non_finite_keys and atr_mult <= 0:
+        _err("ATR_SL_MULTIPLIER", "out_of_bounds", f"ATR_SL_MULTIPLIER must be positive, got {atr_mult}")
+
+    min_sl = _val("MIN_SL_PCT", 0.005)
+    max_sl = _val("MAX_SL_PCT", 0.03)
+    if "MIN_SL_PCT" not in non_finite_keys and min_sl <= 0:
+        _err("MIN_SL_PCT", "out_of_bounds", f"MIN_SL_PCT must be positive, got {min_sl}")
+    if "MIN_SL_PCT" not in non_finite_keys and "MAX_SL_PCT" not in non_finite_keys and max_sl <= min_sl:
+        _err("MAX_SL_PCT", "cross_field_error", f"MAX_SL_PCT ({max_sl}) must be greater than MIN_SL_PCT ({min_sl})")
+
+    etp_min_sl = _val("ETP_MIN_SL_PCT", 0.025)
+    etp_max_sl = _val("ETP_MAX_SL_PCT", 0.080)
+    if "ETP_MIN_SL_PCT" not in non_finite_keys and etp_min_sl <= 0:
+        _err("ETP_MIN_SL_PCT", "out_of_bounds", f"ETP_MIN_SL_PCT must be positive, got {etp_min_sl}")
+    if "ETP_MAX_SL_PCT" not in non_finite_keys and etp_max_sl > 1.0:
+        _err("ETP_MAX_SL_PCT", "out_of_bounds", f"ETP_MAX_SL_PCT must be <= 1.0, got {etp_max_sl}")
+    if (
+        "ETP_MIN_SL_PCT" not in non_finite_keys
+        and "ETP_MAX_SL_PCT" not in non_finite_keys
+        and etp_max_sl <= etp_min_sl
+    ):
+        _err(
+            "ETP_MAX_SL_PCT",
+            "cross_field_error",
+            f"ETP_MAX_SL_PCT ({etp_max_sl}) must be greater than ETP_MIN_SL_PCT ({etp_min_sl})",
+        )
+
+    tp1 = _val("TP1_R_MULTIPLE", 1.5)
+    tp2 = _val("TP2_R_MULTIPLE", 2.5)
+    tp3 = _val("TP3_R_MULTIPLE", 3.5)
+    if (
+        "TP1_R_MULTIPLE" not in non_finite_keys
+        and "TP2_R_MULTIPLE" not in non_finite_keys
+        and "TP3_R_MULTIPLE" not in non_finite_keys
+    ):
+        if tp1 <= 0:
+            _err("TP1_R_MULTIPLE", "out_of_bounds", f"TP1_R_MULTIPLE must be positive, got {tp1}")
+        if not (tp1 < tp2 < tp3):
+            _err(
+                "TP2_R_MULTIPLE",
+                "cross_field_error",
+                f"Take-profit multiples must satisfy TP1 < TP2 < TP3, got TP1={tp1}, TP2={tp2}, TP3={tp3}",
+            )
+
+    tsl_atr = _val("TSL_ATR_MULTIPLIER", 1.2)
+    if "TSL_ATR_MULTIPLIER" not in non_finite_keys and tsl_atr <= 0:
+        _err("TSL_ATR_MULTIPLIER", "out_of_bounds", f"TSL_ATR_MULTIPLIER must be positive, got {tsl_atr}")
+
+    hyst = _val("TSL_HYSTERESIS_ATR_MULT", 0.5)
+    if "TSL_HYSTERESIS_ATR_MULT" not in non_finite_keys and hyst <= 0:
+        _err("TSL_HYSTERESIS_ATR_MULT", "out_of_bounds", f"TSL_HYSTERESIS_ATR_MULT must be positive, got {hyst}")
+
+    decay_day1 = _val("TSL_DECAY_DAY1_MULT", 2.20)
+    decay_step = _val("TSL_DECAY_STEP_MULT", 0.35)
+    decay_floor = _val("TSL_DECAY_FLOOR_MULT", 1.15)
+    decay_runner = _val("TSL_DECAY_RUNNER_MULT", 2.00)
+    decay_keys = {"TSL_DECAY_DAY1_MULT", "TSL_DECAY_STEP_MULT", "TSL_DECAY_FLOOR_MULT", "TSL_DECAY_RUNNER_MULT"}
+    if not (decay_keys & non_finite_keys):
+        if decay_floor <= 0:
+            _err("TSL_DECAY_FLOOR_MULT", "out_of_bounds", f"TSL_DECAY_FLOOR_MULT must be positive, got {decay_floor}")
+        if decay_step < 0:
+            _err("TSL_DECAY_STEP_MULT", "out_of_bounds", f"TSL_DECAY_STEP_MULT must be >= 0, got {decay_step}")
+        if decay_day1 < decay_floor:
+            _err(
+                "TSL_DECAY_DAY1_MULT",
+                "cross_field_error",
+                f"TSL_DECAY_DAY1_MULT ({decay_day1}) cannot be below TSL_DECAY_FLOOR_MULT ({decay_floor})",
+            )
+        if decay_runner < decay_floor:
+            _err(
+                "TSL_DECAY_RUNNER_MULT",
+                "cross_field_error",
+                f"TSL_DECAY_RUNNER_MULT ({decay_runner}) cannot be below TSL_DECAY_FLOOR_MULT ({decay_floor})",
+            )
+
+    t1 = _val("TP1_TRIM_PCT", 0.50)
+    t2 = _val("TP2_TRIM_PCT", 0.25)
+    t3 = _val("TP3_TRIM_PCT", 0.25)
+    if not ({"TP1_TRIM_PCT", "TP2_TRIM_PCT", "TP3_TRIM_PCT"} & non_finite_keys):
+        for tk, tv in (("TP1_TRIM_PCT", t1), ("TP2_TRIM_PCT", t2), ("TP3_TRIM_PCT", t3)):
+            if not (0.0 <= tv <= 1.0):
+                _err(tk, "out_of_bounds", f"{tk} must be in [0.0, 1.0], got {tv}")
+        total_trim = round(t1 + t2 + t3, 4)
+        if total_trim != 1.0:
+            _err(
+                "TP1_TRIM_PCT",
+                "cross_field_error",
+                f"Trim percentages must sum to 1.0, got {total_trim} (TP1={t1}, TP2={t2}, TP3={t3})",
+            )
+
+    universe_size = _val("UNIVERSE_SIZE", 100)
+    if not isinstance(universe_size, int) or isinstance(universe_size, bool) or universe_size <= 0:
+        _err("UNIVERSE_SIZE", "out_of_bounds", f"UNIVERSE_SIZE must be positive, got {universe_size}")
+
+    max_cat = _val("SCREENER_MAX_CATALYST_RISK", 0.25)
+    if "SCREENER_MAX_CATALYST_RISK" not in non_finite_keys and not (0.0 <= max_cat <= 1.0):
+        _err(
+            "SCREENER_MAX_CATALYST_RISK",
+            "out_of_bounds",
+            f"SCREENER_MAX_CATALYST_RISK must be in [0.0, 1.0], got {max_cat}",
+        )
+
+    top_n = _val("SCREENER_TOP_N", 15)
+    if not isinstance(top_n, int) or isinstance(top_n, bool) or top_n <= 0:
+        _err("SCREENER_TOP_N", "out_of_bounds", f"SCREENER_TOP_N must be positive, got {top_n}")
+
+    min_setup = _val("SCREENER_MIN_SETUP_SCORE", "favorable")
+    if min_setup not in _VALID_SETUP_SCORES:
+        _err(
+            "SCREENER_MIN_SETUP_SCORE",
+            "invalid_value",
+            f"SCREENER_MIN_SETUP_SCORE must be one of {_VALID_SETUP_SCORES}, got {min_setup!r}",
+        )
+
+    cutoff = _val("SESSION_CLOSE_CUTOFF_UTC", "16:20")
+    if not isinstance(cutoff, str) or not _TIME_HHMM_RE.match(cutoff.strip()):
+        _err(
+            "SESSION_CLOSE_CUTOFF_UTC",
+            "invalid_format",
+            f"SESSION_CLOSE_CUTOFF_UTC must be HH:MM (UTC 24h), got {cutoff!r}",
+        )
+
+    enable_5x = bool(_val("ENABLE_5X_LEVERAGE", False))
+    prefer_5x = bool(_val("PREFER_5X_LEVERAGE", False))
+    max_lev = _val("MAX_LEVERAGE", 3)
+    if isinstance(max_lev, bool) or not isinstance(max_lev, int) or max_lev not in _VALID_LEVERAGE_CAPS:
+        _err("MAX_LEVERAGE", "out_of_bounds", f"MAX_LEVERAGE must be one of {_VALID_LEVERAGE_CAPS}, got {max_lev!r}")
+    else:
+        if enable_5x and max_lev < 5:
+            _err(
+                "MAX_LEVERAGE",
+                "leverage_conflict",
+                f"ENABLE_5X_LEVERAGE=True conflicts with MAX_LEVERAGE={max_lev} (must be 5)",
+            )
+        if not enable_5x and max_lev > 3:
+            _err(
+                "MAX_LEVERAGE",
+                "leverage_conflict",
+                f"ENABLE_5X_LEVERAGE=False conflicts with MAX_LEVERAGE={max_lev} (must be <= 3)",
+            )
+    if prefer_5x and not enable_5x:
+        _err(
+            "PREFER_5X_LEVERAGE",
+            "leverage_conflict",
+            "PREFER_5X_LEVERAGE=True requires ENABLE_5X_LEVERAGE=True",
+        )
+
+    return errors
 
 
 @dataclass
@@ -111,6 +379,8 @@ class Settings:
     ATR_SL_MULTIPLIER: float = 2.2
     MIN_SL_PCT: float = 0.005  # 0.5% minimum stop distance
     MAX_SL_PCT: float = 0.03   # 3.0% maximum stop distance (strict risk cap)
+    ETP_MIN_SL_PCT: float = 0.025  # 2.5% minimum ETP stop-clamp distance
+    ETP_MAX_SL_PCT: float = 0.080  # 8.0% maximum ETP stop-clamp distance
     TP1_R_MULTIPLE: float = 1.5
     TP2_R_MULTIPLE: float = 2.5
     TP3_R_MULTIPLE: float = 3.5
@@ -120,10 +390,22 @@ class Settings:
     SCREENER_MIN_SETUP_SCORE: str = "favorable"
     SCREENER_MAX_CATALYST_RISK: float = 0.25
     SCREENER_TOP_N: int = 15
+    SCREENER_MAX_PER_CATEGORY: int = 2
     MIN_ADX_TREND: float = 18.0  # Trend strength gate for 3x leverage (relaxed from 20.0 to catch trends earlier)
+    REGIME_BREAKOUT_ADX_MIN: float = 25.0
+    HIGH_VOL_MAX_REALIZED_VOL: float = 0.65
+    HIGH_VOL_MAX_ATR_SPIKE_RATIO: float = 1.50
+    FALLBACK_SCREENER_MIN_ADX: float = 20.0
 
     # Quantitative Strategy (Directional Trend with Multi-Timeframe Gating & Dual-Track Short Execution)
     ACTIVE_STRATEGY: str = "directional_trend"
+    STRATEGY_EXCEPTIONAL_ADX: float = 25.0
+    MIN_EMA20_SLOPE_PCT: float = 0.0
+    ENTRY_EARNINGS_BLACKOUT_DAYS: float = 2.0
+    STRATEGY_BASE_CONVICTION: float = 0.70
+    STRATEGY_SHORT_BASE_CONVICTION: float = 0.75
+    STRATEGY_MACRO_TAILWIND_BONUS: float = 0.10
+    DIRECTIONAL_MAX_CONVICTION: float = 0.95
     MAX_SWING_HOLD_DAYS: int = 10
     MR_MAX_HOLD_DAYS: int = 10  # Backward compatibility alias
 
@@ -131,6 +413,10 @@ class Settings:
     PURE_TSL_MODE: bool = True            # Pure 100% Trailing Stop Loss mode (no partial TP trims, lets winners run fully)
     TSL_ATR_MULTIPLIER: float = 1.2
     TSL_HYSTERESIS_ATR_MULT: float = 0.5  # Escape buffer past TP1 before elevating stop to TP1
+    TSL_DECAY_DAY1_MULT: float = 2.20     # Day 1 session ATR trail multiplier
+    TSL_DECAY_STEP_MULT: float = 0.35     # Per-session ATR trail compression step
+    TSL_DECAY_FLOOR_MULT: float = 1.15    # Minimum compressed ATR trail floor
+    TSL_DECAY_RUNNER_MULT: float = 2.00   # Frozen ATR trail multiplier for tenured runners
     TP1_TRIM_PCT: float = 0.50            # Upfront cash profit trim (50%) - legacy
     TP2_TRIM_PCT: float = 0.25            # Second milestone trim (25%) - legacy
     TP3_TRIM_PCT: float = 0.25            # Remaining runner tranche (25%) - legacy
@@ -163,6 +449,7 @@ class Settings:
     # Broker Reconciliation & Safety Kill Switch
     RECONCILIATION_INTERVAL_SECONDS: int = 60
     PANIC_FLATTEN_TOKEN: str = ""
+    DASHBOARD_AUTH_TOKEN: str = ""
 
     # Notifications
     TELEGRAM_BOT_TOKEN: str = ""
@@ -191,190 +478,175 @@ class Settings:
 
     def __post_init__(self) -> None:
         """Load configuration from environment variables if not explicitly provided."""
-        # Load API keys from environment variables using os.environ.get()
-        if not self.TRADING212_API_KEY:
-            self.TRADING212_API_KEY = os.environ.get("TRADING212_API_KEY", "")
+        secret_keys = (
+            "TRADING212_API_KEY",
+            "TRADING212_API_SECRET",
+            "OPENAI_API_KEY",
+            "POLYGON_API_KEY",
+            "FINNHUB_API_KEY",
+            "OLOSTEP_API_KEY",
+            "NIXTLA_API_KEY",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DISCORD_WEBHOOK_URL",
+            "PANIC_FLATTEN_TOKEN",
+            "DASHBOARD_AUTH_TOKEN",
+        )
+        for key in secret_keys:
+            if not getattr(self, key):
+                setattr(self, key, os.environ.get(key, ""))
 
-        if not self.TRADING212_API_SECRET:
-            self.TRADING212_API_SECRET = os.environ.get("TRADING212_API_SECRET", "")
-
-        if not self.OPENAI_API_KEY:
-            self.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
-        if not self.POLYGON_API_KEY:
-            self.POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
-
-        if not self.FINNHUB_API_KEY:
-            self.FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
-
-        if not self.OLOSTEP_API_KEY:
-            self.OLOSTEP_API_KEY = os.environ.get("OLOSTEP_API_KEY", "")
-
-        if not self.NIXTLA_API_KEY:
-            self.NIXTLA_API_KEY = os.environ.get("NIXTLA_API_KEY", "")
-
-        # Optional environment overrides for URLs, models, and flags
         env_use_live = os.environ.get("USE_LIVE")
         if env_use_live is not None and not self.USE_LIVE:
-            self.USE_LIVE = env_use_live.strip().lower() in ("1", "true", "yes", "t")
+            self.USE_LIVE = _parse_bool_env(env_use_live)
 
-        env_base_url = os.environ.get("TRADING212_BASE_URL")
-        if env_base_url:
-            self.TRADING212_BASE_URL = env_base_url.strip()
+        str_fields = (
+            ("TRADING212_BASE_URL", False),
+            ("TRADING212_LIVE_URL", False),
+            ("LLM_DEEP_MODEL", False),
+            ("LLM_QUICK_MODEL", False),
+            ("LOG_LEVEL", True),
+            ("TRADES_LOG_PATH", False),
+            ("NOTIFICATIONS_LOG_PATH", False),
+            ("ACTIVE_TRADES_PATH", False),
+            ("CANDLE_DB_PATH", False),
+            ("SCREENER_MIN_SETUP_SCORE", False),
+            ("ACTIVE_STRATEGY", False),
+            ("SESSION_CLOSE_CUTOFF_UTC", False),
+        )
+        for key, upper in str_fields:
+            raw = os.environ.get(key)
+            if raw and raw.strip():
+                val = raw.strip().upper() if upper else raw.strip()
+                if key == "SCREENER_MIN_SETUP_SCORE":
+                    val = val.lower()
+                setattr(self, key, val)
 
-        env_live_url = os.environ.get("TRADING212_LIVE_URL")
-        if env_live_url:
-            self.TRADING212_LIVE_URL = env_live_url.strip()
+        float_fields = (
+            "DEFAULT_ACCOUNT_EQUITY",
+            "SPECULATIVE_CONFIDENCE_THRESHOLD",
+            "MAX_RISK_PER_TRADE",
+            "MAX_POSITION_PCT",
+            "ATR_SL_MULTIPLIER",
+            "MIN_SL_PCT",
+            "MAX_SL_PCT",
+            "ETP_MIN_SL_PCT",
+            "ETP_MAX_SL_PCT",
+            "TP1_R_MULTIPLE",
+            "TP2_R_MULTIPLE",
+            "TP3_R_MULTIPLE",
+            "TARGET_ANNUAL_VOLATILITY",
+            "SCREENER_MAX_CATALYST_RISK",
+            "MIN_ADX_TREND",
+            "STRATEGY_EXCEPTIONAL_ADX",
+            "MIN_EMA20_SLOPE_PCT",
+            "ENTRY_EARNINGS_BLACKOUT_DAYS",
+            "STRATEGY_BASE_CONVICTION",
+            "STRATEGY_SHORT_BASE_CONVICTION",
+            "STRATEGY_MACRO_TAILWIND_BONUS",
+            "DIRECTIONAL_MAX_CONVICTION",
+            "REGIME_BREAKOUT_ADX_MIN",
+            "HIGH_VOL_MAX_REALIZED_VOL",
+            "HIGH_VOL_MAX_ATR_SPIKE_RATIO",
+            "FALLBACK_SCREENER_MIN_ADX",
+            "TSL_ATR_MULTIPLIER",
+            "TSL_HYSTERESIS_ATR_MULT",
+            "TSL_DECAY_DAY1_MULT",
+            "TSL_DECAY_STEP_MULT",
+            "TSL_DECAY_FLOOR_MULT",
+            "TSL_DECAY_RUNNER_MULT",
+            "TP1_TRIM_PCT",
+            "TP2_TRIM_PCT",
+            "TP3_TRIM_PCT",
+            "MIN_OVERNIGHT_PROFIT_CUSHION_PCT",
+            "RATE_LIMIT_INTER_CALL_DELAY",
+            "MAX_BID_ASK_SPREAD_PCT",
+            "MAX_SPREAD_TO_STOP_RATIO",
+            "TRADE_LOSS_COOLDOWN_SECONDS",
+            "MIN_HOLD_SECONDS",
+            "MAX_PORTFOLIO_BETA_HEAT",
+            "DAILY_MAX_DRAWDOWN_PCT",
+        )
+        for key in float_fields:
+            raw = os.environ.get(key)
+            if raw and raw.strip():
+                try:
+                    parsed = float(raw.strip())
+                    if math.isfinite(parsed):
+                        setattr(self, key, parsed)
+                except ValueError:
+                    pass
 
-        env_deep_model = os.environ.get("LLM_DEEP_MODEL")
-        if env_deep_model:
-            self.LLM_DEEP_MODEL = env_deep_model.strip()
+        int_fields = (
+            "PARALLEL_INGESTION_WORKERS",
+            "PARALLEL_DELIBERATION_WORKERS",
+            "NIXTLA_FORECAST_HORIZON",
+            "SCREENER_TOP_N",
+            "SCREENER_MAX_PER_CATEGORY",
+            "MAX_SWING_HOLD_DAYS",
+            "MR_MAX_HOLD_DAYS",
+            "EARNINGS_BLACKOUT_HOURS",
+            "MAX_SECTOR_POSITIONS",
+            "CANDLE_CACHE_TTL_SECONDS",
+            "RECONCILIATION_INTERVAL_SECONDS",
+            "DASHBOARD_PORT",
+            "UNIVERSE_SIZE",
+        )
+        for key in int_fields:
+            raw = os.environ.get(key)
+            if raw and raw.strip():
+                try:
+                    setattr(self, key, int(raw.strip()))
+                except ValueError:
+                    pass
 
-        env_quick_model = os.environ.get("LLM_QUICK_MODEL")
-        if env_quick_model:
-            self.LLM_QUICK_MODEL = env_quick_model.strip()
-
-        env_log_level = os.environ.get("LOG_LEVEL")
-        if env_log_level:
-            self.LOG_LEVEL = env_log_level.strip().upper()
-
-        env_trades_log_path = os.environ.get("TRADES_LOG_PATH")
-        if env_trades_log_path:
-            self.TRADES_LOG_PATH = env_trades_log_path.strip()
-
-        if not self.TELEGRAM_BOT_TOKEN:
-            self.TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-
-        if not self.TELEGRAM_CHAT_ID:
-            self.TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-        if not self.DISCORD_WEBHOOK_URL:
-            self.DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-
-        env_3x = os.environ.get("USE_LEVERAGED_3X")
-        if env_3x is not None:
-            self.USE_LEVERAGED_3X = env_3x.strip().lower() in ("1", "true", "yes", "t")
+        bool_fields = (
+            "ENABLE_SPECULATIVE_ROUTING",
+            "ENABLE_FINNHUB_FUNDAMENTALS",
+            "ENABLE_FINNHUB_NEWS",
+            "ENABLE_OLOSTEP_SENTIMENT",
+            "ENABLE_NIXTLA_FORECAST",
+            "PURE_TSL_MODE",
+            "ENFORCE_INVERSE_INTRADAY_ONLY",
+            "ENFORCE_LONG_BREAKEVEN_OVERNIGHT",
+            "ENFORCE_SPREAD_GATE",
+            "ENFORCE_CORRELATION_LIMITS",
+            "ENFORCE_DAILY_CIRCUIT_BREAKER",
+            "ENABLE_CANDLE_CACHE",
+            "ENABLE_DESKTOP_NOTIFICATIONS",
+            "ENABLE_EMBEDDED_DASHBOARD",
+            "USE_LEVERAGED_3X",
+            "ENABLE_CRYPTO_3X",
+            "ENABLE_COMMODITIES_3X",
+            "PREFER_5X_LEVERAGE",
+        )
+        for key in bool_fields:
+            raw = os.environ.get(key)
+            if raw is not None and raw.strip():
+                setattr(self, key, _parse_bool_env(raw))
 
         env_5x = os.environ.get("ENABLE_5X_LEVERAGE")
-        if env_5x is not None:
-            self.ENABLE_5X_LEVERAGE = env_5x.strip().lower() in ("1", "true", "yes", "t")
+        if env_5x is not None and env_5x.strip():
+            self.ENABLE_5X_LEVERAGE = _parse_bool_env(env_5x)
 
-        self.MAX_LEVERAGE = 5 if self.ENABLE_5X_LEVERAGE else 3
-
-        env_prefer_5x = os.environ.get("PREFER_5X_LEVERAGE")
-        if env_prefer_5x is not None:
-            self.PREFER_5X_LEVERAGE = env_prefer_5x.strip().lower() in ("1", "true", "yes", "t")
-
-        env_dashboard = os.environ.get("ENABLE_EMBEDDED_DASHBOARD")
-        if env_dashboard is not None:
-            self.ENABLE_EMBEDDED_DASHBOARD = env_dashboard.strip().lower() in ("1", "true", "yes", "t")
-
-        env_port = os.environ.get("DASHBOARD_PORT")
-        if env_port:
+        env_max_lev = os.environ.get("MAX_LEVERAGE")
+        if env_max_lev is not None and env_max_lev.strip():
             try:
-                self.DASHBOARD_PORT = int(env_port.strip())
+                self.MAX_LEVERAGE = int(env_max_lev.strip())
             except ValueError:
                 pass
+        elif (env_5x is not None or self.ENABLE_5X_LEVERAGE) and self.MAX_LEVERAGE == 3:
+            self.MAX_LEVERAGE = 5 if self.ENABLE_5X_LEVERAGE else 3
 
         if self.WATCHLIST is None:
             env_watchlist = os.environ.get("WATCHLIST")
             if env_watchlist:
                 self.WATCHLIST = [s.strip() for s in env_watchlist.split(",") if s.strip()]
 
-        # Advanced Risk & Safety Gates env loading
-        env_max_pos = os.environ.get("MAX_POSITION_PCT")
-        if env_max_pos:
-            try:
-                self.MAX_POSITION_PCT = float(env_max_pos.strip())
-            except ValueError:
-                pass
-
-        env_max_risk = os.environ.get("MAX_RISK_PER_TRADE")
-        if env_max_risk:
-            try:
-                self.MAX_RISK_PER_TRADE = float(env_max_risk.strip())
-            except ValueError:
-                pass
-
-        env_spec_thresh = os.environ.get("SPECULATIVE_CONFIDENCE_THRESHOLD")
-        if env_spec_thresh:
-            try:
-                self.SPECULATIVE_CONFIDENCE_THRESHOLD = float(env_spec_thresh.strip())
-            except ValueError:
-                pass
-
-        env_spread_gate = os.environ.get("ENFORCE_SPREAD_GATE")
-        if env_spread_gate is not None:
-            self.ENFORCE_SPREAD_GATE = env_spread_gate.strip().lower() in ("1", "true", "yes", "t")
-
-        env_max_spread = os.environ.get("MAX_BID_ASK_SPREAD_PCT")
-        if env_max_spread:
-            try:
-                self.MAX_BID_ASK_SPREAD_PCT = float(env_max_spread.strip())
-            except ValueError:
-                pass
-
-        env_corr_limits = os.environ.get("ENFORCE_CORRELATION_LIMITS")
-        if env_corr_limits is not None:
-            self.ENFORCE_CORRELATION_LIMITS = env_corr_limits.strip().lower() in ("1", "true", "yes", "t")
-
-        env_max_sector = os.environ.get("MAX_SECTOR_POSITIONS")
-        if env_max_sector:
-            try:
-                self.MAX_SECTOR_POSITIONS = int(env_max_sector.strip())
-            except ValueError:
-                pass
-
-        env_max_beta = os.environ.get("MAX_PORTFOLIO_BETA_HEAT")
-        if env_max_beta:
-            try:
-                self.MAX_PORTFOLIO_BETA_HEAT = float(env_max_beta.strip())
-            except ValueError:
-                pass
-
-        env_cb = os.environ.get("ENFORCE_DAILY_CIRCUIT_BREAKER")
-        if env_cb is not None:
-            self.ENFORCE_DAILY_CIRCUIT_BREAKER = env_cb.strip().lower() in ("1", "true", "yes", "t")
-
-        env_cb_drawdown = os.environ.get("DAILY_MAX_DRAWDOWN_PCT")
-        if env_cb_drawdown:
-            try:
-                self.DAILY_MAX_DRAWDOWN_PCT = float(env_cb_drawdown.strip())
-            except ValueError:
-                pass
-
-        env_candle_cache = os.environ.get("ENABLE_CANDLE_CACHE")
-        if env_candle_cache is not None:
-            self.ENABLE_CANDLE_CACHE = env_candle_cache.strip().lower() in ("1", "true", "yes", "t")
-
-        env_cache_ttl = os.environ.get("CANDLE_CACHE_TTL_SECONDS")
-        if env_cache_ttl:
-            try:
-                self.CANDLE_CACHE_TTL_SECONDS = int(env_cache_ttl.strip())
-            except ValueError:
-                pass
-
-        env_reconcile = os.environ.get("RECONCILIATION_INTERVAL_SECONDS")
-        if env_reconcile:
-            try:
-                self.RECONCILIATION_INTERVAL_SECONDS = int(env_reconcile.strip())
-            except ValueError:
-                pass
-
         is_testing = "unittest" in sys.modules or any("test" in arg.lower() for arg in sys.argv)
         env_flatten_all = os.environ.get("FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE")
-        if env_flatten_all is not None and not is_testing:
-            self.FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE = env_flatten_all.strip().lower() in ("1", "true", "yes", "t")
-
-        env_max_sl = os.environ.get("MAX_SL_PCT")
-        if env_max_sl:
-            try:
-                self.MAX_SL_PCT = float(env_max_sl.strip())
-            except ValueError:
-                pass
-
-        if not self.PANIC_FLATTEN_TOKEN:
-            self.PANIC_FLATTEN_TOKEN = os.environ.get("PANIC_FLATTEN_TOKEN", "")
+        if env_flatten_all is not None and env_flatten_all.strip() and not is_testing:
+            self.FLATTEN_ALL_LEVERAGED_AT_SESSION_CLOSE = _parse_bool_env(env_flatten_all)
 
     @property
     def api_base_url(self) -> str:
@@ -415,59 +687,9 @@ class Settings:
                 f"Please ensure they are set in environment variables or Settings."
             )
 
-        # Validate risk parameters
-        if not (0.0 < self.MAX_RISK_PER_TRADE <= 1.0):
-            raise ValueError(
-                f"MAX_RISK_PER_TRADE must be in (0.0, 1.0], got {self.MAX_RISK_PER_TRADE}"
-            )
-        if not (0.0 < self.MAX_POSITION_PCT <= 1.0):
-            raise ValueError(
-                f"MAX_POSITION_PCT must be in (0.0, 1.0], got {self.MAX_POSITION_PCT}"
-            )
-        if self.MAX_RISK_PER_TRADE > self.MAX_POSITION_PCT:
-            raise ValueError(
-                f"MAX_RISK_PER_TRADE ({self.MAX_RISK_PER_TRADE}) cannot exceed "
-                f"MAX_POSITION_PCT ({self.MAX_POSITION_PCT})"
-            )
-        if self.ATR_SL_MULTIPLIER <= 0:
-            raise ValueError(
-                f"ATR_SL_MULTIPLIER must be positive, got {self.ATR_SL_MULTIPLIER}"
-            )
-        if self.MIN_SL_PCT <= 0:
-            raise ValueError(
-                f"MIN_SL_PCT must be positive, got {self.MIN_SL_PCT}"
-            )
-        if self.MAX_SL_PCT <= self.MIN_SL_PCT:
-            raise ValueError(
-                f"MAX_SL_PCT ({self.MAX_SL_PCT}) must be greater than MIN_SL_PCT ({self.MIN_SL_PCT})"
-            )
-        if not (self.TP1_R_MULTIPLE < self.TP2_R_MULTIPLE < self.TP3_R_MULTIPLE):
-            raise ValueError(
-                f"Take-profit multiples must satisfy TP1 < TP2 < TP3, "
-                f"got TP1={self.TP1_R_MULTIPLE}, TP2={self.TP2_R_MULTIPLE}, TP3={self.TP3_R_MULTIPLE}"
-            )
-        if self.TSL_HYSTERESIS_ATR_MULT <= 0:
-            raise ValueError(
-                f"TSL_HYSTERESIS_ATR_MULT must be positive, got {self.TSL_HYSTERESIS_ATR_MULT}"
-            )
-        total_trim = round(self.TP1_TRIM_PCT + self.TP2_TRIM_PCT + self.TP3_TRIM_PCT, 4)
-        if total_trim != 1.0:
-            raise ValueError(
-                f"Trim percentages must sum to 1.0, got {total_trim} "
-                f"(TP1={self.TP1_TRIM_PCT}, TP2={self.TP2_TRIM_PCT}, TP3={self.TP3_TRIM_PCT})"
-            )
-        if self.UNIVERSE_SIZE <= 0:
-            raise ValueError(
-                f"UNIVERSE_SIZE must be positive, got {self.UNIVERSE_SIZE}"
-            )
-        if not (0.0 <= self.SCREENER_MAX_CATALYST_RISK <= 1.0):
-            raise ValueError(
-                f"SCREENER_MAX_CATALYST_RISK must be in [0.0, 1.0], got {self.SCREENER_MAX_CATALYST_RISK}"
-            )
-        if self.SCREENER_TOP_N <= 0:
-            raise ValueError(
-                f"SCREENER_TOP_N must be positive, got {self.SCREENER_TOP_N}"
-            )
+        invariant_errors = collect_settings_invariant_errors(self)
+        if invariant_errors:
+            raise ValueError(invariant_errors[0]["message"])
 
         if not self.OPENAI_API_KEY and not require_openai:
             logger.warning(
