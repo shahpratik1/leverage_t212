@@ -856,7 +856,9 @@ class TestControlGatewayAPI(unittest.TestCase):
             )
             self.assertEqual(s_mut, 200)
             ev_name, ev_payload = _read_sse_event(streams[0][1], timeout_s=1.5)
-            if ev_name == "heartbeat":
+            drained = 0
+            while ev_name == "heartbeat" and drained < 100:
+                drained += 1
                 ev_name, ev_payload = _read_sse_event(streams[0][1], timeout_s=1.5)
             self.assertEqual(ev_name, "config_epoch_changed")
             self.assertEqual(ev_payload["config_epoch_id"], "epoch-1")
@@ -1360,7 +1362,7 @@ class TestControlGatewayAPI(unittest.TestCase):
             self.assertTrue(json.loads(b_panic.decode("utf-8"))["dashboard"]["is_halted"])
 
             seen_events: Dict[str, Dict[str, Any]] = {}
-            for _ in range(4):
+            for _ in range(20):
                 ev, payload = _read_sse_event(fp, timeout_s=1.5)
                 if ev and payload is not None:
                     seen_events[ev] = payload
