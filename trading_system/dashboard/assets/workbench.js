@@ -2992,116 +2992,65 @@
     return Array.from(metrics);
   }
 
-  function renderConfigWorkspace(forceRebuildControls) {
+  function ensureConfigToolbar(controlsRoot, readOnly) {
     const doc = getDoc();
-    const root = doc && doc.getElementById("workspace-config");
-    if (!root) return;
-
-    let layout = doc.getElementById("config-layout");
-    if (!layout) {
-      layout = el("div", { id: "config-layout", className: "wb-config-layout" });
-      root.appendChild(layout);
-    }
-
-    let controlsRoot = doc.getElementById("config-controls-root");
-    if (!controlsRoot) {
-      controlsRoot = el("div", { id: "config-controls-root" });
-      layout.appendChild(controlsRoot);
-    }
-
-    let drawer = doc.getElementById("diff-drawer");
-    if (!drawer) {
-      drawer = el("aside", { id: "diff-drawer", className: "wb-diff-drawer", "aria-label": "Staged-Intent Diff Drawer" });
-      layout.appendChild(drawer);
-    } else if (drawer.parentNode !== layout) {
-      layout.appendChild(drawer);
-    }
-
-    const params = getSchemaParameters();
-    const schemaByKey = {};
-    params.forEach((p) => {
-      if (p && p.key) schemaByKey[p.key] = p;
-    });
-
-    // Preserve focused input inside controlsRoot across SSE updates!
-    const focused = getFocusedElement();
-    const focusInsideControls = Boolean(focused && isElementInside(focused, controlsRoot));
-    const schemaSig = params.map((p) => p.key).join("|") + "::" + (state.route.param || "") + "::" + (state.route.gate || "") + "::" + state.configGroup + "::" + state.configSearch;
-
-    if (!forceRebuildControls && focusInsideControls && state.lastSchemaSignature === schemaSig) {
-      patchConfigBadgesInPlace(params);
-      return;
-    }
-
-    state.lastSchemaSignature = schemaSig;
-    state.paramDomCache = {};
-    clearNode(controlsRoot);
-
-    const readOnly = isReadOnlyMode();
     const profiles = getBuiltinProfiles();
     const profileIds = Object.keys(profiles);
+    const profilesSig = profileIds.map((pid) => `${pid}:${(profiles[pid] && profiles[pid].label) || pid}`).join("|");
 
-    // Toolbar: Search, Group Filter, Built-in Profiles, + Add Parameter
-    const profileSelect = el(
-      "select",
-      { id: "profile-select", className: "wb-select" },
-      profileIds.length === 0
-        ? el("option", { value: "", text: "No profiles available" })
-        : profileIds.map((pid) => el("option", { value: pid, text: profiles[pid].label || pid }))
-    );
-
-    const loadProfileBtn = el("button", {
-      type: "button",
-      id: "load-profile-btn",
-      className: "wb-btn wb-btn--sm",
-      disabled: readOnly || profileIds.length === 0,
-      text: "Load Profile",
-      onClick: () => {
-        if (profileSelect.value) loadBuiltinProfileIntoDraft(profileSelect.value);
-      },
-    });
-
-    const addParamBtn = el("button", {
-      type: "button",
-      id: "add-param-btn",
-      className: "wb-btn wb-btn--sm wb-btn--primary",
-      disabled: readOnly,
-      text: "+ Add Parameter",
-      onClick: openAddParameterModal,
-    });
-
-    const searchInput = el("input", {
-      id: "config-search-input",
-      type: "search",
-      className: "wb-input",
-      placeholder: "Filter parameters by key or label...",
-      value: state.configSearch,
-      onInput: (ev) => {
-        state.configSearch = ev.target.value;
-        renderConfigWorkspace(true);
-      },
-    });
-
-    const groupSelect = el(
-      "select",
-      {
-        id: "config-group-select",
-        className: "wb-select",
-        onChange: (ev) => {
-          state.configGroup = ev.target.value;
-          renderConfigWorkspace(true);
+    let toolbarCard = doc.getElementById("config-toolbar-card");
+    if (!toolbarCard) {
+      const profileSelect = el("select", { id: "profile-select", className: "wb-select" });
+      const loadProfileBtn = el("button", {
+        type: "button",
+        id: "load-profile-btn",
+        className: "wb-btn wb-btn--sm",
+        text: "Load Profile",
+        onClick: () => {
+          if (profileSelect.value) loadBuiltinProfileIntoDraft(profileSelect.value);
         },
-      },
-      el("option", { value: "all", text: "All Groups" }),
-      GROUP_ORDER.map((g) => el("option", { value: g, text: GROUP_LABELS[g] || g })),
-      el("option", { value: "dynamic", text: "Custom Dynamic Gates" })
-    );
-    groupSelect.value = state.configGroup;
+      });
+      const addParamBtn = el("button", {
+        type: "button",
+        id: "add-param-btn",
+        className: "wb-btn wb-btn--sm wb-btn--primary",
+        text: "+ Add Parameter",
+        onClick: openAddParameterModal,
+      });
+      const searchInput = el("input", {
+        id: "config-search-input",
+        type: "search",
+        className: "wb-input",
+        placeholder: "Filter parameters by key or label...",
+        value: state.configSearch,
+        onInput: (ev) => {
+          state.configSearch = ev.target.value;
+          const params = getSchemaParameters();
+          renderConfigParamGroups(controlsRoot, params, isReadOnlyMode());
+          state.lastSchemaSignature = computeConfigSignature(params, isReadOnlyMode());
+        },
+      });
+      const groupSelect = el(
+        "select",
+        {
+          id: "config-group-select",
+          className: "wb-select",
+          onChange: (ev) => {
+            state.configGroup = ev.target.value;
+            const params = getSchemaParameters();
+            renderConfigParamGroups(controlsRoot, params, isReadOnlyMode());
+            state.lastSchemaSignature = computeConfigSignature(params, isReadOnlyMode());
+          },
+        },
+        el("option", { value: "all", text: "All Groups" }),
+        GROUP_ORDER.map((g) => el("option", { value: g, text: GROUP_LABELS[g] || g })),
+        el("option", { value: "dynamic", text: "Custom Dynamic Gates" })
+      );
+      groupSelect.value = state.configGroup;
 
-    controlsRoot.appendChild(
-      el(
+      toolbarCard = el(
         "div",
-        { className: "wb-card" },
+        { id: "config-toolbar-card", className: "wb-card" },
         el(
           "div",
           { className: "wb-config-toolbar" },
@@ -3125,48 +3074,93 @@
           ),
           addParamBtn
         )
-      )
-    );
-
-    // Deep-link callout or missing/structural notice
-    if (state.route.param || state.route.gate) {
-      const targetKey = state.route.param;
-      const targetSpec = targetKey ? schemaByKey[targetKey] : null;
-      if (!targetSpec || (state.route.gate && STRUCTURAL_GATES.has(state.route.gate))) {
-        controlsRoot.appendChild(
-          el("div", {
-            id: "config-deeplink-fallback",
-            className: "wb-banner wb-banner--warn",
-            style: "margin-top:0.85rem",
-            text: `Deep-link notice: parameter '${targetKey || state.route.gate}' is unavailable (deleted custom parameter or non-tunable structural gate).`,
-          })
-        );
-      } else {
-        const crossMetrics = getCrossSectionalMetricsMap();
-        const related = findRelatedMetrics(targetKey, state.route.gate, schemaByKey);
-        const summaryLines = [];
-        related.forEach((m) => {
-          const stats = crossMetrics[m];
-          if (stats && typeof stats === "object") {
-            summaryLines.push(
-              `${m}: median ${formatStat(stats.median)} (p25 ${formatStat(stats.p25)}, p75 ${formatStat(stats.p75)}, min ${formatStat(stats.min)}, max ${formatStat(stats.max)})`
-            );
-          }
-        });
-        controlsRoot.appendChild(
-          el(
-            "div",
-            { id: "config-deeplink-callout", className: "wb-callout", style: "margin-top:0.85rem" },
-            el("strong", { text: `Focused Gate Parameter: ${targetSpec.label || targetKey} (${targetKey})` }),
-            summaryLines.length > 0
-              ? el("div", { className: "wb-mono", style: "margin-top:0.35rem;font-size:0.78rem", text: summaryLines.join(" | ") })
-              : el("div", { className: "wb-muted", style: "margin-top:0.25rem;font-size:0.78rem", text: "Cross-sectional distribution will appear after a completed universe scan cycle." })
-          )
-        );
-      }
+      );
+      controlsRoot.appendChild(toolbarCard);
     }
 
-    // Group & filter parameters
+    const profileSelectEl = doc.getElementById("profile-select");
+    if (profileSelectEl && toolbarCard.dataset.profilesSig !== profilesSig) {
+      const prevVal = profileSelectEl.value;
+      clearNode(profileSelectEl);
+      if (profileIds.length === 0) {
+        profileSelectEl.appendChild(el("option", { value: "", text: "No profiles available" }));
+      } else {
+        profileIds.forEach((pid) => {
+          profileSelectEl.appendChild(el("option", { value: pid, text: profiles[pid].label || pid }));
+        });
+        profileSelectEl.value = prevVal && profileIds.includes(prevVal) ? prevVal : profileIds[0];
+      }
+      toolbarCard.dataset.profilesSig = profilesSig;
+    }
+
+    const loadProfileBtnEl = doc.getElementById("load-profile-btn");
+    if (loadProfileBtnEl) loadProfileBtnEl.disabled = readOnly || profileIds.length === 0;
+    const addParamBtnEl = doc.getElementById("add-param-btn");
+    if (addParamBtnEl) addParamBtnEl.disabled = readOnly;
+    const groupSelectEl = doc.getElementById("config-group-select");
+    if (groupSelectEl && groupSelectEl.value !== state.configGroup) {
+      groupSelectEl.value = state.configGroup;
+    }
+  }
+
+  function renderConfigDeepLinkSlot(controlsRoot, schemaByKey) {
+    const doc = getDoc();
+    let slot = doc.getElementById("config-deeplink-slot");
+    if (!slot) {
+      slot = el("div", { id: "config-deeplink-slot" });
+      controlsRoot.appendChild(slot);
+    }
+    clearNode(slot);
+
+    if (!state.route.param && !state.route.gate) return;
+
+    const targetKey = state.route.param;
+    const targetSpec = targetKey ? schemaByKey[targetKey] : null;
+    if (!targetSpec || (state.route.gate && STRUCTURAL_GATES.has(state.route.gate))) {
+      slot.appendChild(
+        el("div", {
+          id: "config-deeplink-fallback",
+          className: "wb-banner wb-banner--warn",
+          style: "margin-top:0.85rem",
+          text: `Deep-link notice: parameter '${targetKey || state.route.gate}' is unavailable (deleted custom parameter or non-tunable structural gate).`,
+        })
+      );
+      return;
+    }
+
+    const crossMetrics = getCrossSectionalMetricsMap();
+    const related = findRelatedMetrics(targetKey, state.route.gate, schemaByKey);
+    const summaryLines = [];
+    related.forEach((m) => {
+      const stats = crossMetrics[m];
+      if (stats && typeof stats === "object") {
+        summaryLines.push(
+          `${m}: median ${formatStat(stats.median)} (p25 ${formatStat(stats.p25)}, p75 ${formatStat(stats.p75)}, min ${formatStat(stats.min)}, max ${formatStat(stats.max)})`
+        );
+      }
+    });
+    slot.appendChild(
+      el(
+        "div",
+        { id: "config-deeplink-callout", className: "wb-callout", style: "margin-top:0.85rem" },
+        el("strong", { text: `Focused Gate Parameter: ${targetSpec.label || targetKey} (${targetKey})` }),
+        summaryLines.length > 0
+          ? el("div", { className: "wb-mono", style: "margin-top:0.35rem;font-size:0.78rem", text: summaryLines.join(" | ") })
+          : el("div", { className: "wb-muted", style: "margin-top:0.25rem;font-size:0.78rem", text: "Cross-sectional distribution will appear after a completed universe scan cycle." })
+      )
+    );
+  }
+
+  function renderConfigParamGroups(controlsRoot, params, readOnly) {
+    const doc = getDoc();
+    let slot = doc.getElementById("config-param-groups-slot");
+    if (!slot) {
+      slot = el("div", { id: "config-param-groups-slot" });
+      controlsRoot.appendChild(slot);
+    }
+    state.paramDomCache = {};
+    clearNode(slot);
+
     const q = state.configSearch.trim().toLowerCase();
     const filtered = params.filter((p) => {
       if (!p || !p.key) return false;
@@ -3189,7 +3183,7 @@
             : "No parameters match your current filter.",
         })
       );
-      controlsRoot.appendChild(groupsWrap);
+      slot.appendChild(groupsWrap);
       return;
     }
 
@@ -3219,7 +3213,79 @@
       );
     });
 
-    controlsRoot.appendChild(groupsWrap);
+    slot.appendChild(groupsWrap);
+  }
+
+  function computeConfigSignature(params, readOnly) {
+    return (
+      params.map((p) => p.key).join("|") +
+      "::" +
+      (state.route.param || "") +
+      "::" +
+      (state.route.gate || "") +
+      "::" +
+      state.configGroup +
+      "::" +
+      state.configSearch +
+      "::" +
+      (readOnly ? "ro" : "rw")
+    );
+  }
+
+  function renderConfigWorkspace(forceRebuildControls) {
+    const doc = getDoc();
+    const root = doc && doc.getElementById("workspace-config");
+    if (!root) return;
+
+    let layout = doc.getElementById("config-layout");
+    if (!layout) {
+      layout = el("div", { id: "config-layout", className: "wb-config-layout" });
+      root.appendChild(layout);
+    }
+
+    let controlsRoot = doc.getElementById("config-controls-root");
+    if (!controlsRoot) {
+      controlsRoot = el("div", { id: "config-controls-root" });
+      layout.appendChild(controlsRoot);
+    }
+
+    let drawer = doc.getElementById("diff-drawer");
+    if (!drawer) {
+      drawer = el("aside", { id: "diff-drawer", className: "wb-diff-drawer", "aria-label": "Staged-Intent Diff Drawer" });
+      layout.appendChild(drawer);
+    } else if (drawer.parentNode !== layout) {
+      layout.appendChild(drawer);
+    }
+
+    const params = getSchemaParameters();
+    const readOnly = isReadOnlyMode();
+    const schemaByKey = {};
+    params.forEach((p) => {
+      if (p && p.key) schemaByKey[p.key] = p;
+    });
+
+    ensureConfigToolbar(controlsRoot, readOnly);
+
+    const focused = getFocusedElement();
+    const groupsSlot = doc.getElementById("config-param-groups-slot");
+    const focusInsideGroups = Boolean(focused && groupsSlot && isElementInside(focused, groupsSlot));
+    const schemaSig = computeConfigSignature(params, readOnly);
+
+    if (!forceRebuildControls && focusInsideGroups && state.lastSchemaSignature === schemaSig) {
+      renderConfigDeepLinkSlot(controlsRoot, schemaByKey);
+      patchConfigBadgesInPlace(params);
+      return;
+    }
+
+    if (!forceRebuildControls && state.lastSchemaSignature === schemaSig && groupsSlot) {
+      renderConfigDeepLinkSlot(controlsRoot, schemaByKey);
+      patchConfigBadgesInPlace(params);
+      return;
+    }
+
+    state.lastSchemaSignature = schemaSig;
+    renderConfigDeepLinkSlot(controlsRoot, schemaByKey);
+    renderConfigParamGroups(controlsRoot, params, readOnly);
   }
 
   function formatStat(val) {

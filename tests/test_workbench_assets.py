@@ -1118,6 +1118,49 @@ async function runAll() {
     assert.strictEqual(catchUpCalls, 1, "SSE reconnect open must trigger one-shot /api/data catch-up");
     env.api.destroyWorkbench();
   }
+
+  // 10. Regression: #config-search-input & #config-group-select keep toolbar DOM node identity, focus, and cursor while filtering
+  {
+    const env = createMockEnv({ hash: "#config" });
+    const searchBefore = env.doc.getElementById("config-search-input");
+    const groupBefore = env.doc.getElementById("config-group-select");
+    assert.ok(searchBefore);
+    assert.ok(env.doc.getElementById("cfg-input-MIN_PRICE_USD"), "MIN_PRICE_USD visible before filtering");
+
+    searchBefore.focus();
+    searchBefore.value = "ADX";
+    searchBefore.selectionStart = 3;
+    searchBefore.selectionEnd = 3;
+    searchBefore.dispatchEvent({ type: "input", target: searchBefore });
+
+    assert.strictEqual(env.doc.getElementById("config-search-input"), searchBefore, "#config-search-input node must stay mounted during typing");
+    assert.strictEqual(env.doc.activeElement, searchBefore, "#config-search-input focus must survive filtering");
+    assert.strictEqual(searchBefore.selectionStart, 3);
+    assert.strictEqual(searchBefore.selectionEnd, 3);
+    assert.ok(env.doc.getElementById("cfg-input-MIN_ADX_TREND"), "Matched param must stay rendered");
+    assert.strictEqual(env.doc.getElementById("cfg-input-MIN_PRICE_USD"), null, "Unmatched param must be filtered out");
+
+    // SSE snapshot arriving while user is focused in #config-search-input must also keep node + focus
+    env.sseInstances[0].emit("snapshot", makeSampleInitialData({ current_equity: 10490 }));
+    assert.strictEqual(env.doc.getElementById("config-search-input"), searchBefore);
+    assert.strictEqual(env.doc.activeElement, searchBefore);
+
+    // Clearing search restores all params without rebuilding toolbar nodes
+    searchBefore.value = "";
+    searchBefore.dispatchEvent({ type: "input", target: searchBefore });
+    assert.ok(env.doc.getElementById("cfg-input-MIN_PRICE_USD"));
+    assert.strictEqual(env.doc.getElementById("config-search-input"), searchBefore);
+
+    // Changing #config-group-select filters without rebuilding #config-group-select or #config-search-input
+    groupBefore.value = "risk";
+    groupBefore.dispatchEvent({ type: "change", target: groupBefore });
+    assert.strictEqual(env.doc.getElementById("config-group-select"), groupBefore);
+    assert.strictEqual(env.doc.getElementById("config-search-input"), searchBefore);
+    assert.ok(env.doc.getElementById("cfg-input-RISK_PER_TRADE_PCT"));
+    assert.strictEqual(env.doc.getElementById("cfg-input-MIN_ADX_TREND"), null);
+
+    env.api.destroyWorkbench();
+  }
 }
 
 runAll()
