@@ -16,17 +16,44 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import copy
+import inspect
 import json
 import logging
+import os
+import shutil
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from types import SimpleNamespace
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from trading_system.config import settings
-from trading_system.data.leveraged_universe import LeveragedUniverse
+from trading_system.config_bus import (
+    ConfigBus,
+    ConfigConflictError,
+    ConfigSnapshot,
+    ConfigValidationError,
+)
+from trading_system.config_schema import (
+    SCHEMA_BY_KEY,
+    SIMULATABLE_GROUPS,
+    export_config_schema,
+    get_builtin_profiles,
+)
+from trading_system.dashboard.auth import is_sensitive_key
+from trading_system.data.leveraged_universe import (
+    CURATED_3X_PAIRS,
+    LeveragedUniverse,
+    format_price,
+    get_ticker_currency,
+    normalize_quote_to_eur,
+)
 from trading_system.data.trading212_client import (
     AccountCash,
     MarketDataProvider,
@@ -34,9 +61,20 @@ from trading_system.data.trading212_client import (
     Trading212Client,
     Trading212Error,
 )
-from trading_system.execution.position_monitor import PositionMonitor
-from trading_system.notifications.notifier import Notifier
-from trading_system.screener.laya_screener import LayaScreener, ScreenerResult
+from trading_system.execution.position_monitor import (
+    PositionEpochConflictError,
+    PositionMonitor,
+    ResumeBlockedError,
+)
+from trading_system.notifications.notifier import Notifier, TradeNotification
+from trading_system.screener.laya_screener import (
+    CycleFunnelReport,
+    LayaScreener,
+    ScreenerResult,
+    TechnicalFallbackScreener,
+    build_cycle_funnel_report,
+    simulate_screener_gate_impact,
+)
 from trading_system.agents.technical_agent import TechnicalAnalyst
 from trading_system.agents.fundamental_agent import FundamentalAnalyst
 from trading_system.agents.debate_engine import DebateEngine
@@ -44,6 +82,120 @@ from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.agents.strategy_improvement_agent import StrategyImprovementAgent
 
 logger = logging.getLogger(__name__)
+
+
+def _is_unittest_process() -> bool:
+    """Return True when running inside a Python unittest or pytest session."""
+    return (
+        "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or any("test" in arg.lower() for arg in sys.argv)
+    )
+
+
+def _atomic_write_json(target_path: Path, payload: Any) -> None:
+    """Atomically write JSON to target_path via a same-directory temporary file."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target_path.name}.",
+        suffix=".tmp",
+        dir=str(target_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target_path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def _scrub_mapping(obj: Any) -> Any:
+    """Recursively strip sensitive credential/path keys from serialized config dicts."""
+    if isinstance(obj, Mapping):
+        cleaned: Dict[str, Any] = {}
+        for k, v in obj.items():
+            key_str = str(k)
+            if key_str.lower() != "key" and is_sensitive_key(key_str):
+                continue
+            cleaned[key_str] = _scrub_mapping(v)
+        return cleaned
+    if isinstance(obj, list):
+        return [_scrub_mapping(item) for item in obj]
+    if isinstance(obj, tuple):
+        return [_scrub_mapping(item) for item in obj]
+    return obj
+
+
+def _snap_val(snap: Any, key: str, default: Any = None) -> Any:
+    """Read a config field safely from a ConfigSnapshot, Mapping, or settings object."""
+    if snap is None:
+        return default
+    if hasattr(snap, key):
+        return getattr(snap, key)
+    if isinstance(snap, Mapping) and key in snap:
+        return snap[key]
+    dyn = getattr(snap, "dynamic_parameters", None)
+    if isinstance(dyn, Mapping) and key in dyn:
+        return dyn[key]
+    return default
+
+
+def _changed_snapshot_keys(old_snap: ConfigSnapshot, new_snap: ConfigSnapshot) -> List[str]:
+    """Return sorted configuration keys that differ between two ConfigSnapshots."""
+    changed: Set[str] = set()
+    for key in SCHEMA_BY_KEY:
+        if getattr(old_snap, key, None) != getattr(new_snap, key, None):
+            changed.add(key)
+    old_dyn = dict(getattr(old_snap, "dynamic_parameters", {}) or {})
+    new_dyn = dict(getattr(new_snap, "dynamic_parameters", {}) or {})
+    for key in set(old_dyn.keys()) | set(new_dyn.keys()):
+        if old_dyn.get(key) != new_dyn.get(key):
+            changed.add(key)
+    old_specs = tuple(getattr(old_snap, "dynamic_parameter_specs", ()) or ())
+    new_specs = tuple(getattr(new_snap, "dynamic_parameter_specs", ()) or ())
+    old_spec_map = {getattr(s, "key", None): s for s in old_specs}
+    new_spec_map = {getattr(s, "key", None): s for s in new_specs}
+    for key in set(old_spec_map.keys()) | set(new_spec_map.keys()):
+        if key and old_spec_map.get(key) != new_spec_map.get(key):
+            changed.add(str(key))
+    return sorted(changed)
+
+
+def _revalidation_scope_for_keys(
+    keys: Sequence[str],
+    old_snap: ConfigSnapshot,
+    new_snap: ConfigSnapshot,
+) -> str:
+    """Determine aggregate revalidation_scope ('abort_stale_scan' or 'resize_entry') for changed keys."""
+    dyn_spec_keys: Set[str] = set()
+    for snap in (old_snap, new_snap):
+        for spec in getattr(snap, "dynamic_parameter_specs", ()) or ():
+            if getattr(spec, "key", None):
+                dyn_spec_keys.add(str(spec.key))
+        for k in (getattr(snap, "dynamic_parameters", {}) or {}):
+            dyn_spec_keys.add(str(k))
+
+    for key in keys:
+        schema_entry = SCHEMA_BY_KEY.get(key)
+        if schema_entry is not None:
+            if schema_entry.revalidation_scope == "abort_stale_scan":
+                return "abort_stale_scan"
+        elif key in dyn_spec_keys or key.startswith("dynamic_"):
+            return "abort_stale_scan"
+    return "resize_entry"
+
+
+def _as_bool_strict(val: Any, default: bool = False) -> bool:
+    """Interpret strict boolean values safely without mistaking MagicMock objects for True."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return default
 
 # Fallback watchlist of ordinary equities if 3x mode is disabled
 DEFAULT_UNIVERSE = [
@@ -53,6 +205,19 @@ DEFAULT_UNIVERSE = [
     "CRM", "CSCO", "TMO", "ACN", "ABT", "LIN", "BAC", "NFLX", "PFE",
     "AMD", "DHR", "DIS", "ORCL", "CMCSA", "PM", "INTC", "VZ", "WFC",
 ]
+
+
+class _CachedHistoryClientProxy:
+    """Adapter presenting cached historical orders with zero Trading 212 HTTP calls."""
+
+    def __init__(self, cached_history: Optional[Dict[str, Any]]) -> None:
+        self._cached_history = cached_history if isinstance(cached_history, dict) else {"items": []}
+
+    def get_historical_orders(self, limit: int = 50, **_: Any) -> Dict[str, Any]:
+        items = self._cached_history.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        return {"items": list(items[:limit])}
 
 
 class Orchestrator:
@@ -68,92 +233,174 @@ class Orchestrator:
         dashboard_port: Optional[int] = None,
         open_browser: bool = False,
         t212_client: Optional[Trading212Client] = None,
+        config_bus: Optional[ConfigBus] = None,
+        data_dir: Optional[Path | str] = None,
     ) -> None:
         settings.validate()
         self.dry_run = dry_run
+        is_testing = _is_unittest_process()
+
+        # ── 0. Data Directory & Control-Plane ConfigBus ──────────
+        self._owns_temp_data_dir = False
+        explicit_isolation = data_dir is not None or config_bus is not None
+        if data_dir is not None:
+            self.data_dir = Path(data_dir)
+        elif config_bus is not None:
+            self.data_dir = Path(getattr(config_bus, "data_dir", "data"))
+        elif is_testing:
+            self.data_dir = Path(tempfile.mkdtemp(prefix="t212_orch_ctrl_"))
+            self._owns_temp_data_dir = True
+        else:
+            self.data_dir = Path("data")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._funnel_state_path = self.data_dir / "funnel_state.json"
+
+        self.config_bus = config_bus if config_bus is not None else ConfigBus(data_dir=self.data_dir)
+        snap = self.config_bus.active_snapshot()
+
+        # Synchronization locks (hierarchy: _execution_gate_lock / _broker_op_lock -> _state_lock; _read_model_lock is leaf)
+        existing_gate_lock = (
+            getattr(position_monitor, "execution_gate_lock", None)
+            if position_monitor is not None
+            else None
+        )
+        self._execution_gate_lock: threading.RLock = (
+            existing_gate_lock if isinstance(existing_gate_lock, type(threading.RLock())) else threading.RLock()
+        )
+        self._read_model_lock = threading.RLock()
+        self._read_model_snapshot: Optional[Dict[str, Any]] = None
+        self._latest_funnel_report: Optional[CycleFunnelReport] = self._load_persisted_funnel_state()
+        self._latest_funnel_meta: Dict[str, Any] = (
+            {"status": "ok", "reason": ""}
+            if self._latest_funnel_report is not None
+            else {"status": "pre_scan", "reason": "No completed universe scan cycle recorded yet."}
+        )
+        self._last_funnel_inputs: Optional[Dict[str, Any]] = None
 
         # ── 1. Trading 212 API Client ─────────────────────────────
         self.t212 = t212_client or Trading212Client(
             api_key=settings.TRADING212_API_KEY,
             api_secret=settings.TRADING212_API_SECRET,
             base_url=settings.api_base_url,
+            rate_limit_delay=float(getattr(snap, "RATE_LIMIT_INTER_CALL_DELAY", settings.RATE_LIMIT_INTER_CALL_DELAY)),
         )
 
         # ── 2. Universe Manager ───────────────────────────────────
         self.leveraged_universe = LeveragedUniverse()
-        if settings.USE_LEVERAGED_3X:
-            self.universe: List[str] = (
-                settings.WATCHLIST
-                if settings.WATCHLIST
-                else self.leveraged_universe.get_all_underlyings()
-            )
-        else:
-            self.universe = (
-                settings.WATCHLIST
-                if settings.WATCHLIST
-                else DEFAULT_UNIVERSE[: settings.UNIVERSE_SIZE]
-            )
+        self.universe: List[str] = []
+        self._rebuild_universe(snap)
 
         # ── 3. Notification Engine ────────────────────────────────
+        default_notif_log = (
+            str(self.data_dir / "notifications.jsonl")
+            if (explicit_isolation or is_testing)
+            else settings.NOTIFICATIONS_LOG_PATH
+        )
         self.notifier = notifier or Notifier(
             telegram_bot_token=settings.TELEGRAM_BOT_TOKEN,
             telegram_chat_id=settings.TELEGRAM_CHAT_ID,
             discord_webhook_url=settings.DISCORD_WEBHOOK_URL,
-            log_file=settings.NOTIFICATIONS_LOG_PATH,
-            enable_desktop=settings.ENABLE_DESKTOP_NOTIFICATIONS,
+            log_file=default_notif_log,
+            enable_desktop=False if is_testing else bool(getattr(snap, "ENABLE_DESKTOP_NOTIFICATIONS", settings.ENABLE_DESKTOP_NOTIFICATIONS)),
         )
 
-        # ── 4. Quantitative Candidate Screener ───────────────────
+        quarantine_warnings = list(self.config_bus.get_quarantine_warnings())
+        if quarantine_warnings:
+            joined = "; ".join(quarantine_warnings)
+            logger.warning("Config quarantine warnings detected at startup: %s", joined)
+            self._dispatch_system_alert(
+                "CONFIG QUARANTINE WARNING",
+                f"Corrupt persisted config quarantined on boot: {joined}",
+            )
+
+        # ── 4. Quantitative Candidate Screener & Improvement Agent ─
         self.screener = LayaScreener(
-            min_setup_score=settings.SCREENER_MIN_SETUP_SCORE,
-            max_catalyst_risk=settings.SCREENER_MAX_CATALYST_RISK,
-            top_n=settings.SCREENER_TOP_N,
+            min_setup_score=str(snap.SCREENER_MIN_SETUP_SCORE),
+            max_catalyst_risk=float(snap.SCREENER_MAX_CATALYST_RISK),
+            top_n=int(snap.SCREENER_TOP_N),
         )
-        self.improvement_agent = StrategyImprovementAgent()
+        audit_history_path = (
+            self.data_dir / "audit_history.jsonl"
+            if (explicit_isolation or is_testing)
+            else Path("data") / "audit_history.jsonl"
+        )
+        self.improvement_agent = StrategyImprovementAgent(audit_history_path=audit_history_path)
 
         # ── 5. System 2: Deliberative Multi-Agent Stack ──────────
         self.technical_analyst = TechnicalAnalyst(
             openai_api_key=settings.OPENAI_API_KEY,
-            model=settings.LLM_DEEP_MODEL,
+            model=str(snap.LLM_DEEP_MODEL),
         )
         self.fundamental_analyst = FundamentalAnalyst(
             openai_api_key=settings.OPENAI_API_KEY,
-            model=settings.LLM_DEEP_MODEL,
+            model=str(snap.LLM_DEEP_MODEL),
         )
         self.debate_engine = DebateEngine(
             openai_api_key=settings.OPENAI_API_KEY,
-            model=settings.LLM_DEEP_MODEL,
-            quick_model=settings.LLM_QUICK_MODEL,
+            model=str(snap.LLM_DEEP_MODEL),
+            quick_model=str(snap.LLM_QUICK_MODEL),
             debate_rounds=3,
-            speculative_routing=settings.ENABLE_SPECULATIVE_ROUTING,
-            speculative_threshold=settings.SPECULATIVE_CONFIDENCE_THRESHOLD,
+            speculative_routing=bool(snap.ENABLE_SPECULATIVE_ROUTING),
+            speculative_threshold=float(snap.SPECULATIVE_CONFIDENCE_THRESHOLD),
         )
-        self.parallel_ingestion_workers = settings.PARALLEL_INGESTION_WORKERS
-        self.parallel_deliberation_workers = settings.PARALLEL_DELIBERATION_WORKERS
+        self.parallel_ingestion_workers = int(snap.PARALLEL_INGESTION_WORKERS)
+        self.parallel_deliberation_workers = int(snap.PARALLEL_DELIBERATION_WORKERS)
         self.risk_manager = RiskManager(
-            max_risk_per_trade=settings.MAX_RISK_PER_TRADE,
-            max_position_pct=settings.MAX_POSITION_PCT,
-            atr_sl_multiplier=settings.ATR_SL_MULTIPLIER,
-            min_sl_pct=settings.MIN_SL_PCT,
-            tp1_r=settings.TP1_R_MULTIPLE,
-            tp2_r=settings.TP2_R_MULTIPLE,
-            tp3_r=settings.TP3_R_MULTIPLE,
-            tsl_atr_multiplier=settings.TSL_ATR_MULTIPLIER,
+            max_risk_per_trade=float(snap.MAX_RISK_PER_TRADE),
+            max_position_pct=float(snap.MAX_POSITION_PCT),
+            atr_sl_multiplier=float(snap.ATR_SL_MULTIPLIER),
+            min_sl_pct=float(snap.MIN_SL_PCT),
+            max_sl_pct=float(snap.MAX_SL_PCT),
+            tp1_r=float(snap.TP1_R_MULTIPLE),
+            tp2_r=float(snap.TP2_R_MULTIPLE),
+            tp3_r=float(snap.TP3_R_MULTIPLE),
+            tsl_atr_multiplier=float(snap.TSL_ATR_MULTIPLIER),
+            tsl_hysteresis_atr_mult=float(snap.TSL_HYSTERESIS_ATR_MULT),
+            tp1_trim_pct=float(snap.TP1_TRIM_PCT),
+            tp2_trim_pct=float(snap.TP2_TRIM_PCT),
+            tp3_trim_pct=float(snap.TP3_TRIM_PCT),
+            target_annual_volatility=float(snap.TARGET_ANNUAL_VOLATILITY),
+            enforce_spread_gate=bool(snap.ENFORCE_SPREAD_GATE),
+            max_bid_ask_spread_pct=float(snap.MAX_BID_ASK_SPREAD_PCT),
+            enforce_correlation_limits=bool(snap.ENFORCE_CORRELATION_LIMITS),
+            max_sector_positions=int(snap.MAX_SECTOR_POSITIONS),
+            max_portfolio_beta_heat=float(snap.MAX_PORTFOLIO_BETA_HEAT),
+            enforce_daily_circuit_breaker=bool(snap.ENFORCE_DAILY_CIRCUIT_BREAKER),
+            daily_max_drawdown_pct=float(snap.DAILY_MAX_DRAWDOWN_PCT),
         )
 
         # ── 6. Active Position & Lifecycle Monitor ───────────────
-        self.position_monitor = position_monitor or PositionMonitor(
-            t212_client=self.t212,
-            notifier=self.notifier,
-            risk_manager=self.risk_manager,
-            state_file=settings.ACTIVE_TRADES_PATH,
-            dry_run=self.dry_run,
+        default_state_file = (
+            str(self.data_dir / "active_trades.json")
+            if (explicit_isolation or is_testing)
+            else settings.ACTIVE_TRADES_PATH
         )
+        if position_monitor is not None:
+            self.position_monitor = position_monitor
+            if getattr(self.position_monitor, "config_bus", None) is None:
+                with contextlib.suppress(Exception):
+                    self.position_monitor.config_bus = self.config_bus
+            if getattr(self.position_monitor, "execution_gate_lock", None) is None:
+                with contextlib.suppress(Exception):
+                    self.position_monitor.execution_gate_lock = self._execution_gate_lock
+        else:
+            self.position_monitor = PositionMonitor(
+                t212_client=self.t212,
+                notifier=self.notifier,
+                risk_manager=self.risk_manager,
+                state_file=default_state_file,
+                dry_run=self.dry_run,
+                pure_tsl_mode=bool(snap.PURE_TSL_MODE),
+                config_bus=self.config_bus,
+                execution_gate_lock=self._execution_gate_lock,
+            )
+
         self.session_start_equity: Optional[float] = None
         self._last_reconciliation_time: float = 0.0
         self.in_flight_tickers: Set[str] = set()
         self._scan_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="universe_scan")
         self._scan_future: Optional[concurrent.futures.Future] = None
+
         # Synchronize broker-native GTC Stop Loss / Limit orders for active positions
         if not self.dry_run:
             try:
@@ -163,8 +410,34 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("Initial broker stop sync deferred: %s", exc)
 
+        # Non-unit-test warm-up using non-forced broker getters before initial snapshot publish
+        if not is_testing and not self.dry_run and settings.TRADING212_API_KEY:
+            try:
+                self.t212.get_account_cash(
+                    fallback_equity=float(snap.DEFAULT_ACCOUNT_EQUITY),
+                    force_refresh=False,
+                )
+            except Exception as warm_exc:
+                logger.debug("Boot cash cache warm-up deferred: %s", warm_exc)
+            if hasattr(self.t212, "get_historical_orders"):
+                try:
+                    self.t212.get_historical_orders(limit=30, force_refresh=False)
+                except Exception as hist_exc:
+                    logger.debug("Boot historical orders warm-up deferred: %s", hist_exc)
+
         # ── 7. Audit Logging ──────────────────────────────────────
-        self.trades_log = Path(trades_log) if trades_log else Path(settings.TRADES_LOG_PATH)
+        default_trades_log = (
+            self.data_dir / "trades.jsonl"
+            if (explicit_isolation or is_testing)
+            else Path(settings.TRADES_LOG_PATH)
+        )
+        self.trades_log = Path(trades_log) if trades_log else default_trades_log
+
+        # Populate initial read-model snapshot cleanly with zero extra broker HTTP requests
+        self._refresh_read_model_snapshot(
+            persist_funnel=(not is_testing or explicit_isolation),
+            broadcast=False,
+        )
 
         # ── 8. Embedded Dashboard Web Server ──────────────────────
         self.dashboard_thread = None
@@ -173,8 +446,6 @@ class Orchestrator:
         self._generate_html_dashboard = None
 
         if enable_dashboard is None:
-            # Auto-detect test runner environment to avoid binding ports during unit tests
-            is_testing = "unittest" in sys.modules and any("test" in arg.lower() for arg in sys.argv)
             enable_dashboard = False if is_testing else getattr(settings, "ENABLE_EMBEDDED_DASHBOARD", True)
 
         self.enable_dashboard = enable_dashboard
@@ -187,26 +458,979 @@ class Orchestrator:
                     start_local_server_thread,
                 )
                 self._generate_html_dashboard = generate_html_dashboard
+                srv_sig = inspect.signature(start_local_server_thread)
+                srv_kwargs: Dict[str, Any] = {
+                    "port": self.dashboard_port,
+                    "open_browser": open_browser,
+                }
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in srv_sig.parameters.values()
+                )
+                if "orchestrator" in srv_sig.parameters or accepts_var_kw:
+                    srv_kwargs["orchestrator"] = self
+                if "allow_port_fallback" in srv_sig.parameters or accepts_var_kw:
+                    srv_kwargs["allow_port_fallback"] = False
                 self.dashboard_thread, self.dashboard_server, self.dashboard_url = start_local_server_thread(
-                    port=self.dashboard_port,
-                    open_browser=open_browser,
+                    **srv_kwargs
                 )
             except Exception as exc:
                 logger.warning("Failed to start embedded dashboard server: %s", exc)
 
         logger.info(
-            "Orchestrator initialized — 3x Universe: %d assets, Mode: %s (DryRun: %s, Dashboard: %s)",
+            "Orchestrator initialized — 3x Universe: %d assets, Epoch: %s, Mode: %s (DryRun: %s, Dashboard: %s)",
             len(self.universe),
+            snap.config_epoch_id,
             "LIVE" if settings.USE_LIVE else "DEMO",
             self.dry_run,
             self.dashboard_url if self.enable_dashboard and self.dashboard_url else "DISABLED",
         )
 
-    def _update_dashboard(self) -> None:
-        """Regenerate signals_dashboard.html if embedded dashboard is enabled."""
+    def _rebuild_universe(self, snap: ConfigSnapshot) -> None:
+        """Build monitored underlying list from active ConfigSnapshot."""
+        use_lev = bool(getattr(snap, "USE_LEVERAGED_3X", True))
+        watchlist = getattr(snap, "WATCHLIST", None)
+        universe_size = int(getattr(snap, "UNIVERSE_SIZE", 100))
+        if use_lev:
+            self.universe = list(watchlist) if watchlist else self.leveraged_universe.get_all_underlyings()
+        else:
+            self.universe = list(watchlist) if watchlist else DEFAULT_UNIVERSE[:universe_size]
+
+    def _apply_snapshot_to_runtime(self, snap: ConfigSnapshot) -> None:
+        """Update hot-reloadable runtime knobs after a ConfigBus commit."""
+        self.parallel_ingestion_workers = int(getattr(snap, "PARALLEL_INGESTION_WORKERS", self.parallel_ingestion_workers))
+        self.parallel_deliberation_workers = int(getattr(snap, "PARALLEL_DELIBERATION_WORKERS", self.parallel_deliberation_workers))
+        if hasattr(self.t212, "rate_limit_delay"):
+            with contextlib.suppress(Exception):
+                self.t212.rate_limit_delay = float(getattr(snap, "RATE_LIMIT_INTER_CALL_DELAY", 1.25))
+
+    def _dispatch_system_alert(self, title: str, message: str) -> None:
+        """Emit an operational system alert (e.g. boot quarantine) through Notifier safely."""
+        if not getattr(self, "notifier", None):
+            return
+        try:
+            if hasattr(self.notifier, "notify_alert") and callable(getattr(self.notifier, "notify_alert")):
+                # Avoid invoking unconfigured MagicMock attributes unintentionally only if real or mocked explicitly
+                from unittest.mock import NonCallableMock
+                attr = getattr(self.notifier, "notify_alert")
+                if not isinstance(attr, NonCallableMock) or "notify_alert" in getattr(self.notifier, "__dict__", {}):
+                    attr(title, message)
+                    return
+            if hasattr(self.notifier, "dispatch"):
+                note = TradeNotification(
+                    event_type="SYSTEM_ALERT",  # type: ignore[arg-type]
+                    ticker="SYSTEM",
+                    underlying="CONFIG",
+                    direction="LONG",
+                    price=0.0,
+                    quantity=0.0,
+                    stop_loss=0.0,
+                    trailing_stop=0.0,
+                    tp1=0.0,
+                    tp2=0.0,
+                    tp3=0.0,
+                    rationale=f"{title}: {message}",
+                )
+                self.notifier.dispatch(note)
+        except Exception as exc:
+            logger.debug("System alert dispatch failed cleanly: %s", exc)
+
+    def _load_persisted_funnel_state(self) -> Optional[CycleFunnelReport]:
+        """Restore the latest CycleFunnelReport from data/funnel_state.json if valid."""
+        path = getattr(self, "_funnel_state_path", None)
+        if path is None or not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not isinstance(raw.get("stage_counts"), dict):
+                return None
+            return CycleFunnelReport(
+                timestamp=str(raw.get("timestamp", "")),
+                config_epoch_id=raw.get("config_epoch_id"),
+                stage_counts={str(k): int(v) for k, v in raw.get("stage_counts", {}).items()},
+                gate_breakdown=[dict(x) for x in (raw.get("gate_breakdown") or []) if isinstance(x, dict)],
+                _compact_indicators={
+                    str(k): {str(mk): float(mv) for mk, mv in row.items()}
+                    for k, row in (raw.get("_compact_indicators") or {}).items()
+                    if isinstance(row, dict)
+                },
+                metric_percentiles={
+                    str(k): {str(sk): float(sv) for sk, sv in stats.items()}
+                    for k, stats in (raw.get("metric_percentiles") or {}).items()
+                    if isinstance(stats, dict)
+                },
+                passed_tickers=[str(t) for t in (raw.get("passed_tickers") or [])],
+                executed_tickers=[str(t) for t in (raw.get("executed_tickers") or [])],
+            )
+        except Exception as exc:
+            logger.warning("Ignoring corrupt or unreadable funnel state %s: %s", path, exc)
+            return None
+
+    def _broadcast_sse(self, event_type: str, data: Any) -> None:
+        """Broadcast an SSE event through SSEBroadcaster safely without propagating errors."""
+        try:
+            from trading_system.dashboard.server import SSEBroadcaster
+            SSEBroadcaster.get_instance().broadcast(event_type, data)
+        except Exception as exc:
+            logger.debug("SSE broadcast (%s) skipped: %s", event_type, exc)
+
+    def _get_cached_broker_view(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Read cached Trading 212 snapshot and rate telemetry with ZERO HTTP calls."""
+        cached: Dict[str, Any] = {}
+        if hasattr(self.t212, "get_cached_broker_snapshot"):
+            try:
+                raw = self.t212.get_cached_broker_snapshot()
+                if isinstance(raw, dict):
+                    cached = raw
+            except Exception as exc:
+                logger.debug("Cached broker snapshot read notice: %s", exc)
+
+        if not cached:
+            # Fallback for custom/minimal clients supporting cached_only=True
+            cash_dict = None
+            try:
+                if hasattr(self.t212, "get_account_cash"):
+                    sig = inspect.signature(self.t212.get_account_cash)
+                    if "cached_only" in sig.parameters:
+                        c = self.t212.get_account_cash(cached_only=True)
+                        if isinstance(c, AccountCash):
+                            cash_dict = {
+                                "free": float(c.free),
+                                "invested": float(c.invested),
+                                "total": float(c.total),
+                                "blocked": float(c.blocked),
+                                "result": float(c.result),
+                                "ppl_result": float(c.ppl_result),
+                            }
+            except Exception:
+                pass
+            cached = {"cash": cash_dict, "portfolio": None, "orders": None, "historical_orders": None}
+
+        telemetry: Dict[str, Any] = {}
+        if hasattr(self.t212, "get_rate_limit_telemetry"):
+            try:
+                raw_tel = self.t212.get_rate_limit_telemetry()
+                if isinstance(raw_tel, dict):
+                    telemetry = copy.deepcopy(raw_tel)
+            except Exception:
+                pass
+
+        return cached, telemetry
+
+    def _snapshot_positions_under_lock(self) -> Tuple[bool, List[Tuple[str, Dict[str, Any]]]]:
+        """Copy TrackedPosition dicts briefly under PositionMonitor._state_lock (no I/O)."""
+        pm = getattr(self, "position_monitor", None)
+        if pm is None:
+            return False, []
+
+        raw_positions = getattr(pm, "positions", None)
+        if not isinstance(raw_positions, Mapping):
+            raw_positions = {}
+
+        state_lock = getattr(pm, "_state_lock", None)
+        lock_ctx = state_lock if state_lock is not None and hasattr(state_lock, "__enter__") else contextlib.nullcontext()
+
+        rows: List[Tuple[str, Dict[str, Any]]] = []
+        with lock_ctx:
+            halted = False
+            if hasattr(pm, "is_system_halted"):
+                halted = _as_bool_strict(pm.is_system_halted(), False)
+            if not halted:
+                halted = _as_bool_strict(getattr(pm, "is_halted", False), False)
+
+            for ticker, pos in list(raw_positions.items()):
+                if getattr(pos, "is_closed", False):
+                    continue
+                rem_qty = float(getattr(pos, "remaining_quantity", 0.0) or 0.0)
+                if rem_qty <= 0.0 and not bool(getattr(pos, "panic_failed", False)):
+                    continue
+                pos_dict = asdict(pos) if hasattr(pos, "__dataclass_fields__") else dict(vars(pos))
+                rows.append((str(ticker), pos_dict))
+        return halted, rows
+
+    def _build_active_signals_snapshot(
+        self,
+        pos_rows: List[Tuple[str, Dict[str, Any]]],
+        cached_prices: Mapping[str, float],
+        cfg_snap: ConfigSnapshot,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Build enriched active_signals, positions_behind_epoch, and unprotected_positions lists."""
+        active_epoch_id = cfg_snap.config_epoch_id
+        signals: List[Dict[str, Any]] = []
+        behind_epoch: List[Dict[str, Any]] = []
+        unprotected: List[Dict[str, Any]] = []
+
+        for ticker, pos in pos_rows:
+            underlying = str(pos.get("underlying") or ticker)
+            pair = self.leveraged_universe.get_pair_for_underlying(underlying)
+            asset_name = pair.name if pair else underlying
+
+            raw_dir = str(pos.get("direction") or "LONG").upper()
+            auth_dir = self.leveraged_universe.get_etp_direction(ticker)
+            direction = auth_dir if auth_dir else ("SHORT" if "SHORT" in raw_dir or "SELL" in raw_dir else "LONG")
+
+            entry = float(pos.get("entry_price") or 0.0)
+            cur_px = float(cached_prices.get(ticker) or pos.get("current_price") or entry)
+            orig_qty = float(pos.get("original_quantity") or 0.0)
+            rem_qty = float(pos.get("remaining_quantity") or 0.0)
+            sl = float(pos.get("stop_loss") or 0.0)
+            tsl = float(pos.get("trailing_stop_loss") or sl)
+
+            currency_code = get_ticker_currency(ticker)
+            currency_prefix = "€" if currency_code == "EUR" else ("$" if currency_code == "USD" else "")
+            currency_suffix = "p" if currency_code == "GBX" else (" £" if currency_code == "GBP" else "")
+
+            pnl_pct = ((cur_px - entry) / entry * 100.0) if entry > 0 else 0.0
+            pnl_amount = (cur_px - entry) * rem_qty
+            pnl_amount_eur = normalize_quote_to_eur(ticker, pnl_amount, currency_code)
+
+            risk_pct = ((entry - sl) / entry * 100.0) if entry > 0 and sl > 0 else 0.0
+            broker_stop_id = pos.get("broker_stop_order_id")
+            broker_tp_id = pos.get("broker_tp_order_id")
+            panic_failed = bool(pos.get("panic_failed", False))
+            unprotected_reason = pos.get("unprotected_reason")
+            pos_epoch_id = pos.get("config_epoch_id")
+            is_behind = (pos_epoch_id != active_epoch_id)
+
+            entry_snap_raw = pos.get("entry_config_snapshot")
+            pos_pure_tsl = bool(
+                entry_snap_raw.get("PURE_TSL_MODE", cfg_snap.PURE_TSL_MODE)
+                if isinstance(entry_snap_raw, Mapping)
+                else cfg_snap.PURE_TSL_MODE
+            )
+
+            session_count = max(1, int(pos.get("session_count") or 1))
+            is_runner = bool(pos.get("is_runner", False))
+            snap_for_decay = entry_snap_raw if isinstance(entry_snap_raw, Mapping) else cfg_snap
+            decay_mult = RiskManager.get_decay_atr_multiplier(
+                session_count=session_count,
+                is_runner=is_runner,
+                config_snapshot=snap_for_decay,
+            )
+
+            if panic_failed:
+                status = "PANIC_FAILED"
+                tsl_status = "Panic Failed"
+            elif unprotected_reason or not broker_stop_id:
+                status = "UNPROTECTED"
+                tsl_status = "No GTC Stop"
+            elif tsl >= entry > 0:
+                status = "BREAKEVEN LOCKED (Risk-Free Trail Active)"
+                tsl_status = "Break-Even Locked"
+            else:
+                status = "ACTIVE (Initial Stop Protection)"
+                tsl_status = "Initial Stop Active"
+
+            item = {
+                "ticker": ticker,
+                "underlying": underlying,
+                "name": asset_name,
+                "direction": direction,
+                "leverage": int(pos.get("leverage") or (5 if "5" in ticker else 3)),
+                "entry_price": round(entry, 4),
+                "current_price": round(cur_px, 4),
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_amount": round(pnl_amount, 2),
+                "pnl_amount_eur": round(pnl_amount_eur, 2),
+                "currency_code": currency_code,
+                "currency_prefix": currency_prefix,
+                "currency_suffix": currency_suffix,
+                "stop_loss": round(sl, 4),
+                "trailing_stop_loss": round(tsl, 4),
+                "tp1": round(float(pos.get("tp1") or 0.0), 4),
+                "tp2": round(float(pos.get("tp2") or 0.0), 4),
+                "tp3": round(float(pos.get("tp3") or 0.0), 4),
+                "highest_price": round(float(pos.get("highest_price") or cur_px), 4),
+                "lowest_price": round(float(pos.get("lowest_price") or cur_px), 4),
+                "tsl_status": tsl_status,
+                "session_count": session_count,
+                "is_runner": is_runner,
+                "decay_multiplier": decay_mult,
+                "decay_label": f"Session {session_count} ({decay_mult:.2f}x ATR)",
+                "stop_distance_pct": round(risk_pct, 2),
+                "broker_stop_order_id": broker_stop_id,
+                "broker_tp_order_id": broker_tp_id,
+                "quantity": orig_qty,
+                "remaining_quantity": rem_qty,
+                "status": status,
+                "entry_time": pos.get("entry_time", ""),
+                "atr": round(float(pos.get("atr") or 0.0), 4),
+                "earnings_in_days": pos.get("earnings_in_days"),
+                "config_epoch_id": pos_epoch_id,
+                "position_epoch_id": pos_epoch_id,
+                "pure_tsl_mode": pos_pure_tsl,
+                "is_behind_epoch": is_behind,
+                "panic_failed": panic_failed,
+                "unprotected_reason": unprotected_reason,
+            }
+            signals.append(item)
+
+            if is_behind:
+                behind_epoch.append({
+                    "ticker": ticker,
+                    "underlying": underlying,
+                    "direction": direction,
+                    "position_epoch_id": pos_epoch_id,
+                    "active_epoch_id": active_epoch_id,
+                    "is_legacy": pos_epoch_id is None,
+                    "stop_loss": item["stop_loss"],
+                    "trailing_stop_loss": item["trailing_stop_loss"],
+                    "pure_tsl_mode": pos_pure_tsl,
+                })
+
+            if panic_failed or unprotected_reason or not broker_stop_id:
+                unprotected.append({
+                    "ticker": ticker,
+                    "underlying": underlying,
+                    "panic_failed": panic_failed,
+                    "reason": unprotected_reason or "Missing broker GTC stop",
+                    "broker_stop_order_id": broker_stop_id,
+                    "remaining_quantity": rem_qty,
+                })
+
+        return signals, behind_epoch, unprotected
+
+    def _build_pairs_watchlist_snapshot(self, cfg_snap: ConfigSnapshot) -> Tuple[List[Dict[str, Any]], str, Dict[str, int]]:
+        """Build dynamic universe pairs list and EUR/USD/GBX currency mix breakdown."""
+        allow_5x = bool(getattr(cfg_snap, "ENABLE_5X_LEVERAGE", False))
+        pairs_list: List[Dict[str, Any]] = []
+        currency_counts: Dict[str, int] = {"EUR": 0, "USD": 0, "GBX": 0, "GBP": 0, "other": 0}
+
+        for pair in self.leveraged_universe.pairs:
+            long_t = (
+                pair.long_5x_ticker
+                if (allow_5x and pair.has_5x and pair.long_5x_ticker)
+                else pair.long_3x_ticker
+            )
+            short_t = (
+                pair.short_5x_ticker
+                if (allow_5x and pair.has_5x and pair.short_5x_ticker and pair.short_5x_ticker != "None")
+                else (pair.short_3x_ticker if pair.short_3x_ticker and pair.short_3x_ticker != "None" else None)
+            )
+            long_curr = get_ticker_currency(long_t) if long_t else "EUR"
+            if long_curr in currency_counts:
+                currency_counts[long_curr] += 1
+            else:
+                currency_counts["other"] += 1
+
+            pairs_list.append({
+                "underlying": pair.underlying_symbol,
+                "name": pair.name,
+                "category": pair.category,
+                "long_ticker": long_t,
+                "short_ticker": short_t,
+                "has_5x": bool(pair.has_5x),
+                "long_5x_ticker": pair.long_5x_ticker,
+                "short_5x_ticker": pair.short_5x_ticker,
+                "currency": long_curr,
+                "long_currency": long_curr,
+            })
+
+        total = max(1, len(pairs_list))
+        eur_pct = round((currency_counts["EUR"] / total) * 100.0)
+        currency_counts["total"] = len(pairs_list)
+        return pairs_list, f"{eur_pct}%", currency_counts
+
+    def _build_read_model_snapshot(self) -> Dict[str, Any]:
+        """Construct complete JSON-ready dashboard snapshot with zero Trading 212 HTTP calls."""
+        cfg_snap = self.config_bus.active_snapshot()
+        active_epoch_id = cfg_snap.config_epoch_id
+        now_utc = datetime.now(timezone.utc)
+        generated_at_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        cached_broker, rate_telemetry = self._get_cached_broker_view()
+        cached_prices: Dict[str, float] = {}
+        for p in (cached_broker.get("portfolio") or []):
+            if isinstance(p, Mapping):
+                tk = str(p.get("ticker") or "")
+                px = float(p.get("current_price") or p.get("average_price") or 0.0)
+                if tk and px > 0:
+                    cached_prices[tk] = px
+
+        is_halted, pos_rows = self._snapshot_positions_under_lock()
+        active_signals, positions_behind_epoch, unprotected_positions = self._build_active_signals_snapshot(
+            pos_rows, cached_prices, cfg_snap
+        )
+        pairs_watchlist, eur_ratio, currency_mix = self._build_pairs_watchlist_snapshot(cfg_snap)
+
+        # Load recent history and notifications strictly from local logs + cached historical orders
+        try:
+            from trading_system.dashboard.server import (
+                fetch_live_broker_notifications,
+                load_recent_history,
+                load_recent_notifications,
+            )
+            history = load_recent_history(str(self.trades_log), limit=15)
+            local_notifs = load_recent_notifications(str(self.notifier.log_file), limit=30)
+            cached_hist = cached_broker.get("historical_orders")
+            broker_notifs = (
+                fetch_live_broker_notifications(_CachedHistoryClientProxy(cached_hist), self.leveraged_universe, limit=30)
+                if isinstance(cached_hist, dict) and cached_hist.get("items")
+                else []
+            )
+        except Exception:
+            history, local_notifs, broker_notifs = [], [], []
+
+        seen_notifs: Set[Tuple[Any, ...]] = set()
+        merged_notifs: List[Dict[str, Any]] = []
+        for item in list(broker_notifs) + list(local_notifs):
+            if not isinstance(item, dict):
+                continue
+            dedup_key = (item.get("event_type"), item.get("ticker"), round(float(item.get("price") or 0.0), 3), str(item.get("timestamp", ""))[:16])
+            if dedup_key in seen_notifs:
+                continue
+            seen_notifs.add(dedup_key)
+            merged_notifs.append(dict(item))
+        merged_notifs.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        recent_notifications = merged_notifs[:30]
+
+        cached_cash = cached_broker.get("cash") if isinstance(cached_broker.get("cash"), Mapping) else None
+        cached_total = float(cached_cash.get("total") or 0.0) if cached_cash else 0.0
+        default_eq = float(getattr(cfg_snap, "DEFAULT_ACCOUNT_EQUITY", 10000.0))
+        base_equity = round(cached_total, 2) if cached_total > 0 else round(default_eq, 2)
+
+        equity_points: List[Dict[str, Any]] = [{"time": "Start", "equity": base_equity}]
+        running_equity = base_equity
+        realized_evs = [e for e in recent_notifications if e.get("pnl") is not None]
+        realized_evs.reverse()
+        for ev in realized_evs:
+            running_equity += float(ev.get("pnl") or 0.0)
+            t_str = str(ev.get("timestamp") or "")[-12:-4] or "Trade"
+            equity_points.append({"time": t_str, "equity": round(running_equity, 2)})
+
+        total_open_pnl = sum(float(s.get("pnl_amount_eur", s.get("pnl_amount", 0.0)) or 0.0) for s in active_signals)
+        current_equity = (
+            round(cached_total + total_open_pnl, 2)
+            if cached_total > 0
+            else round(running_equity + total_open_pnl, 2)
+        )
+        equity_points.append({"time": now_utc.strftime("%H:%M:%S"), "equity": current_equity})
+
+        active_stops_cached = cached_broker.get("active_server_stops_count")
+        active_stops = (
+            int(active_stops_cached)
+            if isinstance(active_stops_cached, int)
+            else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
+        )
+
+        # Build funnel payload cleanly
+        if self._latest_funnel_report is not None:
+            funnel_dict = self._latest_funnel_report.to_dict()
+            funnel_dict.setdefault("cross_sectional_metrics", copy.deepcopy(funnel_dict.get("metric_percentiles", {})))
+            funnel_dict["status"] = self._latest_funnel_meta.get("status", "ok")
+            if self._latest_funnel_meta.get("reason"):
+                funnel_dict["reason"] = self._latest_funnel_meta["reason"]
+        else:
+            funnel_dict = {
+                "status": self._latest_funnel_meta.get("status", "pre_scan"),
+                "reason": self._latest_funnel_meta.get("reason", "No completed universe scan cycle recorded yet."),
+                "timestamp": now_utc.isoformat(),
+                "config_epoch_id": active_epoch_id,
+                "stage_counts": {
+                    "universe": 0,
+                    "screened": 0,
+                    "strategy": 0,
+                    "debate": 0,
+                    "gates": 0,
+                    "executed": 0,
+                },
+                "gate_breakdown": [],
+                "_compact_indicators": {},
+                "metric_percentiles": {},
+                "cross_sectional_metrics": {},
+                "passed_tickers": [],
+                "executed_tickers": [],
+            }
+
+        last_audit = getattr(self.improvement_agent, "last_audit", None)
+        audit_hist = list(getattr(self.improvement_agent, "audit_history", ()) or ())
+
+        scrubbed_cfg = _scrub_mapping(cfg_snap.to_dict())
+        schema_dict = export_config_schema(cfg_snap.dynamic_parameter_specs)
+        profiles_dict = get_builtin_profiles()
+
+        return {
+            "generated_at": generated_at_str,
+            "mode": "DRY_RUN" if self.dry_run else ("LIVE_AUTO" if settings.USE_LIVE else "DEMO_AUTO"),
+            "controller_attached": True,
+            "read_only_reason": None,
+            "is_halted": is_halted,
+            "active_signals": active_signals,
+            "active_signals_count": len(active_signals),
+            "recent_notifications": recent_notifications,
+            "pairs_watchlist": pairs_watchlist,
+            "history": history,
+            "equity_history": equity_points,
+            "equity_points": equity_points,
+            "base_equity": base_equity,
+            "starting_equity": base_equity,
+            "current_equity": current_equity,
+            "broker_status": {
+                "broker_name": "Trading 212 Live" if settings.USE_LIVE else "Trading 212 Demo",
+                "broker_mode": "LIVE" if settings.USE_LIVE else "DEMO",
+                "dry_run": bool(self.dry_run),
+                "is_connected": bool(settings.TRADING212_API_KEY) and not self.dry_run,
+                "is_halted": is_halted,
+                "active_server_stops": active_stops,
+                "active_positions_count": len(active_signals),
+                "execution_mode": (
+                    "System 2 Pure TSL (Native GTC Stop + Algorithmic Trail)"
+                    if bool(cfg_snap.PURE_TSL_MODE)
+                    else "System 2 Scaled Exits (TP1/2/3 + Native GTC TSL)"
+                ),
+                "runner_status": "HALTED" if is_halted else ("DRY-RUN" if self.dry_run else "ONLINE"),
+                "monitored_assets": len(self.universe),
+                "universe_count": len(self.universe),
+                "pairs_count": len(pairs_watchlist),
+                "eur_ratio": eur_ratio,
+                "currency_mix": currency_mix,
+                "rate_limit_telemetry": rate_telemetry,
+            },
+            "active_epoch_id": active_epoch_id,
+            "config_epoch_id": active_epoch_id,
+            "config": scrubbed_cfg,
+            "schema": schema_dict,
+            "presets": profiles_dict,
+            "pending_restart_keys": list(cfg_snap.pending_restart_keys),
+            "config_quarantine_warnings": list(cfg_snap.config_quarantine_warnings),
+            "epoch_history": self.config_bus.epoch_history(limit=25),
+            "funnel": funnel_dict,
+            "audit": last_audit.to_dict() if last_audit is not None else None,
+            "audit_history": [a.to_dict() for a in audit_hist],
+            "rate_limit_telemetry": rate_telemetry,
+            "positions_behind_epoch": positions_behind_epoch,
+            "unprotected_positions": unprotected_positions,
+        }
+
+    def _refresh_read_model_snapshot(
+        self,
+        *,
+        persist_funnel: bool = True,
+        broadcast: bool = True,
+        extra_events: Optional[Sequence[Tuple[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Rebuild thread-safe read-model snapshot, optionally persist funnel_state.json, and notify SSE."""
+        snapshot_payload = self._build_read_model_snapshot()
+        with self._read_model_lock:
+            self._read_model_snapshot = snapshot_payload
+
+        if persist_funnel:
+            try:
+                _atomic_write_json(self._funnel_state_path, snapshot_payload["funnel"])
+            except Exception as exc:
+                logger.warning("Failed persisting atomic funnel state to %s: %s", self._funnel_state_path, exc)
+
+        if broadcast:
+            if extra_events:
+                for evt_name, evt_data in extra_events:
+                    self._broadcast_sse(evt_name, copy.deepcopy(evt_data))
+            self._broadcast_sse("dashboard_update", copy.deepcopy(snapshot_payload))
+
+        return copy.deepcopy(snapshot_payload)
+
+    def get_dashboard_snapshot(self) -> Dict[str, Any]:
+        """Return a deep-copied dashboard/control-plane snapshot with ZERO Trading 212 HTTP calls."""
+        with self._read_model_lock:
+            if self._read_model_snapshot is not None:
+                return copy.deepcopy(self._read_model_snapshot)
+        return self._refresh_read_model_snapshot(persist_funnel=False, broadcast=False)
+
+    def _compute_positions_behind_epoch(self, target_epoch_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Summarize open positions whose entry epoch lags target_epoch_id."""
+        resolved_target = target_epoch_id or self.config_bus.active_epoch_id
+        _, rows = self._snapshot_positions_under_lock()
+        behind: List[Dict[str, Any]] = []
+        for ticker, pos in rows:
+            pos_epoch = pos.get("config_epoch_id")
+            if pos_epoch != resolved_target:
+                behind.append({
+                    "ticker": ticker,
+                    "underlying": pos.get("underlying", ticker),
+                    "direction": pos.get("direction", "LONG"),
+                    "position_epoch_id": pos_epoch,
+                    "target_epoch_id": resolved_target,
+                    "is_legacy": pos_epoch is None,
+                    "stop_loss": pos.get("stop_loss"),
+                    "trailing_stop_loss": pos.get("trailing_stop_loss"),
+                })
+        return behind
+
+    # ─────────────────────────────────────────────────────────────
+    # Thread-Safe Control Gateway Surface (U4 / U5)
+    # ─────────────────────────────────────────────────────────────
+    def preview_config_patch(
+        self,
+        patch: Mapping[str, Any],
+        expected_epoch_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate a config patch, simulate Phase-2 screener gate impact, and report positions behind epoch."""
+        base = self.config_bus.preview_patch(patch, expected_epoch_id=expected_epoch_id)
+        current_snap = self.config_bus.active_snapshot()
+
+        if base.get("validation_ok"):
+            candidate_raw = current_snap.to_dict()
+            dyn_keys = set((candidate_raw.get("dynamic_parameters") or {}).keys())
+            for entry in base.get("diff") or ():
+                k = entry.get("key")
+                new_val = entry.get("new_value")
+                if k in dyn_keys:
+                    candidate_raw.setdefault("dynamic_parameters", {})[k] = new_val
+                elif k in candidate_raw or k in SCHEMA_BY_KEY:
+                    candidate_raw[k] = new_val
+            try:
+                candidate_snap = ConfigSnapshot.from_dict(candidate_raw)
+            except Exception:
+                candidate_snap = current_snap
+
+            compact = (
+                dict(self._latest_funnel_report._compact_indicators)
+                if self._latest_funnel_report is not None and self._latest_funnel_report._compact_indicators
+                else {}
+            )
+            if compact:
+                baseline = simulate_screener_gate_impact(compact, current_snap)
+                candidate = simulate_screener_gate_impact(compact, candidate_snap)
+                base["gate_impact"] = {
+                    "available": True,
+                    "baseline_passed": baseline["selected_count"],
+                    "candidate_passed": candidate["selected_count"],
+                    "delta": candidate["selected_count"] - baseline["selected_count"],
+                    "baseline_qualified": baseline["passed_count"],
+                    "candidate_qualified": candidate["passed_count"],
+                    "baseline": baseline,
+                    "candidate": candidate,
+                }
+            else:
+                base["gate_impact"] = {
+                    "available": False,
+                    "reason": "No compact funnel indicators cached yet (pre-scan or off-hours).",
+                }
+        else:
+            base["gate_impact"] = {
+                "available": False,
+                "reason": "Validation errors present; simulation skipped.",
+            }
+
+        behind = self._compute_positions_behind_epoch(target_epoch_id=current_snap.config_epoch_id)
+        base["positions_behind_epoch"] = behind
+        base["positions_behind_epoch_count"] = len(behind)
+        return base
+
+    def commit_config_patch(
+        self,
+        patch: Mapping[str, Any],
+        expected_epoch_id: str,
+        author: str = "operator",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Commit an epoch-versioned config patch with strict CAS, hot-reload runtime, and SSE notify."""
+        new_snap = self.config_bus.commit_patch(
+            patch,
+            expected_epoch_id=expected_epoch_id,
+            author=author,
+            reason=reason,
+        )
+        self._apply_snapshot_to_runtime(new_snap)
+        epoch_evt = {
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "author": author,
+            "reason": reason,
+            "pending_restart_keys": list(new_snap.pending_restart_keys),
+            "config": _scrub_mapping(new_snap.to_dict()),
+        }
+        dash = self._refresh_read_model_snapshot(
+            persist_funnel=True,
+            broadcast=True,
+            extra_events=[("config_epoch_changed", epoch_evt)],
+        )
+        return {
+            "ok": True,
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "snapshot": _scrub_mapping(new_snap.to_dict()),
+            "config": _scrub_mapping(new_snap.to_dict()),
+            "pending_restart_keys": list(new_snap.pending_restart_keys),
+            "dashboard": dash,
+        }
+
+    def apply_config_profile(
+        self,
+        profile_id: str,
+        expected_epoch_id: str,
+        author: str = "operator",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Apply a named built-in configuration profile atomically under CAS."""
+        new_snap = self.config_bus.apply_profile(
+            profile_id,
+            expected_epoch_id=expected_epoch_id,
+            author=author,
+            reason=reason,
+        )
+        self._apply_snapshot_to_runtime(new_snap)
+        epoch_evt = {
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "profile_id": profile_id,
+            "author": author,
+            "reason": reason,
+            "pending_restart_keys": list(new_snap.pending_restart_keys),
+            "config": _scrub_mapping(new_snap.to_dict()),
+        }
+        dash = self._refresh_read_model_snapshot(
+            persist_funnel=True,
+            broadcast=True,
+            extra_events=[("config_epoch_changed", epoch_evt)],
+        )
+        return {
+            "ok": True,
+            "profile_id": profile_id,
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "snapshot": _scrub_mapping(new_snap.to_dict()),
+            "config": _scrub_mapping(new_snap.to_dict()),
+            "pending_restart_keys": list(new_snap.pending_restart_keys),
+            "dashboard": dash,
+        }
+
+    def add_custom_parameter(
+        self,
+        spec_dict: Mapping[str, Any],
+        expected_epoch_id: Optional[str] = None,
+        author: str = "operator",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Create and register a validated user-defined dynamic parameter + screener gate."""
+        new_snap = self.config_bus.add_dynamic_parameter(
+            spec_dict,
+            expected_epoch_id=expected_epoch_id,
+            author=author,
+            reason=reason,
+        )
+        self._apply_snapshot_to_runtime(new_snap)
+        epoch_evt = {
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "added_key": spec_dict.get("key") if isinstance(spec_dict, Mapping) else None,
+            "config": _scrub_mapping(new_snap.to_dict()),
+        }
+        dash = self._refresh_read_model_snapshot(
+            persist_funnel=True,
+            broadcast=True,
+            extra_events=[("config_epoch_changed", epoch_evt)],
+        )
+        return {
+            "ok": True,
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "snapshot": _scrub_mapping(new_snap.to_dict()),
+            "schema": dash["schema"],
+            "dashboard": dash,
+        }
+
+    def delete_custom_parameter(
+        self,
+        key: str,
+        expected_epoch_id: Optional[str] = None,
+        author: str = "operator",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Delete a user-defined dynamic parameter and prune its overrides atomically."""
+        new_snap = self.config_bus.delete_dynamic_parameter(
+            key,
+            expected_epoch_id=expected_epoch_id,
+            author=author,
+            reason=reason,
+        )
+        self._apply_snapshot_to_runtime(new_snap)
+        epoch_evt = {
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "deleted_key": key,
+            "config": _scrub_mapping(new_snap.to_dict()),
+        }
+        dash = self._refresh_read_model_snapshot(
+            persist_funnel=True,
+            broadcast=True,
+            extra_events=[("config_epoch_changed", epoch_evt)],
+        )
+        return {
+            "ok": True,
+            "deleted_key": key,
+            "config_epoch_id": new_snap.config_epoch_id,
+            "active_epoch_id": new_snap.config_epoch_id,
+            "snapshot": _scrub_mapping(new_snap.to_dict()),
+            "schema": dash["schema"],
+            "dashboard": dash,
+        }
+
+    def preview_position_re_epoch(
+        self,
+        ticker: str,
+        target_epoch_id: Optional[str] = None,
+        confirm_pure_tsl_mode_change: bool = False,
+    ) -> Dict[str, Any]:
+        """Preview exact stop & policy diff of re-epoching one open position."""
+        return self.position_monitor.preview_re_epoch(
+            ticker=ticker,
+            target_epoch_id=target_epoch_id,
+            confirm_pure_tsl_mode_change=confirm_pure_tsl_mode_change,
+        )
+
+    def re_epoch_position(
+        self,
+        ticker: str,
+        expected_position_epoch_id: Optional[str],
+        target_epoch_id: Optional[str] = None,
+        confirm_pure_tsl_mode_change: bool = False,
+    ) -> Dict[str, Any]:
+        """Migrate an open position onto target_epoch_id under dual CAS checks and refresh dashboard."""
+        result = self.position_monitor.re_epoch_position(
+            ticker=ticker,
+            expected_position_epoch_id=expected_position_epoch_id,
+            target_epoch_id=target_epoch_id,
+            confirm_pure_tsl_mode_change=confirm_pure_tsl_mode_change,
+        )
+        dash = self._refresh_read_model_snapshot(persist_funnel=True, broadcast=True)
+        return {**result, "dashboard": dash}
+
+    def preview_re_epoch_all(
+        self,
+        target_epoch_id: Optional[str] = None,
+        confirm_pure_tsl_mode_change: bool = False,
+    ) -> Dict[str, Any]:
+        """Preview batch re-epoch actions across all currently active open positions."""
+        return self.position_monitor.preview_re_epoch_all(
+            target_epoch_id=target_epoch_id,
+            confirm_pure_tsl_mode_change=confirm_pure_tsl_mode_change,
+        )
+
+    def re_epoch_all_positions(
+        self,
+        expected_epoch_id: Optional[str] = None,
+        target_epoch_id: Optional[str] = None,
+        confirm_pure_tsl_mode_change: bool = False,
+    ) -> Dict[str, Any]:
+        """Batch-migrate open positions to the active/target epoch under CAS and publish snapshot."""
+        active_epoch = self.config_bus.active_epoch_id
+        if expected_epoch_id is not None and expected_epoch_id != active_epoch:
+            raise PositionEpochConflictError(
+                f"Batch target epoch conflict: expected {expected_epoch_id!r}, active is {active_epoch!r}",
+                expected_epoch_id=expected_epoch_id,
+                actual_epoch_id=active_epoch,
+                expected_target_epoch_id=expected_epoch_id,
+                actual_target_epoch_id=active_epoch,
+            )
+        resolved_target = target_epoch_id if target_epoch_id is not None else expected_epoch_id
+        result = self.position_monitor.re_epoch_all_positions(
+            target_epoch_id=resolved_target,
+            confirm_pure_tsl_mode_change=confirm_pure_tsl_mode_change,
+        )
+        dash = self._refresh_read_model_snapshot(persist_funnel=True, broadcast=True)
+        succeeded_count = len(result.get("applied", []))
+        failed_count = len(result.get("errors", [])) + len(result.get("conflicts", []))
+        return {
+            **result,
+            "succeeded_count": succeeded_count,
+            "failed_count": failed_count,
+            "halted_preempted": bool(result.get("preempted_by_halt", False)),
+            "dashboard": dash,
+        }
+
+    def trigger_panic_flatten(self, reason: str = "Dashboard emergency panic") -> Dict[str, Any]:
+        """Execute fail-closed emergency panic flatten, halt trading, and broadcast SSE alerts."""
+        result = self.position_monitor.panic_flatten_all()
+        halted = _as_bool_strict(self.position_monitor.is_system_halted(), True)
+        panic_evt = {
+            "reason": reason,
+            "is_halted": halted,
+            **result,
+        }
+        dash = self._refresh_read_model_snapshot(
+            persist_funnel=True,
+            broadcast=True,
+            extra_events=[("panic_triggered", panic_evt)],
+        )
+        return {
+            **result,
+            "reason": reason,
+            "is_halted": halted,
+            "dashboard": dash,
+        }
+
+    def resume_trading(self, confirm_unprotected: bool = False) -> Dict[str, Any]:
+        """Verify/re-arm broker stops via PositionMonitor and clear system halt when safe."""
+        result = self.position_monitor.resume_trading(confirm_unprotected=confirm_unprotected)
+        dash = self._refresh_read_model_snapshot(
+            persist_funnel=True,
+            broadcast=True,
+            extra_events=[("trading_resumed", result)],
+        )
+        return {**result, "dashboard": dash}
+
+    def retry_panic_liquidation(self, ticker: str) -> Dict[str, Any]:
+        """Retry market liquidation on a panic_failed position under PositionMonitor._broker_op_lock."""
+        pm = self.position_monitor
+        broker_lock = getattr(pm, "_broker_op_lock", None) or contextlib.nullcontext()
+        state_lock = getattr(pm, "_state_lock", None) or contextlib.nullcontext()
+
+        with broker_lock:
+            with state_lock:
+                pos = pm.positions.get(ticker)
+                if pos is None or getattr(pos, "is_closed", False) or float(getattr(pos, "remaining_quantity", 0.0) or 0.0) <= 0.0:
+                    raise KeyError(f"Open position {ticker!r} not found for liquidation retry")
+                qty_to_sell = float(pos.remaining_quantity)
+
+            with contextlib.suppress(Exception):
+                pm.cancel_all_broker_orders(pos)
+
+            sold = True
+            if qty_to_sell > 0.0 and not getattr(pm, "dry_run", self.dry_run):
+                try:
+                    sold = bool(pm._execute_sell(pos.ticker, qty_to_sell))
+                except Exception as exc:
+                    logger.error("Retry panic liquidation failed for %s: %s", ticker, exc)
+                    sold = False
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with state_lock:
+                if sold:
+                    pos.is_closed = True
+                    pos.remaining_quantity = 0.0
+                    pos.panic_failed = False
+                    pos.unprotected_reason = None
+                    pos.last_update_time = now_iso
+                else:
+                    pos.is_closed = False
+                    pos.panic_failed = True
+                    pos.unprotected_reason = "Retry panic liquidation failed"
+                    pos.last_update_time = now_iso
+
+            if hasattr(pm, "_save_state"):
+                pm._save_state()
+
+        dash = self._refresh_read_model_snapshot(persist_funnel=True, broadcast=True)
+        return {
+            "ok": bool(sold),
+            "ticker": ticker,
+            "liquidated_quantity": qty_to_sell if sold else 0.0,
+            "panic_failed": not sold,
+            "dashboard": dash,
+        }
+
+    def _update_dashboard(self, *, persist_funnel: bool = True, broadcast: bool = True) -> None:
+        """Refresh read-model snapshot, persist funnel_state.json, notify SSE, and regenerate HTML."""
+        self._refresh_read_model_snapshot(persist_funnel=persist_funnel, broadcast=broadcast)
         if self.enable_dashboard and self._generate_html_dashboard:
             try:
-                self._generate_html_dashboard("signals_dashboard.html")
+                sig = inspect.signature(self._generate_html_dashboard)
+                gen_kwargs: Dict[str, Any] = {}
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if "orchestrator" in sig.parameters or accepts_var_kw:
+                    gen_kwargs["orchestrator"] = self
+                self._generate_html_dashboard("signals_dashboard.html", **gen_kwargs)
             except Exception as exc:
                 logger.debug("Dashboard regeneration skipped: %s", exc)
 
@@ -259,12 +1483,18 @@ class Orchestrator:
     # ─────────────────────────────────────────────────────────────
     # Phase 1 — Data Ingestion (Parallel Subagents)
     # ─────────────────────────────────────────────────────────────
-    def ingest_universe_data(self, filter_active_sessions: bool = True) -> Dict[str, Dict[str, Any]]:
+    def ingest_universe_data(
+        self,
+        filter_active_sessions: bool = True,
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         """Fetch OHLCV and compute indicators for liquid underlyings in parallel using worker threads.
 
         Applies session-gated filtering to skip assets whose underlying and ETP exchanges
         are closed, eliminating API quota exhaustion on dormant markets.
         """
+        snap = config_snapshot or self.config_bus.active_snapshot()
+        workers = max(1, int(getattr(snap, "PARALLEL_INGESTION_WORKERS", self.parallel_ingestion_workers)))
         universe_metrics: Dict[str, Dict[str, Any]] = {}
         start_time = time.time()
 
@@ -304,10 +1534,10 @@ class Orchestrator:
 
         logger.info(
             "Ingesting market data for %d assets in parallel across %d subagent workers…",
-            total, self.parallel_ingestion_workers
+            total, workers
         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel_ingestion_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_symbol = {executor.submit(_fetch_asset, sym): sym for sym in assets_to_ingest}
             completed = 0
             for future in concurrent.futures.as_completed(future_to_symbol):
@@ -331,37 +1561,94 @@ class Orchestrator:
     # ─────────────────────────────────────────────────────────────
     # Phase 2 — Candidate Pre-Filtering for System 2 Deliberation
     # ─────────────────────────────────────────────────────────────
-    def screen_candidates(
-        self, universe_metrics: Dict[str, Dict[str, Any]]
-    ) -> List[ScreenerResult]:
-        """Filter universe using Laya NLI router for Bullish and Bearish setups.
+    @staticmethod
+    def _supports_kwarg(fn: Any, kwarg_name: str) -> bool:
+        """Check cleanly whether callable accepts a keyword argument."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        return kwarg_name in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
 
-        Falls back to :class:`~trading_system.screener.laya_screener.TechnicalFallbackScreener`
-        when the Laya NLI engine is not installed or returns zero candidates, ensuring
-        the engine always has signals to act on even without the NLI model.
-        """
-        from trading_system.screener.laya_screener import HAS_LAYA, TechnicalFallbackScreener
+    def screen_candidates_with_funnel(
+        self,
+        universe_metrics: Dict[str, Dict[str, Any]],
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> Tuple[List[ScreenerResult], List[ScreenerResult]]:
+        """Filter universe against ConfigSnapshot and return (passed_candidates, all_screener_results)."""
+        snap = config_snapshot or self.config_bus.active_snapshot()
+        min_adx = float(getattr(snap, "MIN_ADX_TREND", settings.MIN_ADX_TREND))
+        logger.info(
+            "Screening %d assets for 3x Long/Short momentum (ADX >= %.1f, Epoch=%s)…",
+            len(universe_metrics),
+            min_adx,
+            snap.config_epoch_id,
+        )
 
-        logger.info("Screening %d assets for 3x Long/Short momentum (ADX >= %.1f)…",
-                    len(universe_metrics), settings.MIN_ADX_TREND)
+        # Evaluate full per-ticker outcomes when screener supports evaluate_single for gate attribution
+        all_results: List[ScreenerResult] = []
+        if hasattr(self.screener, "evaluate_single"):
+            eval_fn = self.screener.evaluate_single
+            pass_snap = self._supports_kwarg(eval_fn, "config_snapshot")
+            for ticker, m in universe_metrics.items():
+                try:
+                    res = eval_fn(ticker, m, config_snapshot=snap) if pass_snap else eval_fn(ticker, m)
+                    if isinstance(res, ScreenerResult):
+                        if not getattr(res, "config_epoch_id", None):
+                            res.config_epoch_id = snap.config_epoch_id
+                        all_results.append(res)
+                except Exception as eval_exc:
+                    logger.debug("evaluate_single failed for %s: %s", ticker, eval_exc)
 
-        # Evaluate candidates with primary screener (supports 3-RSI and Momentum)
-        candidates = self.screener.scan_universe(universe_metrics)
+        scan_fn = self.screener.scan_universe
+        candidates = (
+            scan_fn(universe_metrics, config_snapshot=snap)
+            if self._supports_kwarg(scan_fn, "config_snapshot")
+            else scan_fn(universe_metrics)
+        )
+        candidates = list(candidates or [])
 
         # Safety net: if primary returned 0, evaluate with TechnicalFallbackScreener
         if not candidates:
             logger.warning(
                 "Primary screener returned 0 candidates — running TechnicalFallbackScreener as safety net."
             )
-            candidates = TechnicalFallbackScreener(top_n=10).scan_universe(universe_metrics)
+            fb_top_n = max(10, int(getattr(snap, "SCREENER_TOP_N", 10)))
+            fb_screener = TechnicalFallbackScreener(top_n=fb_top_n)
+            fb_res = fb_screener.scan_universe(universe_metrics, config_snapshot=snap)
+            candidates = list(fb_res or [])
+
+        for cand in candidates:
+            if not getattr(cand, "config_epoch_id", None):
+                cand.config_epoch_id = snap.config_epoch_id
+
+        # Build partial funnel attribution for StrategyImprovementAgent
+        prelim_report = build_cycle_funnel_report(
+            universe_metrics=universe_metrics,
+            screener_results=all_results if all_results else None,
+            passed_screener=candidates,
+            strategy_signals=[
+                r.strategy_signal for r in all_results if getattr(r, "strategy_signal", None) is not None
+            ] if all_results else None,
+            config_snapshot=snap,
+            config_epoch_id=snap.config_epoch_id,
+        )
 
         # Record cycle yield with StrategyImprovementAgent
         if getattr(self, "improvement_agent", None):
             try:
-                self.improvement_agent.record_cycle_yield(
-                    candidate_count=len(candidates),
-                    universe_metrics=universe_metrics,
-                )
+                rec_fn = self.improvement_agent.record_cycle_yield
+                rec_kwargs: Dict[str, Any] = {
+                    "candidate_count": len(candidates),
+                    "universe_metrics": universe_metrics,
+                }
+                if self._supports_kwarg(rec_fn, "config_snapshot"):
+                    rec_kwargs["config_snapshot"] = snap
+                if self._supports_kwarg(rec_fn, "gate_breakdown"):
+                    rec_kwargs["gate_breakdown"] = prelim_report.gate_breakdown
+                rec_fn(**rec_kwargs)
             except Exception as audit_exc:
                 logger.debug("StrategyImprovementAgent record notice: %s", audit_exc)
 
@@ -370,15 +1657,30 @@ class Orchestrator:
             len(candidates),
             [f"{c.ticker} ({c.bias})" for c in candidates],
         )
+        return candidates, (all_results if all_results else list(candidates))
+
+    def screen_candidates(
+        self,
+        universe_metrics: Dict[str, Dict[str, Any]],
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> List[ScreenerResult]:
+        """Filter universe using Laya NLI router and ConfigSnapshot thresholds."""
+        candidates, _ = self.screen_candidates_with_funnel(
+            universe_metrics, config_snapshot=config_snapshot
+        )
         return candidates
 
     # ─────────────────────────────────────────────────────────────
     # Phase 3 — System 2 Multi-Agent Deliberation (Concurrent Subagents)
     # ─────────────────────────────────────────────────────────────
     def deep_analyse(
-        self, candidate: ScreenerResult, account_equity: Optional[float] = None
+        self,
+        candidate: ScreenerResult,
+        account_equity: Optional[float] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Optional[DecisionCard]:
-        """Perform multi-agent debate and map candidate to exact 3x Long/Short ETP."""
+        """Perform multi-agent debate and map candidate to exact leveraged execution ETP."""
+        snap = config_snapshot or self.config_bus.active_snapshot()
         underlying = candidate.ticker
         metrics = candidate.metrics
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -386,10 +1688,16 @@ class Orchestrator:
         strategy_type = getattr(candidate, "strategy_type", "directional_trend")
         if getattr(candidate, "strategy_signal", None) is not None:
             metrics["strategy_signal"] = candidate.strategy_signal
+        if not getattr(candidate, "config_epoch_id", None):
+            candidate.config_epoch_id = snap.config_epoch_id
 
-        logger.info("═══ System 2 Deliberation for %s (%s | %s) ═══", underlying, direction, strategy_type)
+        logger.info(
+            "═══ System 2 Deliberation for %s (%s | %s | Epoch=%s) ═══",
+            underlying, direction, strategy_type, snap.config_epoch_id,
+        )
 
-        # ── Pre-Trade Earnings Blackout Check (48h Gate - R2.2) ──
+        # ── Pre-Trade Earnings Blackout Check ────────────────────
+        blackout_days = float(getattr(snap, "ENTRY_EARNINGS_BLACKOUT_DAYS", 2.0))
         earnings_raw = metrics.get("earnings_in_days")
         earnings_in_days: Optional[float] = None
         if earnings_raw is not None:
@@ -398,25 +1706,37 @@ class Orchestrator:
             except (ValueError, TypeError):
                 earnings_in_days = None
 
-        if earnings_in_days is not None and 0 <= earnings_in_days <= 2.0:
+        if earnings_in_days is not None and 0 <= earnings_in_days <= blackout_days:
             logger.warning(
-                "Pre-trade earnings filter: %s rejected due to impending earnings in %.1f days (<= 48h blackout)",
-                underlying, earnings_in_days
+                "Pre-trade earnings filter: %s rejected due to impending earnings in %.1f days (<= %.1fd blackout)",
+                underlying, earnings_in_days, blackout_days,
             )
             return None
 
         # ── 1. Map to Leveraged Execution Ticker (Multi-Tier 5x & 3x Allocation) ──
         direction_upper = direction.upper()
         is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
-        if settings.USE_LEVERAGED_3X:
+        use_lev_3x = bool(getattr(snap, "USE_LEVERAGED_3X", getattr(settings, "USE_LEVERAGED_3X", True)))
+        allow_5x = bool(getattr(snap, "ENABLE_5X_LEVERAGE", False))
+        prefer_5x = bool(getattr(snap, "PREFER_5X_LEVERAGE", False))
+        max_lev = int(getattr(snap, "MAX_LEVERAGE", 5 if allow_5x else 3))
+
+        target_leverage = 3
+        if use_lev_3x:
             has_5x = self.leveraged_universe.has_5x_leverage(underlying, direction)
             realized_vol = float(metrics.get("realized_vol") or metrics.get("historical_vol") or 0.25)
             confidence = float(getattr(candidate, "overall_confidence", 0.0) or 0.0)
-            if has_5x and getattr(settings, "ENABLE_5X_LEVERAGE", True):
-                target_leverage = 5 if (confidence >= 0.85 and realized_vol <= 0.35) else 3
+            if allow_5x and max_lev >= 5 and has_5x:
+                target_leverage = 5 if (prefer_5x or (confidence >= 0.85 and realized_vol <= 0.35)) else 3
             else:
                 target_leverage = 3
-            t212_ticker = self.leveraged_universe.get_execution_ticker(underlying, direction, leverage=target_leverage)
+            t212_ticker = self.leveraged_universe.get_execution_ticker(
+                underlying,
+                direction,
+                leverage=target_leverage,
+                allow_5x=allow_5x,
+                config_snapshot=snap,
+            )
             if not t212_ticker:
                 if is_short:
                     logger.warning(
@@ -448,13 +1768,13 @@ class Orchestrator:
 
         # ── 1b. Ingest Finnhub, Olostep, and Nixtla Provider Data ──
         try:
-            if "finnhub_fundamentals" not in metrics:
+            if getattr(snap, "ENABLE_FINNHUB_FUNDAMENTALS", True) and "finnhub_fundamentals" not in metrics:
                 metrics["finnhub_fundamentals"] = MarketDataProvider.get_company_fundamentals(underlying)
-            if "finnhub_news" not in metrics:
+            if getattr(snap, "ENABLE_FINNHUB_NEWS", True) and "finnhub_news" not in metrics:
                 metrics["finnhub_news"] = MarketDataProvider.get_company_news(underlying, days=7)
-            if "olostep_sentiment" not in metrics:
+            if getattr(snap, "ENABLE_OLOSTEP_SENTIMENT", True) and "olostep_sentiment" not in metrics:
                 metrics["olostep_sentiment"] = MarketDataProvider.get_sentiment_search(underlying)
-            if "nixtla_forecast" not in metrics:
+            if getattr(snap, "ENABLE_NIXTLA_FORECAST", True) and "nixtla_forecast" not in metrics:
                 metrics["nixtla_forecast"] = MarketDataProvider.get_5day_forecast(underlying)
         except Exception as exc:
             logger.debug("Provider enrichment for %s in deep_analyse: %s", underlying, exc)
@@ -487,10 +1807,14 @@ class Orchestrator:
 
         # ── 4. System 2 Deliberative Multi-Agent Debate ───────────
         try:
-            outcome = self.debate_engine.run_debate(
-                underlying, metrics, tech_report, fund_report, date=today,
-                strategy_type=strategy_type,
-            )
+            debate_fn = self.debate_engine.run_debate
+            debate_kwargs: Dict[str, Any] = {"date": today, "strategy_type": strategy_type}
+            if self._supports_kwarg(debate_fn, "config_snapshot"):
+                debate_kwargs["config_snapshot"] = snap
+            outcome = debate_fn(underlying, metrics, tech_report, fund_report, **debate_kwargs)
+            if getattr(outcome, "config_epoch_id", None) is None:
+                with contextlib.suppress(Exception):
+                    outcome.config_epoch_id = snap.config_epoch_id
             logger.info("Debate outcome for %s: consensus=%s, conviction=%.2f",
                         underlying, outcome.consensus_decision, outcome.conviction_score)
         except Exception as exc:
@@ -498,23 +1822,39 @@ class Orchestrator:
             return None
 
         # ── 5. Risk Management & Sizing ──────────────────────────
+        default_equity = float(getattr(snap, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
         try:
             if account_equity is None or account_equity <= 0:
-                account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
-                account_equity = account.total or settings.DEFAULT_ACCOUNT_EQUITY
+                account = self.t212.get_account_cash(fallback_equity=default_equity)
+                account_equity = account.total or default_equity
 
-            card = self.risk_manager.generate_decision_card(
-                ticker=underlying,
-                trading212_ticker=t212_ticker,
-                direction=direction,
-                metrics=metrics,
-                debate_outcome=outcome,
-                account_equity=account_equity,
-                strategy_type=strategy_type,
-                leverage=target_leverage if settings.USE_LEVERAGED_3X else 1,
+            gen_fn = self.risk_manager.generate_decision_card
+            gen_kwargs: Dict[str, Any] = {
+                "ticker": underlying,
+                "trading212_ticker": t212_ticker,
+                "direction": direction,
+                "metrics": metrics,
+                "debate_outcome": outcome,
+                "account_equity": account_equity,
+                "strategy_type": strategy_type,
+                "leverage": target_leverage if use_lev_3x else 1,
+            }
+            if self._supports_kwarg(gen_fn, "config_snapshot"):
+                gen_kwargs["config_snapshot"] = snap
+            card = gen_fn(**gen_kwargs)
+            if card is not None:
+                if not getattr(card, "config_epoch_id", None):
+                    card.config_epoch_id = snap.config_epoch_id
+                with contextlib.suppress(Exception):
+                    setattr(card, "_debate_outcome", outcome)
+
+            fmt_fn = self.risk_manager.format_decision_card
+            fmt_out = (
+                fmt_fn(card, config_snapshot=snap)
+                if self._supports_kwarg(fmt_fn, "config_snapshot")
+                else fmt_fn(card)
             )
-
-            logger.info("Decision card generated:\n%s", self.risk_manager.format_decision_card(card))
+            logger.info("Decision card generated:\n%s", fmt_out)
             return card
 
         except Exception as exc:
@@ -530,8 +1870,11 @@ class Orchestrator:
         atr: float = 0.0,
         available_cash: Optional[float] = None,
         positions: Optional[List[Position]] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> bool:
-        """Execute trade on Trading 212 and dispatch BUY/SELL notification."""
+        """Execute trade on Trading 212 under _execution_gate_lock and dispatch BUY/SELL alerts."""
+        active_snap = config_snapshot or self.config_bus.active_snapshot()
+
         if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
             logger.info("Skipping execution for %s — decision=%s", card.ticker, card.decision)
             self._log_trade(card, executed=False, reason=card.decision)
@@ -548,11 +1891,8 @@ class Orchestrator:
             self._log_trade(card, executed=False, reason=f"Direction mismatch: {card.trading212_ticker} is LONG but signal is SHORT")
             return False
 
-        # ── System Halt Check (from Panic Flatten) ───────────────
-        if self.position_monitor and (
-            getattr(self.position_monitor, "is_system_halted", lambda: False)()
-            or getattr(self.position_monitor, "is_halted", False)
-        ):
+        # ── Pre-Flight System Halt Check ─────────────────────────
+        if self._is_pm_halted():
             logger.warning("Execution rejected for %s — system is currently HALTED following panic flatten", card.ticker)
             self._log_trade(card, executed=False, reason="System is HALTED")
             return False
@@ -566,7 +1906,7 @@ class Orchestrator:
             self._log_trade(card, executed=False, reason="In-flight order already pending")
             return False
 
-        if self.position_monitor and card.trading212_ticker in self.position_monitor.positions:
+        if self._has_active_position(card.trading212_ticker):
             logger.warning(
                 "Execution rejected for %s: position for %s is already active in position monitor. Skipping duplicate order.",
                 card.ticker, card.trading212_ticker
@@ -575,21 +1915,22 @@ class Orchestrator:
             return False
 
         # ── Pre-trade validation ─────────────────────────────────
-        account_total = getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)
+        default_equity = float(getattr(active_snap, "DEFAULT_ACCOUNT_EQUITY", getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)))
+        account_total = default_equity
         if available_cash is not None and positions is not None:
             account_free = available_cash
             current_positions = positions
         else:
             try:
-                account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+                account = self.t212.get_account_cash(fallback_equity=default_equity)
                 account_free = account.free
                 account_total = account.total or account_total
                 current_positions = self.t212.get_portfolio()
             except Trading212Error as exc:
                 if self.dry_run:
                     logger.warning("Pre-trade broker check unavailable (%s) — using dry-run simulation context", exc)
-                    account_free = 10000.0
-                    account_total = 10000.0
+                    account_free = default_equity
+                    account_total = default_equity
                     current_positions = []
                 else:
                     logger.error("Pre-trade check failed: %s", exc)
@@ -600,11 +1941,15 @@ class Orchestrator:
             self.session_start_equity = account_total
 
         # Daily Drawdown Circuit Breaker Gate
-        if getattr(settings, "ENFORCE_DAILY_CIRCUIT_BREAKER", True):
-            tripped, cb_reason = self.risk_manager.check_circuit_breaker(
-                current_equity=account_total,
-                session_start_equity=self.session_start_equity,
-            )
+        if bool(getattr(active_snap, "ENFORCE_DAILY_CIRCUIT_BREAKER", getattr(settings, "ENFORCE_DAILY_CIRCUIT_BREAKER", True))):
+            cb_fn = self.risk_manager.check_circuit_breaker
+            cb_kwargs: Dict[str, Any] = {
+                "current_equity": account_total,
+                "session_start_equity": self.session_start_equity,
+            }
+            if self._supports_kwarg(cb_fn, "config_snapshot"):
+                cb_kwargs["config_snapshot"] = active_snap
+            tripped, cb_reason = cb_fn(**cb_kwargs)
             if tripped:
                 logger.critical("Trade rejected: %s", cb_reason)
                 self._log_trade(card, executed=False, reason=cb_reason)
@@ -612,13 +1957,19 @@ class Orchestrator:
 
         # Real-time Bid-Ask Spread Gate
         spread_pct = None
-        if getattr(settings, "ENFORCE_SPREAD_GATE", True):
+        enforce_spread = bool(getattr(active_snap, "ENFORCE_SPREAD_GATE", getattr(settings, "ENFORCE_SPREAD_GATE", True)))
+        if enforce_spread:
             spread_info = MarketDataProvider.get_bid_ask_spread(card.trading212_ticker)
             spread_pct = spread_info.get("spread_pct")
 
-        valid, reason = self.risk_manager.validate_trade(
-            card, account_free, current_positions, spread_pct=spread_pct, account_equity=account_total
-        )
+        val_fn = self.risk_manager.validate_trade
+        val_kwargs: Dict[str, Any] = {
+            "spread_pct": spread_pct,
+            "account_equity": account_total,
+        }
+        if self._supports_kwarg(val_fn, "config_snapshot"):
+            val_kwargs["config_snapshot"] = active_snap
+        valid, reason = val_fn(card, account_free, current_positions, **val_kwargs)
         if not valid:
             logger.warning("Trade validation FAILED for %s: %s", card.ticker, reason)
             self._log_trade(card, executed=False, reason=reason)
@@ -638,7 +1989,9 @@ class Orchestrator:
             )
             self._log_trade(card, executed=False, reason="Blocked by Safety Interceptor: Market data was synthetic")
             return False
+
         # ── Pre-Execution Market Hours Gate & Auction Buffer ─────
+        max_spread_pct = float(getattr(active_snap, "MAX_BID_ASK_SPREAD_PCT", 0.015))
         if not self.dry_run:
             if not self.t212.is_market_open(card.trading212_ticker):
                 info = Trading212Client.get_market_session_info(card.trading212_ticker)
@@ -649,9 +2002,6 @@ class Orchestrator:
                 self._log_trade(card, executed=False, reason=f"Market closed ({info['exchange']} session: {info['open_time_utc']}-{info['close_time_utc']} UTC)")
                 return False
 
-            # 15-Minute Market Opening Auction Settlement Buffer:
-            # During the first 15 minutes after market open (e.g. 08:00-08:15 UTC for LSE, 14:30-14:45 UTC for US),
-            # opening auctions uncross and spreads blow out (often 5-10%), causing instantaneous stop-outs.
             session_info = Trading212Client.get_market_session_info(card.trading212_ticker)
             if session_info.get("exchange") != "CRYPTO":
                 now_utc = datetime.now(timezone.utc)
@@ -678,22 +2028,22 @@ class Orchestrator:
                 live_ask = float(live_quote.get("ask", 0.0) or 0.0)
                 live_bid = float(live_quote.get("bid", 0.0) or 0.0)
                 live_mid = float(live_quote.get("mid", 0.0) or 0.0)
-                spread_pct = float(live_quote.get("spread_pct", 0.0) or 0.0)
+                quote_spread_pct = float(live_quote.get("spread_pct", 0.0) or 0.0)
 
-                # 1. Spread Check: Max acceptable spread is 1.00% (0.010)
+                # 1. Spread Check against active ConfigSnapshot MAX_BID_ASK_SPREAD_PCT
                 if live_ask > 0 and live_bid > 0:
                     calc_spread = (live_ask - live_bid) / live_ask
-                    spread_pct = max(spread_pct, calc_spread)
+                    quote_spread_pct = max(quote_spread_pct, calc_spread)
 
-                if spread_pct > 0.010:  # > 1.0%
+                if enforce_spread and quote_spread_pct > max_spread_pct:
                     logger.warning(
-                        "Execution rejected: %s bid/ask spread %.2f%% exceeds 1.00%% safety threshold "
+                        "Execution rejected: %s bid/ask spread %.2f%% exceeds %.2f%% safety threshold "
                         "(bid=%.4f, ask=%.4f). Refusing to execute into wide spread.",
-                        card.trading212_ticker, spread_pct * 100.0, live_bid, live_ask
+                        card.trading212_ticker, quote_spread_pct * 100.0, max_spread_pct * 100.0, live_bid, live_ask
                     )
                     self._log_trade(
                         card, executed=False,
-                        reason=f"Wide bid/ask spread: {spread_pct * 100.0:.2f}% > 1.00% limit (bid={live_bid}, ask={live_ask})"
+                        reason=f"Wide bid/ask spread: {quote_spread_pct * 100.0:.2f}% > {max_spread_pct * 100.0:.2f}% limit (bid={live_bid}, ask={live_ask})"
                     )
                     return False
 
@@ -713,7 +2063,6 @@ class Orchestrator:
                         )
                         return False
 
-                    # If within 1.5% drift, recalibrate entry_price and stop_loss to live quote
                     old_entry = card.entry_price
                     card.entry_price = ref_price
                     if card.stop_loss > 0 and old_entry > 0:
@@ -726,94 +2075,116 @@ class Orchestrator:
             except Exception as quote_exc:
                 logger.debug("Pre-trade live quote validation skipped due to lookup error: %s", quote_exc)
 
-        # ── Execute Entry Order on Trading 212 ───────────────────
+        # ── Execute Entry Order + Register Position Under Shared Gate Lock (R18) ──
         order_id = "DRY_RUN_ORDER"
         fill_price: Optional[float] = None
-        if not self.dry_run:
-            try:
-                order_qty = card.position_size_shares
-                try:
-                    inst = self.t212.get_instrument_by_symbol(card.trading212_ticker)
-                    if inst and inst.min_trade_quantity and order_qty < inst.min_trade_quantity:
-                        est_notional = inst.min_trade_quantity * (card.entry_price or 1.0)
-                        if est_notional <= (account_total * 0.25):
-                            logger.info(
-                                "Adjusting %s order quantity from %.3f to broker minimum %.3f",
-                                card.trading212_ticker, order_qty, inst.min_trade_quantity,
-                            )
-                            order_qty = inst.min_trade_quantity
-                            card.position_size_shares = order_qty
-                except Exception as inst_exc:
-                    logger.debug("Could not verify instrument min quantity for %s: %s", card.trading212_ticker, inst_exc)
-
-                logger.info(
-                    "Placing Trading 212 order: %s (%s) — %.3f shares @ ≈$%.2f",
-                    card.trading212_ticker, card.direction, order_qty, card.entry_price
-                )
-                entry_order = self.t212.place_market_order(
-                    ticker=card.trading212_ticker,
-                    quantity=order_qty,
-                )
-                self.in_flight_tickers.add(card.trading212_ticker)
-                order_id = entry_order.id
-                logger.info("Order executed successfully: id=%s", order_id)
-                raw_fill_px = getattr(entry_order, "fill_price", 0.0)
-                try:
-                    fill_px_float = float(raw_fill_px or 0.0)
-                except (TypeError, ValueError):
-                    fill_px_float = 0.0
-                if fill_px_float > 0:
-                    fill_price = fill_px_float
-                else:
-                    for retry_idx in range(3):
-                        time.sleep(1.0)
-                        try:
-                            positions_fresh = self.t212.get_portfolio(force_refresh=True)
-                            for p in positions_fresh:
-                                if p.ticker == card.trading212_ticker and p.average_price > 0:
-                                    fill_price = p.average_price
-                                    break
-                            if fill_price and fill_price > 0:
-                                break
-                        except Exception as port_exc:
-                            logger.debug("Could not retrieve post-order portfolio fill price (attempt %d): %s", retry_idx + 1, port_exc)
-
-                # Secondary safeguard against scale contamination if fill_price is still missing
-                if not fill_price or fill_price <= 0:
-                    try:
-                        quote = MarketDataProvider.get_quote(card.trading212_ticker)
-                        live_px = quote.get("price") or quote.get("close")
-                        if live_px and float(live_px) > 0:
-                            fill_price = float(live_px)
-                    except Exception as quote_exc:
-                        logger.debug("Could not retrieve live quote for %s: %s", card.trading212_ticker, quote_exc)
-            except Trading212Error as exc:
-                logger.error("Execution failed for %s: %s", card.trading212_ticker, exc)
-                self._log_trade(card, executed=False, reason=str(exc))
+        pos = None
+        with self._execution_gate_lock:
+            # Final authoritative halt check inside execution_gate_lock right before place_market_order
+            if self._is_pm_halted():
+                logger.warning("Execution aborted under gate lock for %s — system is HALTED", card.ticker)
+                self._log_trade(card, executed=False, reason="System is HALTED")
                 return False
-        else:
-            logger.info("[DRY-RUN] Simulated execution for %s: %.3f shares @ $%.2f",
-                        card.trading212_ticker, card.position_size_shares, card.entry_price)
 
-        # ── Register with Active Position Monitor ────────────────
-        pos = self.position_monitor.register_new_trade(
-            card,
-            atr=atr,
-            earnings_in_days=card.earnings_in_days,
-            fill_price=fill_price,
-        )
+            if self._has_active_position(card.trading212_ticker):
+                logger.warning("Execution aborted under gate lock for %s — position already active", card.trading212_ticker)
+                self._log_trade(card, executed=False, reason="Position already active")
+                return False
 
-        # ── Place Native Broker GTC Stop & Limit Orders on Trading 212 ────
-        self.position_monitor.place_broker_stop(pos)
-        if not getattr(self.position_monitor, "pure_tsl_mode", False):
-            self.position_monitor.place_broker_tp_limit(pos)
+            if not self.dry_run:
+                try:
+                    order_qty = card.position_size_shares
+                    try:
+                        inst = self.t212.get_instrument_by_symbol(card.trading212_ticker)
+                        if inst and inst.min_trade_quantity and order_qty < inst.min_trade_quantity:
+                            est_notional = inst.min_trade_quantity * (card.entry_price or 1.0)
+                            if est_notional <= (account_total * 0.25):
+                                logger.info(
+                                    "Adjusting %s order quantity from %.3f to broker minimum %.3f",
+                                    card.trading212_ticker, order_qty, inst.min_trade_quantity,
+                                )
+                                order_qty = inst.min_trade_quantity
+                                card.position_size_shares = order_qty
+                    except Exception as inst_exc:
+                        logger.debug("Could not verify instrument min quantity for %s: %s", card.trading212_ticker, inst_exc)
+
+                    logger.info(
+                        "Placing Trading 212 order: %s (%s) — %.3f shares @ ≈$%.2f",
+                        card.trading212_ticker, card.direction, order_qty, card.entry_price
+                    )
+                    entry_order = self.t212.place_market_order(
+                        ticker=card.trading212_ticker,
+                        quantity=order_qty,
+                    )
+                    self.in_flight_tickers.add(card.trading212_ticker)
+                    order_id = entry_order.id
+                    logger.info("Order executed successfully: id=%s", order_id)
+                    raw_fill_px = getattr(entry_order, "fill_price", 0.0)
+                    try:
+                        fill_px_float = float(raw_fill_px or 0.0)
+                    except (TypeError, ValueError):
+                        fill_px_float = 0.0
+                    if fill_px_float > 0:
+                        fill_price = fill_px_float
+                    else:
+                        for retry_idx in range(3):
+                            time.sleep(1.0)
+                            try:
+                                positions_fresh = self.t212.get_portfolio(force_refresh=True)
+                                for p in positions_fresh:
+                                    if p.ticker == card.trading212_ticker and p.average_price > 0:
+                                        fill_price = p.average_price
+                                        break
+                                if fill_price and fill_price > 0:
+                                    break
+                            except Exception as port_exc:
+                                logger.debug("Could not retrieve post-order portfolio fill price (attempt %d): %s", retry_idx + 1, port_exc)
+
+                    if not fill_price or fill_price <= 0:
+                        try:
+                            quote = MarketDataProvider.get_quote(card.trading212_ticker)
+                            live_px = quote.get("price") or quote.get("close")
+                            if live_px and float(live_px) > 0:
+                                fill_price = float(live_px)
+                        except Exception as quote_exc:
+                            logger.debug("Could not retrieve live quote for %s: %s", card.trading212_ticker, quote_exc)
+                except Trading212Error as exc:
+                    logger.error("Execution failed for %s: %s", card.trading212_ticker, exc)
+                    self._log_trade(card, executed=False, reason=str(exc))
+                    return False
+            else:
+                logger.info("[DRY-RUN] Simulated execution for %s: %.3f shares @ $%.2f",
+                            card.trading212_ticker, card.position_size_shares, card.entry_price)
+
+            reg_fn = self.position_monitor.register_new_trade
+            reg_kwargs: Dict[str, Any] = {
+                "atr": atr,
+                "earnings_in_days": card.earnings_in_days,
+                "fill_price": fill_price,
+            }
+            if self._supports_kwarg(reg_fn, "config_snapshot"):
+                reg_kwargs["config_snapshot"] = active_snap
+            pos = reg_fn(card, **reg_kwargs)
+            if pos is not None and not getattr(pos, "config_epoch_id", None):
+                with contextlib.suppress(Exception):
+                    pos.config_epoch_id = active_snap.config_epoch_id
+            if pos is not None and getattr(pos, "entry_config_snapshot", None) is None:
+                with contextlib.suppress(Exception):
+                    pos.entry_config_snapshot = _scrub_mapping(active_snap.to_dict())
+
+        # ── Place Native Broker GTC Stop & Limit Orders (only if not halted while racing) ──
+        if not self._is_pm_halted() and pos is not None:
+            self.position_monitor.place_broker_stop(pos)
+            pos_pure_tsl = bool(getattr(active_snap, "PURE_TSL_MODE", getattr(self.position_monitor, "pure_tsl_mode", True)))
+            if not pos_pure_tsl:
+                self.position_monitor.place_broker_tp_limit(pos)
 
         # ── Dispatch Real-Time Notifications ─────────────────────
-        notif_price = pos.entry_price
-        notif_sl = pos.stop_loss
-        notif_tp1 = pos.tp1
-        notif_tp2 = pos.tp2
-        notif_tp3 = pos.tp3
+        notif_price = pos.entry_price if pos is not None else card.entry_price
+        notif_sl = pos.stop_loss if pos is not None else card.stop_loss
+        notif_tp1 = pos.tp1 if pos is not None else card.take_profit_1
+        notif_tp2 = pos.tp2 if pos is not None else card.take_profit_2
+        notif_tp3 = pos.tp3 if pos is not None else card.take_profit_3
         self.notifier.notify_buy(
             ticker=card.trading212_ticker,
             underlying=card.ticker,
@@ -828,7 +2199,33 @@ class Orchestrator:
         )
 
         self._log_trade(card, executed=True, reason="Entry order placed", entry_order_id=order_id)
+        self._refresh_read_model_snapshot(persist_funnel=False, broadcast=True)
         return True
+
+    def _is_pm_halted(self) -> bool:
+        """Check PositionMonitor halt state safely (guarding against MagicMock)."""
+        pm = getattr(self, "position_monitor", None)
+        if pm is None:
+            return False
+        if hasattr(pm, "is_system_halted") and _as_bool_strict(pm.is_system_halted(), False):
+            return True
+        return _as_bool_strict(getattr(pm, "is_halted", False), False)
+
+    def _has_active_position(self, trading212_ticker: str) -> bool:
+        """Check safely under PositionMonitor._state_lock whether ticker already has an open position."""
+        pm = getattr(self, "position_monitor", None)
+        if pm is None:
+            return False
+        positions = getattr(pm, "positions", None)
+        if not isinstance(positions, Mapping):
+            return False
+        state_lock = getattr(pm, "_state_lock", None)
+        lock_ctx = state_lock if state_lock is not None and hasattr(state_lock, "__enter__") else contextlib.nullcontext()
+        with lock_ctx:
+            pos = positions.get(trading212_ticker)
+            if pos is None:
+                return False
+            return not bool(getattr(pos, "is_closed", False))
 
     # ─────────────────────────────────────────────────────────────
     # Audit Log
@@ -854,26 +2251,55 @@ class Orchestrator:
         except Exception as exc:
             logger.error("Failed to write audit log: %s", exc)
 
+    def _resize_card_for_snapshot(
+        self,
+        cand: ScreenerResult,
+        card: DecisionCard,
+        account_equity: float,
+        target_snap: ConfigSnapshot,
+    ) -> Optional[DecisionCard]:
+        """Deterministically recompute sizing/SL/TP on an entry card after a resize_entry epoch shift."""
+        debate_stub = SimpleNamespace(
+            consensus_decision=card.decision,
+            conviction_score=float(getattr(card, "conviction_score", 0.75) or 0.75),
+            synthesis=str(getattr(card, "rationale", "") or "Deterministic resize revalidation"),
+            config_epoch_id=target_snap.config_epoch_id,
+        )
+        metrics = dict(getattr(cand, "metrics", {}) or {})
+        if "close" not in metrics or not metrics.get("close"):
+            metrics["close"] = float(card.entry_price or 0.0)
+        gen_fn = self.risk_manager.generate_decision_card
+        gen_kwargs: Dict[str, Any] = {
+            "ticker": card.ticker,
+            "trading212_ticker": card.trading212_ticker,
+            "direction": card.direction,
+            "metrics": metrics,
+            "debate_outcome": debate_stub,
+            "account_equity": account_equity,
+            "strategy_type": getattr(cand, "strategy_type", "directional_trend"),
+            "leverage": int(getattr(card, "leverage", 3) or 3),
+        }
+        if self._supports_kwarg(gen_fn, "config_snapshot"):
+            gen_kwargs["config_snapshot"] = target_snap
+        resized = gen_fn(**gen_kwargs)
+        if resized is not None:
+            resized.config_epoch_id = target_snap.config_epoch_id
+            resized.earnings_in_days = getattr(card, "earnings_in_days", None)
+            resized.is_synthetic = getattr(card, "is_synthetic", False)
+        return resized
+
     def execute_trades_batch(
         self, candidate_cards: List[tuple[ScreenerResult, DecisionCard]]
     ) -> List[DecisionCard]:
-        """Execute multiple candidate signals in synchronized sequence with capital pacing.
-
-        Ensures:
-        1. API calls are paced (>= 1.5s) to adhere strictly to broker mutation limits.
-        2. High-conviction signals are prioritized first.
-        3. Free cash and position allocations are tracked incrementally so concurrent signals
-           do not over-commit account capital or trigger redundant broker GET requests.
-        4. Cross-process flag warns background monitor daemons to yield bandwidth.
-        """
+        """Execute multiple candidate signals with mid-scan epoch revalidation and capital pacing."""
         if not candidate_cards:
             return []
 
-        # 1. Announce active execution to cross-process daemons
         Trading212Client.set_trade_active(True)
+        batch_rejections: List[Dict[str, Any]] = []
+        executed_cards: List[DecisionCard] = []
 
         try:
-            # 2. Separate actionable entry signals from holds/skips
             actionable: List[tuple[ScreenerResult, DecisionCard]] = []
             for cand, card in candidate_cards:
                 if card.decision in ("BUY_ENTRY", "SELL_ENTRY"):
@@ -884,15 +2310,17 @@ class Orchestrator:
             if not actionable:
                 return []
 
-            # 3. Sort by conviction score descending (highest conviction gets first capital allocation)
             actionable.sort(key=lambda item: item[1].conviction_score, reverse=True)
 
-            # 4. Fetch baseline cash and positions once for the entire batch
+            active_snap = self.config_bus.active_snapshot()
+            default_eq = float(getattr(active_snap, "DEFAULT_ACCOUNT_EQUITY", getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)))
+            running_equity = default_eq
             try:
-                account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
+                account = self.t212.get_account_cash(fallback_equity=default_eq)
                 running_free_cash = account.free
+                running_equity = account.total or default_eq
             except Exception:
-                running_free_cash = 10000.0
+                running_free_cash = default_eq
 
             running_positions = []
             try:
@@ -905,9 +2333,8 @@ class Orchestrator:
                     return []
                 logger.debug("Broker portfolio query notice in batch execution: %s", exc)
 
-            # Ensure all local active positions from position_monitor are included in risk checks
             held_tickers = {getattr(p, "ticker", "") for p in running_positions}
-            for p in self.position_monitor.positions.values():
+            for p in getattr(self.position_monitor, "positions", {}).values():
                 if not p.is_closed and p.remaining_quantity > 0 and p.ticker not in held_tickers:
                     running_positions.append(Position(
                         ticker=p.ticker,
@@ -920,29 +2347,91 @@ class Orchestrator:
                     ))
                     held_tickers.add(p.ticker)
 
-            executed_cards: List[DecisionCard] = []
             is_test_mode = getattr(self.t212, "rate_limit_delay", 1.25) < 0.5
             pacing_delay = self.t212.rate_limit_delay if is_test_mode else 1.5
 
             for i, (cand, card) in enumerate(actionable):
+                latest_snap = self.config_bus.active_snapshot()
+                card_epoch = getattr(card, "config_epoch_id", None) or getattr(cand, "config_epoch_id", None)
+
+                # Mid-scan epoch drift check before execution (F2 / R2)
+                if card_epoch and card_epoch != latest_snap.config_epoch_id:
+                    origin_snap = self.config_bus.snapshot_for_epoch(card_epoch)
+                    if origin_snap is None:
+                        scope = "abort_stale_scan"
+                        changed_keys: List[str] = ["unknown_epoch"]
+                    else:
+                        changed_keys = _changed_snapshot_keys(origin_snap, latest_snap)
+                        scope = _revalidation_scope_for_keys(changed_keys, origin_snap, latest_snap)
+
+                    if scope == "abort_stale_scan":
+                        logger.warning(
+                            "Execution aborted for %s: stale_epoch_superseded (%s -> %s, changed=%s)",
+                            card.ticker, card_epoch, latest_snap.config_epoch_id, changed_keys,
+                        )
+                        self._log_trade(
+                            card,
+                            executed=False,
+                            reason=f"stale_epoch_superseded: {card_epoch} -> {latest_snap.config_epoch_id}",
+                        )
+                        batch_rejections.append({
+                            "gate_id": "stale_epoch_superseded",
+                            "ticker": card.ticker,
+                            "param_keys": changed_keys,
+                            "label": "Stale Epoch Superseded (Pre-Execution)",
+                        })
+                        continue
+
+                    # Only resize_entry keys changed -> deterministically re-size card under latest_snap
+                    resized = self._resize_card_for_snapshot(
+                        cand=cand,
+                        card=card,
+                        account_equity=running_equity,
+                        target_snap=latest_snap,
+                    )
+                    if resized is None or resized.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
+                        rej_reason = f"Resize revalidation rejected for epoch {latest_snap.config_epoch_id}"
+                        self._log_trade(card, executed=False, reason=rej_reason)
+                        if resized is not None and getattr(resized, "gate_rejections", None):
+                            for r in resized.gate_rejections:
+                                batch_rejections.append({**r, "ticker": card.ticker})
+                        continue
+                    logger.info(
+                        "Deterministically resized %s card (%s -> %s): shares %.3f -> %.3f, SL %.4f -> %.4f",
+                        card.ticker,
+                        card_epoch,
+                        latest_snap.config_epoch_id,
+                        card.position_size_shares,
+                        resized.position_size_shares,
+                        card.stop_loss,
+                        resized.stop_loss,
+                    )
+                    card = resized
+
                 atr = cand.metrics.get("atr", card.entry_price * 0.02)
 
-                # Validate against running capital allocation
-                valid, reason = self.risk_manager.validate_trade(card, running_free_cash, running_positions)
+                # Validate against running capital allocation & latest snapshot
+                val_fn = self.risk_manager.validate_trade
+                val_kwargs: Dict[str, Any] = {"account_equity": running_equity}
+                if self._supports_kwarg(val_fn, "config_snapshot"):
+                    val_kwargs["config_snapshot"] = latest_snap
+                valid, reason = val_fn(card, running_free_cash, running_positions, **val_kwargs)
                 if not valid:
                     logger.warning(
                         "Batch trade validation FAILED for %s (conviction=%.2f): %s",
                         card.ticker, card.conviction_score, reason
                     )
                     self._log_trade(card, executed=False, reason=reason)
+                    for r in (getattr(card, "gate_rejections", None) or ()):
+                        batch_rejections.append({**r, "ticker": card.ticker})
                     continue
 
-                # Execute order with synchronized running cash and positions
                 success = self.execute_trade(
                     card,
                     atr=atr,
                     available_cash=running_free_cash,
                     positions=running_positions,
+                    config_snapshot=latest_snap,
                 )
                 if success:
                     executed_cards.append(card)
@@ -957,7 +2446,6 @@ class Orchestrator:
                         max_sell=0.0,
                     ))
 
-                    # Pace consecutive orders by broker quota minimum if more orders remain
                     if i < len(actionable) - 1:
                         time.sleep(pacing_delay)
 
@@ -965,6 +2453,73 @@ class Orchestrator:
 
         finally:
             Trading212Client.set_trade_active(False)
+            self._finalize_cycle_funnel_post_batch(executed_cards, batch_rejections)
+
+    def _publish_funnel_report(
+        self,
+        report: CycleFunnelReport,
+        *,
+        status: str = "ok",
+        reason: str = "",
+        broadcast: bool = True,
+        inputs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Store latest CycleFunnelReport, refresh read-model snapshot, and persist funnel_state.json."""
+        self._latest_funnel_report = report
+        self._latest_funnel_meta = {"status": status, "reason": reason}
+        if inputs is not None:
+            self._last_funnel_inputs = inputs
+        self._refresh_read_model_snapshot(persist_funnel=True, broadcast=broadcast)
+
+    def _finalize_cycle_funnel_post_batch(
+        self,
+        executed_cards: Sequence[DecisionCard],
+        batch_rejections: Sequence[Dict[str, Any]],
+    ) -> None:
+        """Rebuild CycleFunnelReport with post-batch executions/rejections and publish."""
+        inputs = self._last_funnel_inputs
+        if isinstance(inputs, dict):
+            prior_rejections = list(inputs.get("gate_rejections") or ())
+            combined_rejections = prior_rejections + list(batch_rejections or ())
+            snap = inputs.get("config_snapshot") or self.config_bus.active_snapshot()
+            epoch_id = inputs.get("config_epoch_id") or getattr(snap, "config_epoch_id", None)
+            final_report = build_cycle_funnel_report(
+                universe_metrics=inputs.get("universe_metrics"),
+                screener_results=inputs.get("screener_results"),
+                passed_screener=inputs.get("passed_screener"),
+                strategy_signals=inputs.get("strategy_signals"),
+                debate_outcomes=inputs.get("debate_outcomes"),
+                gate_decisions=inputs.get("gate_decisions"),
+                executed_orders=list(executed_cards or ()),
+                gate_rejections=combined_rejections if combined_rejections else None,
+                config_snapshot=snap,
+                config_epoch_id=epoch_id,
+            )
+            self._publish_funnel_report(
+                final_report,
+                status="ok",
+                reason="",
+                broadcast=True,
+                inputs={
+                    **inputs,
+                    "executed_orders": list(executed_cards or ()),
+                    "gate_rejections": combined_rejections,
+                },
+            )
+            return
+
+        if batch_rejections or executed_cards:
+            active_snap = self.config_bus.active_snapshot()
+            minimal_report = build_cycle_funnel_report(
+                gate_decisions=list(executed_cards or ()),
+                executed_orders=list(executed_cards or ()),
+                gate_rejections=list(batch_rejections or ()) if batch_rejections else None,
+                config_snapshot=active_snap,
+                config_epoch_id=active_snap.config_epoch_id,
+            )
+            self._publish_funnel_report(minimal_report, status="ok", reason="", broadcast=True)
+        else:
+            self._refresh_read_model_snapshot(persist_funnel=True, broadcast=True)
 
     # ─────────────────────────────────────────────────────────────
     # Complete Single Cycle & Deliberation Pipeline
@@ -972,42 +2527,176 @@ class Orchestrator:
     def _scan_and_deliberate(self) -> List[tuple[ScreenerResult, DecisionCard]]:
         """Ingest universe data, screen candidates, and deliberate via multi-agent stack.
 
-        Returns candidate cards ready for batch execution. Can run safely in background.
+        Captures an immutable ConfigSnapshot at cycle start, checks mid-scan epoch drift
+        before expensive LLM deliberation, and always publishes CycleFunnelReport +
+        read-model snapshot (including 0-candidate cycles).
         """
-        if self.position_monitor and getattr(self.position_monitor, "is_system_halted", lambda: False)():
+        from types import SimpleNamespace
+
+        cycle_snapshot = self.config_bus.active_snapshot()
+
+        if self._is_pm_halted():
             logger.warning("Scan aborted: System is currently HALTED following emergency panic flatten.")
+            halted_report = build_cycle_funnel_report(
+                universe_metrics={},
+                screener_results=[],
+                passed_screener=[],
+                strategy_signals=[],
+                debate_outcomes=[],
+                gate_decisions=[],
+                executed_orders=[],
+                config_snapshot=cycle_snapshot,
+                config_epoch_id=cycle_snapshot.config_epoch_id,
+            )
+            self._publish_funnel_report(
+                halted_report,
+                status="halted",
+                reason="System is halted following emergency panic flatten.",
+                broadcast=True,
+                inputs=None,
+            )
             return []
 
-        # Step 1: Ingestion
-        metrics_dict = self.ingest_universe_data()
+        # Step 1: Ingestion under cycle_snapshot
+        ingest_fn = self.ingest_universe_data
+        metrics_dict = (
+            ingest_fn(config_snapshot=cycle_snapshot)
+            if self._supports_kwarg(ingest_fn, "config_snapshot")
+            else ingest_fn()
+        )
         if not metrics_dict:
             logger.warning("No market data ingested — scan aborted")
+            empty_report = build_cycle_funnel_report(
+                universe_metrics={},
+                screener_results=[],
+                passed_screener=[],
+                strategy_signals=[],
+                debate_outcomes=[],
+                gate_decisions=[],
+                executed_orders=[],
+                config_snapshot=cycle_snapshot,
+                config_epoch_id=cycle_snapshot.config_epoch_id,
+            )
+            self._publish_funnel_report(
+                empty_report,
+                status="no_data",
+                reason="No market data ingested during universe scan.",
+                broadcast=True,
+                inputs=None,
+            )
             return []
 
-        # Step 2: Screening
-        candidates = self.screen_candidates(metrics_dict)
+        # Step 2: Screening under cycle_snapshot (with per-ticker gate attribution)
+        candidates, all_screener_results = self.screen_candidates_with_funnel(
+            metrics_dict,
+            config_snapshot=cycle_snapshot,
+        )
+        strategy_signals = [
+            r.strategy_signal
+            for r in all_screener_results
+            if getattr(r, "strategy_signal", None) is not None
+        ]
+
         if not candidates:
             logger.info("No candidates passed 3x momentum filter this cycle.")
+            zero_inputs = {
+                "universe_metrics": metrics_dict,
+                "screener_results": all_screener_results,
+                "passed_screener": [],
+                "strategy_signals": strategy_signals,
+                "debate_outcomes": [],
+                "gate_decisions": [],
+                "executed_orders": [],
+                "gate_rejections": [],
+                "config_snapshot": cycle_snapshot,
+                "config_epoch_id": cycle_snapshot.config_epoch_id,
+            }
+            zero_report = build_cycle_funnel_report(**zero_inputs)
+            self._publish_funnel_report(
+                zero_report,
+                status="ok",
+                reason="No candidates passed screener filter this cycle.",
+                broadcast=True,
+                inputs=zero_inputs,
+            )
             return []
 
+        # Mid-Scan Epoch Revalidation Gate BEFORE launching expensive DebateEngine LLM calls
+        latest_snap = self.config_bus.active_snapshot()
+        if latest_snap.config_epoch_id != cycle_snapshot.config_epoch_id:
+            changed_keys = _changed_snapshot_keys(cycle_snapshot, latest_snap)
+            scope = _revalidation_scope_for_keys(changed_keys, cycle_snapshot, latest_snap)
+            if scope == "abort_stale_scan":
+                logger.warning(
+                    "Mid-scan epoch drift (%s -> %s, changed=%s) requires abort_stale_scan — pruning DebateEngine LLM calls.",
+                    cycle_snapshot.config_epoch_id,
+                    latest_snap.config_epoch_id,
+                    changed_keys,
+                )
+                top_n = max(1, int(getattr(cycle_snapshot, "SCREENER_TOP_N", settings.SCREENER_TOP_N)))
+                stale_rejections = [
+                    {
+                        "gate_id": "stale_epoch_superseded",
+                        "ticker": cand.ticker,
+                        "param_keys": changed_keys,
+                        "label": "Stale Epoch Superseded (Pre-Deliberation)",
+                    }
+                    for cand in candidates[:top_n]
+                ]
+                stale_inputs = {
+                    "universe_metrics": metrics_dict,
+                    "screener_results": all_screener_results,
+                    "passed_screener": candidates,
+                    "strategy_signals": strategy_signals,
+                    "debate_outcomes": [],
+                    "gate_decisions": [],
+                    "executed_orders": [],
+                    "gate_rejections": stale_rejections,
+                    "config_snapshot": cycle_snapshot,
+                    "config_epoch_id": cycle_snapshot.config_epoch_id,
+                }
+                stale_report = build_cycle_funnel_report(**stale_inputs)
+                self._publish_funnel_report(
+                    stale_report,
+                    status="aborted_stale_epoch",
+                    reason=f"Scan epoch {cycle_snapshot.config_epoch_id} superseded by {latest_snap.config_epoch_id} ({', '.join(changed_keys)})",
+                    broadcast=True,
+                    inputs=stale_inputs,
+                )
+                return []
+
         # Step 3: Parallel Deliberation across Candidates
-        candidates_to_process = candidates[:settings.SCREENER_TOP_N]
+        top_n = max(1, int(getattr(cycle_snapshot, "SCREENER_TOP_N", settings.SCREENER_TOP_N)))
+        candidates_to_process = candidates[:top_n]
         candidate_cards: List[tuple[ScreenerResult, DecisionCard]] = []
-        n_delib_workers = max(1, min(len(candidates_to_process), self.parallel_deliberation_workers))
+        delib_cap = int(getattr(cycle_snapshot, "PARALLEL_DELIBERATION_WORKERS", self.parallel_deliberation_workers))
+        n_delib_workers = max(1, min(len(candidates_to_process), delib_cap))
 
-        logger.info("Deliberating on %d candidate(s) in parallel across %d subagent workers…",
-                    len(candidates_to_process), n_delib_workers)
+        logger.info(
+            "Deliberating on %d candidate(s) in parallel across %d subagent workers (Epoch=%s)…",
+            len(candidates_to_process),
+            n_delib_workers,
+            cycle_snapshot.config_epoch_id,
+        )
 
+        default_eq = float(getattr(cycle_snapshot, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
         try:
-            account = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
-            baseline_equity = account.total or settings.DEFAULT_ACCOUNT_EQUITY
+            account = self.t212.get_account_cash(fallback_equity=default_eq)
+            baseline_equity = account.total or default_eq
         except Exception as exc:
-            logger.warning("Baseline equity query failed (%s); using default $%.2f", exc, settings.DEFAULT_ACCOUNT_EQUITY)
-            baseline_equity = settings.DEFAULT_ACCOUNT_EQUITY
+            logger.warning("Baseline equity query failed (%s); using default $%.2f", exc, default_eq)
+            baseline_equity = default_eq
+
+        deep_fn = self.deep_analyse
+        pass_snap = self._supports_kwarg(deep_fn, "config_snapshot")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_delib_workers) as executor:
             future_to_cand = {
-                executor.submit(self.deep_analyse, cand, baseline_equity): cand
+                executor.submit(
+                    (lambda c=cand: deep_fn(c, baseline_equity, config_snapshot=cycle_snapshot))
+                    if pass_snap
+                    else (lambda c=cand: deep_fn(c, baseline_equity))
+                ): cand
                 for cand in candidates_to_process
             }
             for future in concurrent.futures.as_completed(future_to_cand):
@@ -1015,9 +2704,50 @@ class Orchestrator:
                 try:
                     card = future.result()
                     if card:
+                        if not getattr(card, "config_epoch_id", None):
+                            with contextlib.suppress(Exception):
+                                card.config_epoch_id = cycle_snapshot.config_epoch_id
                         candidate_cards.append((cand, card))
                 except Exception as exc:
                     logger.error("Parallel deliberation failed for %s: %s", cand.ticker, exc)
+
+        all_cards = [card for _, card in candidate_cards]
+        debate_outcomes: List[Any] = []
+        for card in all_cards:
+            deb = getattr(card, "_debate_outcome", None)
+            if deb is not None:
+                cons = getattr(deb, "consensus_decision", None)
+                is_app = bool(getattr(deb, "approved", False)) or (
+                    cons in ("BUY_ENTRY", "SHORT_ENTRY", "SELL_ENTRY")
+                )
+                debate_outcomes.append(SimpleNamespace(consensus_decision=cons, approved=is_app))
+            else:
+                cons = getattr(card, "decision", "DO_NOT_TRADE")
+                is_app = (
+                    cons in ("BUY_ENTRY", "SHORT_ENTRY", "SELL_ENTRY")
+                ) or bool(getattr(card, "gate_rejections", None))
+                debate_outcomes.append(SimpleNamespace(consensus_decision=cons, approved=is_app))
+
+        funnel_inputs = {
+            "universe_metrics": metrics_dict,
+            "screener_results": all_screener_results,
+            "passed_screener": candidates,
+            "strategy_signals": strategy_signals,
+            "debate_outcomes": debate_outcomes,
+            "gate_decisions": all_cards,
+            "executed_orders": [],
+            "gate_rejections": [],
+            "config_snapshot": cycle_snapshot,
+            "config_epoch_id": cycle_snapshot.config_epoch_id,
+        }
+        pre_batch_report = build_cycle_funnel_report(**funnel_inputs)
+        self._publish_funnel_report(
+            pre_batch_report,
+            status="ok",
+            reason="",
+            broadcast=True,
+            inputs=funnel_inputs,
+        )
 
         return candidate_cards
 
@@ -1088,23 +2818,31 @@ class Orchestrator:
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
 
         # Step 0: Broker Portfolio Reconciliation & Position Adoption
+        recon_changed = False
         try:
-            recon = self.position_monitor.reconcile_with_broker(adopt_untracked=True)
+            recon = self.position_monitor.reconcile_with_broker(adopt_untracked=True) or {}
             if recon.get("adopted_from_broker"):
+                recon_changed = True
                 logger.info(
                     "Synchronized with Trading 212 account: Adopted %d active broker positions: %s",
                     len(recon["adopted_from_broker"]), recon["adopted_from_broker"],
                 )
             if recon.get("closed_externally"):
+                recon_changed = True
                 logger.info(
                     "Reconciliation closed %d positions not found on broker: %s",
                     len(recon["closed_externally"]), recon["closed_externally"],
                 )
+            if recon.get("quantity_synced"):
+                recon_changed = True
             if not self.dry_run:
                 self.position_monitor.apply_daily_rollover_stops()
                 self.position_monitor.sync_broker_orders()
         except Exception as recon_exc:
             logger.debug("Initial broker reconciliation notice: %s", recon_exc)
+
+        if recon_changed:
+            self._update_dashboard(persist_funnel=False, broadcast=True)
 
         # Step 0b: Broker Pre-Flight Order Queue Reconciliation & Deduplication
         self.reconcile_pending_orders()
@@ -1115,13 +2853,129 @@ class Orchestrator:
 
         # Step 4: Execution & Logging via Synchronized Batch Coordinator
         executed_cards = self.execute_trades_batch(candidate_cards)
-        self._update_dashboard()
+        self._update_dashboard(persist_funnel=True, broadcast=True)
         logger.info("Cycle finished. %d trades executed.", len(executed_cards))
         return executed_cards
 
     # ─────────────────────────────────────────────────────────────
     # Continuous Loop with Active-Trade Driven Architecture
     # ─────────────────────────────────────────────────────────────
+    def _position_state_fingerprint(self) -> Tuple[bool, Tuple[Tuple[Any, ...], ...]]:
+        """Capture thread-safe fingerprint of monitor halt status and tracked positions."""
+        is_halted, items = self._snapshot_positions_under_lock()
+        sig = tuple(
+            sorted(
+                (
+                    ticker,
+                    round(float(p.get("remaining_quantity") or 0.0), 6),
+                    round(float(p.get("stop_loss") or 0.0), 6),
+                    round(float(p.get("trailing_stop_loss") or 0.0), 6),
+                    round(float(p.get("current_price") or p.get("entry_price") or 0.0), 6),
+                    p.get("broker_stop_order_id"),
+                    p.get("config_epoch_id"),
+                    bool(p.get("panic_failed", False)),
+                    p.get("unprotected_reason"),
+                    bool(p.get("tp1_hit", False)),
+                    bool(p.get("tp2_hit", False)),
+                    bool(p.get("tp3_hit", False)),
+                )
+                for ticker, p in items
+            )
+        )
+        return is_halted, sig
+
+    def _run_off_hours_reconciliation_step(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Run 300s off-hours reconciliation and republish read-model snapshot (cached broker getters)."""
+        now_ts = time.time() if now is None else float(now)
+        rec: Dict[str, Any] = {}
+        try:
+            rec = self.position_monitor.reconcile_with_broker() or {}
+            if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
+                logger.info("Off-hours broker reconciliation sync: %s", rec)
+        except Exception as e:
+            logger.debug("Off-hours reconciliation notice: %s", e)
+        self._last_reconciliation_time = now_ts
+        self._update_dashboard(persist_funnel=True, broadcast=True)
+        return rec
+
+    def _run_priority_monitor_step(
+        self,
+        now: Optional[float] = None,
+        now_utc: Optional[datetime] = None,
+    ) -> List[Any]:
+        """Execute Priority 1 active-trade monitoring tick and refresh snapshot on state changes."""
+        now_ts = time.time() if now is None else float(now)
+        now_dt = now_utc or datetime.now(timezone.utc)
+        snap = self.config_bus.active_snapshot()
+
+        pre_fp = self._position_state_fingerprint()
+
+        # Fetch targeted indicators & forecasts for active trade underlyings (<0.5s)
+        active_metrics = self.fetch_active_trades_metrics()
+
+        # 1. Reconcile with Trading 212 & adopt untracked positions using live market data
+        rec: Dict[str, Any] = {}
+        recon_interval = float(
+            getattr(snap, "RECONCILIATION_INTERVAL_SECONDS", getattr(settings, "RECONCILIATION_INTERVAL_SECONDS", 30))
+        )
+        if now_ts - getattr(self, "_last_reconciliation_time", 0.0) >= recon_interval:
+            rec = self.position_monitor.reconcile_with_broker(adopt_untracked=True, active_metrics=active_metrics) or {}
+            if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
+                logger.info("Active trade reconciliation: %s", rec)
+            self._last_reconciliation_time = now_ts
+
+        # 2. Sync native broker orders ("set the price" on broker server)
+        if not self.dry_run:
+            self.position_monitor.sync_broker_orders()
+
+        # 3. Active Position Price & Technical Signal Monitoring (using cached portfolio prices where supported)
+        events: List[Any] = []
+        _, items = self._snapshot_positions_under_lock()
+        if items:
+            logger.debug("Active management for %d positions…", len(items))
+            current_prices: Dict[str, float] = {}
+            try:
+                get_port_fn = self.t212.get_portfolio
+                t212_positions = (
+                    get_port_fn(cached_only=True)
+                    if self._supports_kwarg(get_port_fn, "cached_only")
+                    else get_port_fn()
+                )
+                for p in (t212_positions or ()):
+                    p_price = getattr(p, "current_price", None) or getattr(p, "average_price", None) or 0.0
+                    if p_price and float(p_price) > 0:
+                        current_prices[p.ticker] = float(p_price)
+            except Exception as e:
+                logger.debug("T212 cached portfolio price fetch notice: %s", e)
+
+            for und, met in (active_metrics or {}).items():
+                if met.get("close"):
+                    current_prices[und] = met["close"]
+
+            for ticker, pos in items:
+                if ticker not in current_prices:
+                    pos_price = pos.get("current_price") or pos.get("entry_price") or 0.0
+                    if pos_price and float(pos_price) > 0:
+                        current_prices[ticker] = float(pos_price)
+
+            # Price-target tick (TP1/TP2/TP3/SL/TSL)
+            tick_events = self.position_monitor.monitor_tick(current_prices, current_time=now_dt) or []
+            events.extend(tick_events)
+
+            # Signal-driven execution on active trades
+            signal_events = self.position_monitor.evaluate_active_trade_signals(active_metrics) or []
+            if signal_events:
+                events.extend(signal_events)
+
+        post_fp = self._position_state_fingerprint()
+        rec_changed = bool(
+            rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker")
+        )
+        if events or rec_changed or post_fp != pre_fp:
+            self._update_dashboard(persist_funnel=True, broadcast=True)
+
+        return events
+
     def run_loop(self, scan_interval_minutes: int = 5, monitor_interval_seconds: int = 30) -> None:
         """Run continuous engine loop.
 
@@ -1141,13 +2995,15 @@ class Orchestrator:
             try:
                 now = time.time()
                 now_utc = datetime.now(timezone.utc)
+                snap = self.config_bus.active_snapshot()
 
                 # Daily Circuit Breaker Calendar Date Rollover Reset
                 today_date = now_utc.strftime("%Y-%m-%d")
                 if getattr(self, "_last_session_cb_date", "") != today_date:
+                    default_eq = float(getattr(snap, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
                     try:
-                        acc = self.t212.get_account_cash(fallback_equity=settings.DEFAULT_ACCOUNT_EQUITY)
-                        new_eq = acc.total or settings.DEFAULT_ACCOUNT_EQUITY
+                        acc = self.t212.get_account_cash(fallback_equity=default_eq)
+                        new_eq = acc.total or default_eq
                         self.session_start_equity = new_eq
                         if self.risk_manager:
                             self.risk_manager.reset_circuit_breaker(new_session_equity=new_eq)
@@ -1167,69 +3023,15 @@ class Orchestrator:
                         )
                         self._last_closed_loop_log = now
 
-                    # Run periodic reconciliation even during off-hours to catch manual app trades or external closes
+                    # Run periodic reconciliation even during off-hours & republish cached snapshot
                     if now - getattr(self, "_last_reconciliation_time", 0.0) >= 300.0:
-                        try:
-                            rec = self.position_monitor.reconcile_with_broker()
-                            if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
-                                logger.info("Off-hours broker reconciliation sync: %s", rec)
-                                self._update_dashboard()
-                        except Exception as e:
-                            logger.debug("Off-hours reconciliation notice: %s", e)
-                        self._last_reconciliation_time = now
+                        self._run_off_hours_reconciliation_step(now=now)
 
                     time.sleep(min(300, monitor_interval_seconds * 10))
                     continue
 
                 # ── PRIORITY 1: High-Frequency Active Position Management ──
-                # Fetch targeted indicators & forecasts for active trade underlyings (<0.5s)
-                active_metrics = self.fetch_active_trades_metrics()
-
-                # 1. Reconcile with Trading 212 & adopt untracked positions using live market data
-                if now - getattr(self, "_last_reconciliation_time", 0.0) >= getattr(settings, "RECONCILIATION_INTERVAL_SECONDS", 30):
-                    rec = self.position_monitor.reconcile_with_broker(adopt_untracked=True, active_metrics=active_metrics)
-                    if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
-                        logger.info("Active trade reconciliation: %s", rec)
-                        self._update_dashboard()
-                    self._last_reconciliation_time = now
-
-                # 2. Sync native broker orders ("set the price" on broker server)
-                if not self.dry_run:
-                    self.position_monitor.sync_broker_orders()
-
-                # 3. Active Position Price & Technical Signal Monitoring
-                if self.position_monitor.positions:
-                    logger.debug("Active management for %d positions…", len(self.position_monitor.positions))
-                    current_prices = {}
-                    try:
-                        t212_positions = self.t212.get_portfolio()
-                        for p in t212_positions:
-                            p_price = p.current_price or p.average_price or 0.0
-                            if p_price > 0:
-                                current_prices[p.ticker] = p_price
-                    except Exception as e:
-                        logger.debug("T212 portfolio price fetch notice: %s", e)
-
-                    for und, met in active_metrics.items():
-                        if met.get("close"):
-                            current_prices[und] = met["close"]
-
-                    for ticker, pos in self.position_monitor.positions.items():
-                        if ticker not in current_prices:
-                            pos_price = getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0
-                            if pos_price > 0:
-                                current_prices[ticker] = pos_price
-
-                    # Price-target tick (TP1/TP2/TP3/SL/TSL)
-                    events = self.position_monitor.monitor_tick(current_prices, current_time=now_utc)
-
-                    # Signal-driven execution on active trades
-                    signal_events = self.position_monitor.evaluate_active_trade_signals(active_metrics)
-                    if signal_events:
-                        events.extend(signal_events)
-
-                    if events:
-                        self._update_dashboard()
+                self._run_priority_monitor_step(now=now, now_utc=now_utc)
 
                 # ── PRIORITY 2: Decoupled Non-Blocking Universe Scan ──
                 # Harvest completed background scan
@@ -1241,7 +3043,7 @@ class Orchestrator:
                                 executed = self.execute_trades_batch(candidate_cards)
                                 if executed:
                                     logger.info("Background universe scan batch finished: %d trades executed.", len(executed))
-                                    self._update_dashboard()
+                                    self._update_dashboard(persist_funnel=True, broadcast=True)
                         except Exception as scan_err:
                             logger.error("Background universe scan error: %s", scan_err)
                         finally:
@@ -1280,6 +3082,9 @@ class Orchestrator:
             except Exception as exc:
                 logger.debug("Scan executor shutdown notice: %s", exc)
         self.t212.close()
+        if getattr(self, "_owns_temp_data_dir", False) and getattr(self, "data_dir", None):
+            import shutil
+            shutil.rmtree(self.data_dir, ignore_errors=True)
         logger.info("Shutdown complete.")
 
 

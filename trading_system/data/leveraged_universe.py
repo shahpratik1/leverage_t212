@@ -1651,12 +1651,32 @@ class LeveragedUniverse:
             return [1]
         return [3, 5] if pair.has_5x else [3]
 
+    @staticmethod
+    def _resolve_allow_5x(
+        allow_5x: Optional[bool] = None,
+        config_snapshot: Optional["ConfigSnapshot"] = None,
+    ) -> bool:
+        """Resolve 5x leverage toggle from explicit arg, ConfigSnapshot, or global settings."""
+        if allow_5x is not None:
+            return bool(allow_5x)
+        from trading_system.config import settings
+        fallback = bool(getattr(settings, "ENABLE_5X_LEVERAGE", False))
+        if config_snapshot is not None:
+            if hasattr(config_snapshot, "ENABLE_5X_LEVERAGE"):
+                return bool(getattr(config_snapshot, "ENABLE_5X_LEVERAGE"))
+            if hasattr(config_snapshot, "get"):
+                return bool(config_snapshot.get("ENABLE_5X_LEVERAGE", fallback))
+        return fallback
+
     def get_execution_ticker(
         self,
         underlying: str,
         direction: str,
         leverage: Optional[int] = None,
         preferred_currency: str = "EUR",
+        *,
+        allow_5x: Optional[bool] = None,
+        config_snapshot: Optional["ConfigSnapshot"] = None,
     ) -> Optional[str]:
         """Given an underlying symbol, direction ('LONG' or 'SHORT'), and desired leverage (3 or 5),
         return the appropriate Trading 212 execution ticker prioritizing EUR as first preference.
@@ -1674,10 +1694,9 @@ class LeveragedUniverse:
         is_long = direction_upper in ("LONG", "BUY", "BULLISH")
         is_short = direction_upper in ("SHORT", "SELL", "BEARISH")
 
-        # 5x Resolution: only if explicitly enabled in configuration AND requested with leverage >= 5
-        from trading_system.config import settings
-        allow_5x = getattr(settings, "ENABLE_5X_LEVERAGE", False)
-        if allow_5x and pair.has_5x and leverage is not None and leverage >= 5:
+        # 5x Resolution: explicit allow_5x / ConfigSnapshot overrides settings.ENABLE_5X_LEVERAGE
+        resolved_allow_5x = self._resolve_allow_5x(allow_5x=allow_5x, config_snapshot=config_snapshot)
+        if resolved_allow_5x and pair.has_5x and leverage is not None and leverage >= 5:
             if is_long and pair.long_5x_ticker:
                 return pair.long_5x_ticker
             elif is_short and pair.short_5x_ticker and pair.short_5x_ticker != "None":
@@ -1745,13 +1764,17 @@ class LeveragedUniverse:
             return "Index"
         return "General Equity"
 
-    def get_all_execution_tickers(self) -> List[str]:
+    def get_all_execution_tickers(
+        self,
+        *,
+        allow_5x: Optional[bool] = None,
+        config_snapshot: Optional["ConfigSnapshot"] = None,
+    ) -> List[str]:
         """Return list of all active Trading 212 execution tickers (respecting 5x leverage settings)."""
-        from trading_system.config import settings
-        allow_5x = getattr(settings, "ENABLE_5X_LEVERAGE", False)
+        resolved_allow_5x = self._resolve_allow_5x(allow_5x=allow_5x, config_snapshot=config_snapshot)
         tickers = []
         for p in self.pairs:
-            if allow_5x and p.has_5x:
+            if resolved_allow_5x and p.has_5x:
                 if p.long_5x_ticker:
                     tickers.append(p.long_5x_ticker)
                 if p.short_5x_ticker and p.short_5x_ticker != "None":
