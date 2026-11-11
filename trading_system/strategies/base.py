@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from trading_system.config_bus import ConfigSnapshot
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,8 @@ class StrategySignal:
     bear_evidence: List[str] = field(default_factory=list)
     catalyst_risk: float = 0.0
     timeframe: str = "1d"
+    gate_rejections: Optional[List[Dict[str, Any]]] = None
+    config_epoch_id: Optional[str] = None
 
     @property
     def is_actionable(self) -> bool:
@@ -46,13 +51,17 @@ class BaseStrategy(ABC):
 
     @abstractmethod
     def evaluate_candidate(
-        self, ticker: str, metrics: Dict[str, Any]
+        self,
+        ticker: str,
+        metrics: Dict[str, Any],
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> StrategySignal:
         """Evaluate technical indicators for a single asset and emit a StrategySignal.
 
         Args:
             ticker: Underlying asset symbol (e.g. "QQQ", "AAPL", "BTC-USD").
             metrics: Pre-computed technical and fundamental indicators.
+            config_snapshot: Optional immutable runtime configuration epoch snapshot.
 
         Returns:
             StrategySignal with direction, conviction, and dialectic evidence.
@@ -61,13 +70,17 @@ class BaseStrategy(ABC):
 
     @abstractmethod
     def filter_universe(
-        self, universe_metrics: Dict[str, Dict[str, Any]], top_n: int = 5
+        self,
+        universe_metrics: Dict[str, Dict[str, Any]],
+        top_n: int = 5,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> List[StrategySignal]:
         """Screen and rank universe metrics, returning top-ranked actionable signals.
 
         Args:
             universe_metrics: Mapping of ticker to indicator metrics.
             top_n: Maximum number of candidate signals to return.
+            config_snapshot: Optional immutable runtime configuration epoch snapshot.
 
         Returns:
             List of top-ranked StrategySignal instances.

@@ -14,12 +14,15 @@ import math
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 try:
     from trading_system.config import settings
 except ImportError:
     settings = None
+
+if TYPE_CHECKING:
+    from trading_system.config_bus import ConfigSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -290,11 +293,97 @@ class BacktestEngine:
                 sentiment[i] = 50.0
         return sentiment
 
+    @staticmethod
+    def _calculate_ema(values: List[float], period: int) -> List[Optional[float]]:
+        """Compute exponential moving average series aligned with *values*."""
+        if not values:
+            return []
+        alpha = 2.0 / (float(period) + 1.0)
+        res: List[Optional[float]] = []
+        ema = float(values[0])
+        res.append(ema)
+        for v in values[1:]:
+            ema = alpha * float(v) + (1.0 - alpha) * ema
+            res.append(ema)
+        return res
+
+    @staticmethod
+    def _calculate_wilder_adx(
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        period: int = 14,
+    ) -> Tuple[List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
+        """Compute Wilder-smoothed ADX(14), +DI, and -DI series with zero lookahead."""
+        n = len(closes)
+        if n < period + 1 or len(highs) != n or len(lows) != n:
+            return [None] * n, [None] * n, [None] * n
+
+        alpha = 1.0 / float(period)
+        adx_series: List[Optional[float]] = [None] * n
+        pdi_series: List[Optional[float]] = [None] * n
+        mdi_series: List[Optional[float]] = [None] * n
+
+        tr_warmup: List[float] = []
+        pdm_warmup: List[float] = []
+        mdm_warmup: List[float] = []
+        smooth_tr = 0.0
+        smooth_pdm = 0.0
+        smooth_mdm = 0.0
+        dx_warmup: List[float] = []
+        smooth_dx: Optional[float] = None
+
+        for i in range(1, n):
+            hi, lo = float(highs[i]), float(lows[i])
+            prev_hi, prev_lo, prev_c = float(highs[i - 1]), float(lows[i - 1]), float(closes[i - 1])
+
+            tr = max(hi - lo, abs(hi - prev_c), abs(lo - prev_c))
+            up_move = hi - prev_hi
+            down_move = prev_lo - lo
+            pdm = up_move if (up_move > down_move and up_move > 0.0) else 0.0
+            mdm = down_move if (down_move > up_move and down_move > 0.0) else 0.0
+
+            if i <= period:
+                tr_warmup.append(tr)
+                pdm_warmup.append(pdm)
+                mdm_warmup.append(mdm)
+                if i < period:
+                    continue
+                smooth_tr = sum(tr_warmup) / float(period)
+                smooth_pdm = sum(pdm_warmup) / float(period)
+                smooth_mdm = sum(mdm_warmup) / float(period)
+            else:
+                smooth_tr = alpha * tr + (1.0 - alpha) * smooth_tr
+                smooth_pdm = alpha * pdm + (1.0 - alpha) * smooth_pdm
+                smooth_mdm = alpha * mdm + (1.0 - alpha) * smooth_mdm
+
+            plus_di = 100.0 * (smooth_pdm / (smooth_tr + 1e-9))
+            minus_di = 100.0 * (smooth_mdm / (smooth_tr + 1e-9))
+            dx = 100.0 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+
+            if smooth_dx is None:
+                dx_warmup.append(dx)
+                if len(dx_warmup) >= period:
+                    smooth_dx = sum(dx_warmup) / float(period)
+                    adx_val = smooth_dx
+                else:
+                    adx_val = sum(dx_warmup) / float(len(dx_warmup))
+            else:
+                smooth_dx = alpha * dx + (1.0 - alpha) * smooth_dx
+                adx_val = smooth_dx
+
+            pdi_series[i] = round(plus_di, 4)
+            mdi_series[i] = round(minus_di, 4)
+            adx_series[i] = round(adx_val, 4)
+
+        return adx_series, pdi_series, mdi_series
+
     def run(
         self,
         symbol: str,
         candles: List[Dict[str, Any]],
         strategy_filter: str = "both",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> BacktestResult:
         """Run the simulation over a chronological list of daily OHLCV candles.
 
@@ -312,12 +401,29 @@ class BacktestEngine:
 
         # Indicator Series
         sma200 = self._calculate_sma(closes, 200)
+        ema20 = self._calculate_ema(closes, 20)
+        ema50 = self._calculate_ema(closes, 50)
+        adx14, plus_di14, minus_di14 = self._calculate_wilder_adx(highs, lows, closes, 14)
         rsi3 = self._calculate_rsi(closes, 3)
         rsi7 = self._calculate_rsi(closes, 7)
         atr14 = self._calculate_atr(highs, lows, closes, 14)
         vol20 = self._calculate_realized_vol(closes, 20)
         forecast_5d = self._calculate_rolling_nixtla_forecast(closes, 5)
         sentiment_score = self._calculate_sentiment_proxy(closes, 14)
+
+        from trading_system.strategies.directional_trend import DirectionalTrendStrategy
+
+        directional_strategy = DirectionalTrendStrategy()
+        if config_snapshot is not None:
+            max_catalyst_risk = float(
+                getattr(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)
+            )
+        elif settings is not None:
+            max_catalyst_risk = float(
+                getattr(settings, "SCREENER_MAX_CATALYST_RISK", 0.25)
+            )
+        else:
+            max_catalyst_risk = 0.25
 
         capital = self.initial_capital
         equity_curve: List[float] = [capital]
@@ -653,16 +759,31 @@ class BacktestEngine:
 
                 # Directional Trend Strategy
                 if not signal_dir and strategy_filter in ("directional_trend", "all"):
-                    is_bull = (curr_sma is None or curr_c > curr_sma)
-                    is_bear = (curr_sma is not None and curr_c < curr_sma)
-                    if is_bull:
-                        signal_dir = "LONG"
+                    e20 = ema20[i] if i < len(ema20) and ema20[i] is not None else curr_c
+                    e50 = ema50[i] if i < len(ema50) and ema50[i] is not None else curr_c
+                    slope_5d: Optional[float] = None
+                    if i >= 5 and ema20[i] is not None and ema20[i - 5] is not None and ema20[i - 5] > 0:
+                        slope_5d = ((ema20[i] - ema20[i - 5]) / ema20[i - 5]) * 100.0
+                    bar_metrics: Dict[str, Any] = {
+                        "close": curr_c,
+                        "sma200": curr_sma if curr_sma is not None else 0.0,
+                        "ema20": e20,
+                        "ema50": e50,
+                        "ema20_slope_5d": slope_5d,
+                        "adx": adx14[i] if i < len(adx14) and adx14[i] is not None else 0.0,
+                        "plus_di": plus_di14[i] if i < len(plus_di14) and plus_di14[i] is not None else 0.0,
+                        "minus_di": minus_di14[i] if i < len(minus_di14) and minus_di14[i] is not None else 0.0,
+                        "atr": curr_atr,
+                        "realized_vol": curr_vol,
+                    }
+                    if candles[i].get("earnings_in_days") is not None:
+                        bar_metrics["earnings_in_days"] = candles[i]["earnings_in_days"]
+                    dir_sig = directional_strategy.evaluate_candidate(
+                        symbol, bar_metrics, config_snapshot=config_snapshot
+                    )
+                    if dir_sig.is_actionable and dir_sig.catalyst_risk <= max_catalyst_risk:
+                        signal_dir = dir_sig.direction
                         strategy_name = "directional_trend"
-                    elif is_bear:
-                        is_index = any(idx in symbol.upper() for idx in ("QQQ", "SPY", "SMH", "3USL", "QQQ3", "STOXX"))
-                        if is_index:
-                            signal_dir = "SHORT"
-                            strategy_name = "directional_trend"
 
                 # 3-RSI Mean Reversion (standalone or fallback if not multi_factor only)
                 if not signal_dir and strategy_filter in ("both", "3rsi"):

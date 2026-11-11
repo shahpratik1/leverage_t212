@@ -7,13 +7,49 @@ adaptive threshold adjustments based on real-time realized volatility.
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass, field
+import math
+import os
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
 
+from trading_system.config import settings
+
+if TYPE_CHECKING:
+    from trading_system.config_bus import ConfigSnapshot
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """Parse finite numeric values safely without propagating bools, strings, or NaN."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+class _SnapshotProxy:
+    """Lightweight read-only view overriding select settings attributes for simulations."""
+
+    def __init__(self, base: Any, **overrides: Any) -> None:
+        self._base = base
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._base, name)
 
 
 @dataclass
@@ -31,6 +67,20 @@ class ImprovementAudit:
     regime: str = "NORMAL"  # "LOW_VOL_CHOP", "NORMAL", "HIGH_VOL_TREND", "CRISIS"
     recommendations: List[str] = field(default_factory=list)
     action_taken: Optional[str] = None
+    active_strategy: str = "directional_trend"
+    config_epoch_id: Optional[str] = None
+    parameter_recommendations: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize audit report to a JSON-compatible dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ImprovementAudit":
+        """Reconstruct ImprovementAudit safely from persisted JSONL rows."""
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
 
 
 class StrategyImprovementAgent:
@@ -39,7 +89,8 @@ class StrategyImprovementAgent:
     Key Responsibilities:
     1. Zero-Yield Watchdog: Tracks zero-signal cycles and warns before operator notices.
     2. Feature Completeness: Ensures indicators required by screeners exist and are valid.
-    3. Regime-Aware Calibration: Recommends adaptive ADX / RSI threshold widening or tightening.
+    3. Regime-Aware Calibration: Audits active directional_trend parameters via Wilder ADX(14)
+       and emits deep-link tuning recommendations backed by backtest simulation.
     """
 
     REQUIRED_INDICATORS = (
@@ -56,34 +107,113 @@ class StrategyImprovementAgent:
         "macd_signal",
     )
 
-    def __init__(self, zero_yield_threshold: int = 3) -> None:
+    def __init__(
+        self,
+        zero_yield_threshold: int = 3,
+        audit_history_path: Optional[Union[str, Path]] = None,
+        max_persisted_audits: int = 50,
+    ) -> None:
         self.zero_yield_threshold = zero_yield_threshold
+        self._max_persisted_audits = max(1, int(max_persisted_audits))
         self.consecutive_zero_cycles: int = 0
         self.last_audit: Optional[ImprovementAudit] = None
         self.audit_history: List[ImprovementAudit] = []
+
+        self._explicit_history_path = audit_history_path is not None
+        if audit_history_path is not None:
+            self.audit_history_path = Path(audit_history_path)
+        elif "unittest" in sys.modules:
+            self.audit_history_path = (
+                Path(tempfile.gettempdir())
+                / f"audit_history_{os.getpid()}_{id(self)}.jsonl"
+            )
+        else:
+            self.audit_history_path = Path("data") / "audit_history.jsonl"
+
+        if self._explicit_history_path:
+            self._load_audit_history()
+
+    def _load_audit_history(self) -> None:
+        """Load bounded audit history from JSONL file if present, ignoring corrupt lines."""
+        if not self.audit_history_path.exists():
+            return
+        loaded: List[ImprovementAudit] = []
+        try:
+            with open(self.audit_history_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            loaded.append(ImprovementAudit.from_dict(parsed))
+                    except Exception:
+                        logger.warning(
+                            "Skipping malformed audit_history line in %s",
+                            self.audit_history_path,
+                        )
+        except Exception as exc:
+            logger.debug("Could not read audit history from %s: %s", self.audit_history_path, exc)
+            return
+
+        if loaded:
+            self.audit_history = loaded[-self._max_persisted_audits :]
+            self.last_audit = self.audit_history[-1]
+            self.consecutive_zero_cycles = int(self.last_audit.consecutive_zero_cycles or 0)
+
+    def _persist_audit_history(self) -> None:
+        """Atomically persist bounded audit history to JSONL via NamedTemporaryFile + os.replace."""
+        bounded = self.audit_history[-self._max_persisted_audits :]
+        parent = self.audit_history_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(parent),
+                prefix=".audit_history_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_path = tmp.name
+                for item in bounded:
+                    tmp.write(json.dumps(item.to_dict(), sort_keys=True) + "\n")
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_path, self.audit_history_path)
+            tmp_path = None
+        except Exception as exc:
+            logger.warning("Failed to persist audit history atomically: %s", exc)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def record_cycle_yield(
         self,
         candidate_count: int,
         universe_metrics: Optional[Dict[str, Dict[str, Any]]] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
+        gate_breakdown: Optional[List[Dict[str, Any]]] = None,
     ) -> ImprovementAudit:
-        """Record the candidate yield of a universe scan cycle and run health diagnostics.
-
-        Args:
-            candidate_count: Number of qualifying candidates produced for System 2 deliberation.
-            universe_metrics: Full dictionary of metrics across ingested assets.
-
-        Returns:
-            ImprovementAudit summarizing pipeline health and recommendations.
-        """
+        """Record candidate yield of a universe scan cycle and run directional diagnostics."""
         now_str = datetime.now(timezone.utc).isoformat()
+        source: Any = config_snapshot if config_snapshot is not None else settings
+        epoch_id = getattr(config_snapshot, "config_epoch_id", None) if config_snapshot is not None else None
+        active_strategy = str(getattr(source, "ACTIVE_STRATEGY", "directional_trend"))
+        current_min_adx = float(getattr(source, "MIN_ADX_TREND", 18.0))
+        current_max_cat = float(getattr(source, "SCREENER_MAX_CATALYST_RISK", 0.25))
 
         if candidate_count > 0:
             self.consecutive_zero_cycles = 0
         else:
             self.consecutive_zero_cycles += 1
 
-        missing_fields: set = set()
+        missing_fields: set[str] = set()
         null_count: int = 0
         total_assets = len(universe_metrics or {})
         adx_vals: List[float] = []
@@ -98,8 +228,8 @@ class StrategyImprovementAgent:
                     if val is None:
                         missing_fields.add(req)
                         null_count += 1
-                adx = float(m.get("adx", 0.0) or 0.0)
-                vol = float(m.get("realized_vol", 0.0) or 0.0)
+                adx = _safe_float(m.get("adx"), 0.0) or 0.0
+                vol = _safe_float(m.get("realized_vol"), 0.0) or 0.0
                 if adx > 0:
                     adx_vals.append(adx)
                 if vol > 0:
@@ -118,8 +248,8 @@ class StrategyImprovementAgent:
         else:
             regime = "NORMAL"
 
-        # Determine health status
         recommendations: List[str] = []
+        parameter_recommendations: List[Dict[str, Any]] = []
         action_taken: Optional[str] = None
 
         if missing_fields:
@@ -135,21 +265,58 @@ class StrategyImprovementAgent:
         elif self.consecutive_zero_cycles >= self.zero_yield_threshold:
             health = "STARVED"
             recommendations.append(
-                f"Zero signals generated across {self.consecutive_zero_cycles} consecutive scan cycles. "
+                f"Zero signals generated across {self.consecutive_zero_cycles} consecutive {active_strategy} scan cycles. "
                 f"Market regime is {regime} (mean ADX={mean_adx:.1f}, mean vol={mean_vol:.1%})."
             )
-            if regime == "LOW_VOL_CHOP":
-                bt_result = self.verify_parameter_adaptation(candidate_rsi3_threshold=25.0)
-                if bt_result.get("verified"):
-                    recommendations.append(
-                        f"Backtest-verified adaptive tuning: Broaden 3-RSI mean reversion scan (RSI3 <= 25 instead of 22). "
-                        f"Backtest confirmed {bt_result.get('candidate_win_rate', 0.0):.1f}% win-rate (PF: {bt_result.get('profit_factor', 0.0):.2f})."
-                    )
-                else:
-                    recommendations.append(
-                        "Adaptive recommendation: Broaden 3-RSI mean reversion scan (RSI3 <= 25 instead of 22) "
-                        "or lower ADX threshold to 18.0 to capture short-horizon relief swings."
-                    )
+
+            suggested_adx = round(max(12.0, min(current_min_adx - 2.0, 16.0 if current_min_adx > 16.0 else current_min_adx - 1.0)), 1)
+            bt_result = self.verify_parameter_adaptation(
+                candidate_adx_threshold=suggested_adx,
+                candidate_max_catalyst_risk=current_max_cat,
+                config_snapshot=config_snapshot,
+            )
+            verified = bool(bt_result.get("verified"))
+            recommendations.append(
+                f"Calibrate {active_strategy} ADX floor via MIN_ADX_TREND={suggested_adx:.1f} "
+                f"(currently {current_min_adx:.1f}, deep-link #/config?key=MIN_ADX_TREND); "
+                f"verify SCREENER_MAX_CATALYST_RISK={current_max_cat:.2f} (#/config?key=SCREENER_MAX_CATALYST_RISK). "
+                f"Backtest check: {bt_result.get('candidate_win_rate', 0.0):.1f}% win-rate (PF: {bt_result.get('profit_factor', 0.0):.2f})."
+            )
+            parameter_recommendations.append(
+                {
+                    "param_key": "MIN_ADX_TREND",
+                    "label": "Minimum ADX Trend",
+                    "current_value": current_min_adx,
+                    "suggested_value": suggested_adx,
+                    "gate_id": "adx_trend_gate",
+                    "deep_link": "#/config?key=MIN_ADX_TREND",
+                    "verified": verified,
+                    "rationale": f"Lower MIN_ADX_TREND toward {suggested_adx:.1f} under {regime} (mean ADX={mean_adx:.1f}).",
+                }
+            )
+            if gate_breakdown:
+                for entry in gate_breakdown[:3]:
+                    keys = entry.get("param_keys") or []
+                    for key in keys:
+                        if key == "MIN_ADX_TREND":
+                            continue
+                        cur_val = getattr(source, key, None)
+                        if cur_val is None and config_snapshot is not None:
+                            cur_val = config_snapshot.dynamic_parameters.get(key)
+                        parameter_recommendations.append(
+                            {
+                                "param_key": str(key),
+                                "label": str(entry.get("label") or key),
+                                "current_value": cur_val,
+                                "suggested_value": cur_val,
+                                "gate_id": str(entry.get("gate_id") or ""),
+                                "deep_link": f"#/config?key={key}",
+                                "verified": False,
+                                "rationale": (
+                                    f"Gate '{entry.get('label', key)}' blocked {entry.get('count', 0)} candidate(s)."
+                                ),
+                            }
+                        )
             logger.warning(
                 "StrategyImprovementAgent: Pipeline starved (%d zero cycles). Recommendations: %s",
                 self.consecutive_zero_cycles, recommendations,
@@ -171,13 +338,17 @@ class StrategyImprovementAgent:
             regime=regime,
             recommendations=recommendations,
             action_taken=action_taken,
+            active_strategy=active_strategy,
+            config_epoch_id=epoch_id,
+            parameter_recommendations=parameter_recommendations,
         )
 
         self.last_audit = audit
         self.audit_history.append(audit)
-        if len(self.audit_history) > 50:
-            self.audit_history.pop(0)
+        if len(self.audit_history) > self._max_persisted_audits:
+            self.audit_history = self.audit_history[-self._max_persisted_audits :]
 
+        self._persist_audit_history()
         return audit
 
     def verify_parameter_adaptation(
@@ -185,15 +356,28 @@ class StrategyImprovementAgent:
         symbol: str = "QQQ",
         candidate_candles: Optional[List[Dict[str, Any]]] = None,
         candidate_rsi3_threshold: float = 25.0,
+        candidate_adx_threshold: Optional[float] = None,
+        candidate_max_catalyst_risk: Optional[float] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Dict[str, Any]:
-        """Perform automated backtest verification of proposed threshold adaptation.
-
-        Runs historical simulation over benchmark candles, verifying win-rate
-        and profit factor before recommending parameter adoption.
-        """
+        """Run Wilder ADX(14) + directional_trend backtest & candidate check for adaptation verification."""
+        _ = candidate_rsi3_threshold  # Retained harmlessly for backward signature compatibility
         try:
             from trading_system.backtest.engine import BacktestEngine
             from trading_system.data.candle_db import CandleDatabase
+            from trading_system.strategies.directional_trend import DirectionalTrendStrategy
+
+            source: Any = config_snapshot if config_snapshot is not None else settings
+            min_adx = float(
+                candidate_adx_threshold
+                if candidate_adx_threshold is not None
+                else getattr(source, "MIN_ADX_TREND", 18.0)
+            )
+            max_cat_risk = float(
+                candidate_max_catalyst_risk
+                if candidate_max_catalyst_risk is not None
+                else getattr(source, "SCREENER_MAX_CATALYST_RISK", 0.25)
+            )
 
             candles = candidate_candles
             if not candles:
@@ -203,21 +387,78 @@ class StrategyImprovementAgent:
             if not candles or len(candles) < 30:
                 return {
                     "verified": False,
+                    "symbol": symbol,
+                    "strategy": "directional_trend",
                     "reason": "Insufficient historical candles for backtesting",
                     "candidate_win_rate": 0.0,
                     "profit_factor": 0.0,
                 }
 
+            highs = [float(c["high"]) for c in candles]
+            lows = [float(c["low"]) for c in candles]
+            closes = [float(c["close"]) for c in candles]
+            sma200 = BacktestEngine._calculate_sma(closes, 200)
+            ema20 = BacktestEngine._calculate_ema(closes, 20)
+            ema50 = BacktestEngine._calculate_ema(closes, 50)
+            adx14, pdi14, mdi14 = BacktestEngine._calculate_wilder_adx(highs, lows, closes, 14)
+
+            eval_snapshot = _SnapshotProxy(
+                source,
+                MIN_ADX_TREND=min_adx,
+                SCREENER_MAX_CATALYST_RISK=max_cat_risk,
+            )
+            strategy = DirectionalTrendStrategy(
+                min_adx_trend=min_adx, max_catalyst_risk=max_cat_risk
+            )
+
+            actionable_bars = 0
+            latest_dir = "NEUTRAL"
+            for idx in range(20, len(candles)):
+                e20 = ema20[idx] if ema20[idx] is not None else closes[idx]
+                e50 = ema50[idx] if ema50[idx] is not None else closes[idx]
+                slope_5d = (
+                    ((ema20[idx] - ema20[idx - 5]) / ema20[idx - 5]) * 100.0
+                    if idx >= 5 and ema20[idx] is not None and ema20[idx - 5] is not None and ema20[idx - 5] > 0
+                    else None
+                )
+                bar_metrics = {
+                    "close": closes[idx],
+                    "sma200": sma200[idx] if sma200[idx] is not None else 0.0,
+                    "ema20": e20,
+                    "ema50": e50,
+                    "ema20_slope_5d": slope_5d,
+                    "adx": adx14[idx] if adx14[idx] is not None else 0.0,
+                    "plus_di": pdi14[idx] if pdi14[idx] is not None else 0.0,
+                    "minus_di": mdi14[idx] if mdi14[idx] is not None else 0.0,
+                }
+                sig = strategy.evaluate_candidate(symbol, bar_metrics, config_snapshot=eval_snapshot)
+                if sig.is_actionable and sig.catalyst_risk <= max_cat_risk:
+                    actionable_bars += 1
+                if idx == len(candles) - 1:
+                    latest_dir = sig.direction
+
             engine = BacktestEngine(leverage=3)
-            result = engine.run(symbol, candles, strategy_filter="3rsi_mean_reversion")
+            result = engine.run(
+                symbol,
+                candles,
+                strategy_filter="directional_trend",
+                config_snapshot=eval_snapshot,
+            )
 
             win_rate = result.win_rate_pct
             pf = result.profit_factor
             verified = win_rate >= 70.0 and (pf >= 1.2 or result.total_trades == 0)
+            latest_adx = adx14[-1] if adx14 and adx14[-1] is not None else 0.0
 
             return {
                 "verified": verified,
                 "symbol": symbol,
+                "strategy": "directional_trend",
+                "adx_threshold": min_adx,
+                "max_catalyst_risk": max_cat_risk,
+                "latest_adx": round(float(latest_adx), 2),
+                "actionable_bars": actionable_bars,
+                "latest_signal_direction": latest_dir,
                 "total_trades": result.total_trades,
                 "candidate_win_rate": round(win_rate, 2),
                 "profit_factor": round(pf, 2),
@@ -228,6 +469,8 @@ class StrategyImprovementAgent:
             logger.debug("Backtest verification failed: %s", exc)
             return {
                 "verified": False,
+                "symbol": symbol,
+                "strategy": "directional_trend",
                 "reason": str(exc),
                 "candidate_win_rate": 0.0,
                 "profit_factor": 0.0,

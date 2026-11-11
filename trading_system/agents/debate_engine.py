@@ -1,7 +1,15 @@
+from __future__ import annotations
+
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import json
+
+from trading_system.config import settings
+
+if TYPE_CHECKING:
+    from trading_system.config_bus import ConfigSnapshot
 
 try:
     from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -11,6 +19,20 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    """Safely convert numeric metrics to finite float without crashing on strings or bools."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
 @dataclass
 class DebatePosition:
     side: str
@@ -19,6 +41,7 @@ class DebatePosition:
     target_price: Optional[float] = None
     risk_factors: List[str] = field(default_factory=list)
     confidence: float = 0.5
+
 
 @dataclass
 class DebateOutcome:
@@ -30,6 +53,8 @@ class DebateOutcome:
     synthesis: str
     conviction_score: float
     debate_rounds: int
+    config_epoch_id: Optional[str] = None
+
 
 class DebateEngine:
     def __init__(
@@ -50,6 +75,37 @@ class DebateEngine:
         self.speculative_threshold = speculative_threshold
         self.gemini_api_key = gemini_api_key
 
+    def _resolve_params(
+        self, config_snapshot: Optional[ConfigSnapshot] = None
+    ) -> Dict[str, Any]:
+        """Resolve debate configuration dynamically from a ConfigSnapshot or legacy defaults."""
+        if config_snapshot is not None:
+            spec_flag = getattr(
+                config_snapshot,
+                "ENABLE_SPECULATIVE_ROUTING",
+                getattr(config_snapshot, "SPECULATIVE_ROUTING", self.speculative_routing),
+            )
+            return {
+                "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None),
+                "adx_trend_min": float(getattr(config_snapshot, "MIN_ADX_TREND", 18.0)),
+                "model": str(getattr(config_snapshot, "LLM_DEEP_MODEL", self.model)),
+                "quick_model": str(getattr(config_snapshot, "LLM_QUICK_MODEL", self.quick_model)),
+                "debate_rounds": int(getattr(config_snapshot, "DEBATE_ROUNDS", self.debate_rounds)),
+                "speculative_routing": bool(spec_flag),
+                "speculative_threshold": float(
+                    getattr(config_snapshot, "SPECULATIVE_CONFIDENCE_THRESHOLD", self.speculative_threshold)
+                ),
+            }
+        return {
+            "config_epoch_id": None,
+            "adx_trend_min": float(getattr(settings, "MIN_ADX_TREND", 18.0)),
+            "model": self.model,
+            "quick_model": self.quick_model,
+            "debate_rounds": self.debate_rounds,
+            "speculative_routing": bool(self.speculative_routing),
+            "speculative_threshold": float(self.speculative_threshold),
+        }
+
     def run_debate(
         self,
         ticker: str,
@@ -58,6 +114,7 @@ class DebateEngine:
         fundamental_report: str,
         date: Optional[str] = None,
         strategy_type: str = "directional_trend",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> DebateOutcome:
         """
         Runs System 2 Deliberative Multi-Agent Debate:
@@ -66,45 +123,61 @@ class DebateEngine:
         Fast-reflex speculative bypasses have been completely removed to ensure cognitive depth
         and meta-learning alignment across all trades.
         """
+        params = self._resolve_params(config_snapshot)
         logger.info(
             "🧠 [System 2 Deliberative Brain] Running deep multi-agent debate for %s (strategy: %s)",
             ticker, strategy_type,
         )
 
+        strategy_sig = metrics.get("strategy_signal") if isinstance(metrics, dict) else None
+        speculative_bypass = (
+            params["speculative_routing"]
+            and strategy_sig is not None
+            and (_safe_float(getattr(strategy_sig, "conviction", 0.0), 0.0) or 0.0)
+            >= params["speculative_threshold"]
+        )
+
         # Quantitative rule-based or TradingAgents LLM debate
-        if not TRADING_AGENTS_AVAILABLE or not self.openai_api_key:
-            return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
-        
+        if not TRADING_AGENTS_AVAILABLE or not self.openai_api_key or speculative_bypass:
+            return self._fallback_debate(
+                ticker,
+                metrics,
+                technical_report,
+                fundamental_report,
+                strategy_type=strategy_type,
+                config_snapshot=config_snapshot,
+            )
+
         try:
             from tradingagents.default_config import DEFAULT_CONFIG
 
-            logger.info(f"Running TradingAgents deep debate for {ticker} using {self.model}")
+            logger.info("Running TradingAgents deep debate for %s using %s", ticker, params["model"])
             config = DEFAULT_CONFIG.copy()
             config.update({
                 'llm_provider': 'openai',
-                'deep_think_llm': self.model,
-                'quick_think_llm': self.quick_model,
-                'max_debate_rounds': self.debate_rounds,
+                'deep_think_llm': params["model"],
+                'quick_think_llm': params["quick_model"],
+                'max_debate_rounds': params["debate_rounds"],
                 'max_risk_discuss_rounds': 1,
             })
             import os
             os.environ.setdefault('OPENAI_API_KEY', self.openai_api_key)
 
             graph = TradingAgentsGraph(config=config)
-            
+
             analysis_date = date or "2026-01-01"
             state, decision = graph.propagate(ticker=ticker, date=analysis_date)
-            
+
             bull_raw = state.get("debate_transcript", {}) if isinstance(state, dict) else {}
             bear_raw = {}
-            
+
             final_decision_raw = decision.get("action", "") if isinstance(decision, dict) else ""
             confidence = float(decision.get("confidence", 0.5)) if isinstance(decision, dict) else 0.5
             rationale = decision.get("rationale", "No synthesis provided.") if isinstance(decision, dict) else "No synthesis provided."
-            
+
             bull_position = self._parse_bull_position(bull_raw, metrics)
             bear_position = self._parse_bear_position(bear_raw, metrics)
-            
+
             decision_upper = str(final_decision_raw).upper()
             if 'BUY' in decision_upper or 'BULLISH' in decision_upper:
                 consensus_decision = 'BUY_ENTRY'
@@ -115,7 +188,7 @@ class DebateEngine:
             else:
                 consensus_decision = 'DO_NOT_TRADE'
                 winning_side = 'tie'
-                
+
             return DebateOutcome(
                 ticker=ticker,
                 winning_side=winning_side,
@@ -124,12 +197,20 @@ class DebateEngine:
                 bear_position=bear_position,
                 synthesis=rationale,
                 conviction_score=confidence,
-                debate_rounds=self.debate_rounds
+                debate_rounds=params["debate_rounds"],
+                config_epoch_id=params["config_epoch_id"],
             )
-            
+
         except Exception as e:
             logger.error(f"Error during TradingAgents debate: {e}. Falling back to analytical arbiter.")
-            return self._fallback_debate(ticker, metrics, technical_report, fundamental_report, strategy_type=strategy_type)
+            return self._fallback_debate(
+                ticker,
+                metrics,
+                technical_report,
+                fundamental_report,
+                strategy_type=strategy_type,
+                config_snapshot=config_snapshot,
+            )
 
     def _fallback_debate(
         self,
@@ -138,29 +219,30 @@ class DebateEngine:
         technical_report: str,
         fundamental_report: str,
         strategy_type: str = "directional_trend",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> DebateOutcome:
         """Deep analytical arbiter fallback when TradingAgents package is unavailable."""
         logger.info(f"Running deep analytical deliberation for {ticker} (Strategy: {strategy_type})")
-        
+        params = self._resolve_params(config_snapshot)
+        adx_trend_min = params["adx_trend_min"]
+
         bull_evidence = []
         bear_evidence = []
         bull_risks = []
         bear_risks = []
-        
-        rsi14 = metrics.get('rsi14', metrics.get('rsi', 50))
-        ema20 = metrics.get('ema20', 0)
-        ema50 = metrics.get('ema50', 0)
-        sma200 = metrics.get('sma200', 0)
-        close = metrics.get('close', 0)
-        adx = metrics.get('adx', 0)
-        high_20d = metrics.get('high_20d', 0)
-        plus_di = metrics.get('plus_di')
-        minus_di = metrics.get('minus_di')
-        slope_20 = metrics.get('ema20_slope_5d')
-        strategy_sig = metrics.get('strategy_signal')
 
-        from trading_system.config import settings
-        adx_trend_min = getattr(settings, "MIN_ADX_TREND", 18.0)
+        rsi_base = _safe_float(metrics.get("rsi"), 50.0) or 50.0
+        rsi14 = _safe_float(metrics.get("rsi14"), rsi_base) or rsi_base
+        ema20 = _safe_float(metrics.get("ema20"), 0.0) or 0.0
+        ema50 = _safe_float(metrics.get("ema50"), 0.0) or 0.0
+        sma200 = _safe_float(metrics.get("sma200"), 0.0) or 0.0
+        close = _safe_float(metrics.get("close"), 0.0) or 0.0
+        adx = _safe_float(metrics.get("adx"), 0.0) or 0.0
+        high_20d = _safe_float(metrics.get("high_20d"), 0.0) or 0.0
+        plus_di = _safe_float(metrics.get("plus_di"), None)
+        minus_di = _safe_float(metrics.get("minus_di"), None)
+        slope_20 = _safe_float(metrics.get("ema20_slope_5d"), None)
+        strategy_sig = metrics.get('strategy_signal')
 
         # Ingest StrategySignal evidence if available
         if strategy_sig is not None:
@@ -185,11 +267,10 @@ class DebateEngine:
 
         # 20 EMA slope check if present
         if slope_20 is not None:
-            s_val = float(slope_20)
-            if s_val > 0.0:
-                bull_evidence.append(f"Daily 20 EMA upward slope ({s_val:+.2f}%) confirms positive momentum.")
-            elif s_val < 0.0:
-                bear_evidence.append(f"Daily 20 EMA downward slope ({s_val:+.2f}%) warns of deteriorating momentum.")
+            if slope_20 > 0.0:
+                bull_evidence.append(f"Daily 20 EMA upward slope ({slope_20:+.2f}%) confirms positive momentum.")
+            elif slope_20 < 0.0:
+                bear_evidence.append(f"Daily 20 EMA downward slope ({slope_20:+.2f}%) warns of deteriorating momentum.")
 
         # Macro 200 SMA check
         if close > sma200:
@@ -199,16 +280,14 @@ class DebateEngine:
 
         # Directional Movement Index (DMI) and Trend Strength (ADX)
         if plus_di is not None and minus_di is not None:
-            p_di = float(plus_di)
-            m_di = float(minus_di)
-            if p_di > m_di:
-                bull_evidence.append(f"Directional Polarity Bullish: +DI ({p_di:.1f}) > -DI ({m_di:.1f}).")
+            if plus_di > minus_di:
+                bull_evidence.append(f"Directional Polarity Bullish: +DI ({plus_di:.1f}) > -DI ({minus_di:.1f}).")
                 if adx >= adx_trend_min:
                     bull_evidence.append(f"ADX at {adx:.1f} confirms strong bullish trend velocity.")
                 else:
                     bear_evidence.append(f"ADX at {adx:.1f} indicates low directional momentum.")
             else:
-                bear_evidence.append(f"Directional Polarity Bearish: -DI ({m_di:.1f}) > +DI ({p_di:.1f}).")
+                bear_evidence.append(f"Directional Polarity Bearish: -DI ({minus_di:.1f}) > +DI ({plus_di:.1f}).")
                 if adx >= adx_trend_min:
                     bear_evidence.append(f"ADX at {adx:.1f} confirms strong bearish trend velocity.")
                 else:
@@ -253,16 +332,16 @@ class DebateEngine:
                 bull_evidence.append(f"Finnhub valuation multiples show attractive P/E of {pe:.1f}.")
             elif pe and pe > 40.0:
                 bear_risks.append(f"Elevated Finnhub P/E of {pe:.1f} creates multiple compression risk.")
-            
+
         bull_signals_count = len(bull_evidence)
         bear_signals_count = len(bear_evidence)
         total_signals = bull_signals_count + bear_signals_count
-        
+
         if total_signals == 0:
             conviction_score = 0.0
         else:
             conviction_score = abs(bull_signals_count - bear_signals_count) / total_signals
-            
+
         if bull_signals_count >= 3:
             consensus_decision = 'BUY_ENTRY'
             winning_side = 'bull'
@@ -274,9 +353,9 @@ class DebateEngine:
         else:
             consensus_decision = 'DO_NOT_TRADE'
             winning_side = 'tie'
-            
+
         current_price = close if close > 0 else 100.0
-        
+
         bull_position = DebatePosition(
             side='bull',
             thesis="Technical indicators point to upward momentum.",
@@ -285,7 +364,7 @@ class DebateEngine:
             risk_factors=bull_risks,
             confidence=bull_signals_count / total_signals if total_signals > 0 else 0.5
         )
-        
+
         bear_position = DebatePosition(
             side='bear',
             thesis="Technical indicators point to downward pressure.",
@@ -294,7 +373,7 @@ class DebateEngine:
             risk_factors=bear_risks,
             confidence=bear_signals_count / total_signals if total_signals > 0 else 0.5
         )
-        
+
         return DebateOutcome(
             ticker=ticker,
             winning_side=winning_side,
@@ -303,7 +382,8 @@ class DebateEngine:
             bear_position=bear_position,
             synthesis="System 2 Deliberative Multi-Agent synthesis based on technical, fundamental, and sentiment consensus.",
             conviction_score=conviction_score,
-            debate_rounds=self.debate_rounds
+            debate_rounds=params["debate_rounds"],
+            config_epoch_id=params["config_epoch_id"],
         )
 
     def _parse_bull_position(self, raw: Any, metrics: Dict[str, Any]) -> DebatePosition:

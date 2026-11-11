@@ -11,11 +11,52 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+
+if TYPE_CHECKING:
+    from trading_system.config_bus import ConfigSnapshot
 
 logger = logging.getLogger(__name__)
 
 TradeDecision = Literal["BUY_ENTRY", "SELL_ENTRY", "DO_NOT_TRADE", "EXIT"]
+
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely convert values to finite float, rejecting bools, strings, and NaN."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+def _append_card_rejection(
+    card: "DecisionCard",
+    gate_id: str,
+    param_keys: List[str],
+    observed: Any,
+    threshold: Any,
+    label: str,
+) -> None:
+    """Record structured gate rejection metadata on DecisionCard."""
+    if card.gate_rejections is None:
+        card.gate_rejections = []
+    if any(r.get("gate_id") == gate_id for r in card.gate_rejections):
+        return
+    card.gate_rejections.append(
+        {
+            "gate_id": gate_id,
+            "param_keys": list(param_keys),
+            "observed": observed,
+            "threshold": threshold,
+            "label": label,
+            "ticker": card.ticker,
+        }
+    )
 
 
 @dataclass
@@ -44,6 +85,8 @@ class DecisionCard:
     realized_vol: Optional[float] = None
     is_synthetic: bool = False          # Flag indicating whether underlying data was synthetically generated
     timestamp: str = ""                 # ISO format timestamp
+    config_epoch_id: Optional[str] = None
+    gate_rejections: Optional[List[Dict[str, Any]]] = None
 
     def __post_init__(self) -> None:
         if not self.timestamp:
@@ -77,18 +120,18 @@ class RiskManager:
         self,
         max_risk_per_trade: Optional[float] = None,
         max_position_pct: Optional[float] = None,
-        atr_sl_multiplier: float = 1.5,
-        min_sl_pct: float = 0.005,              # 0.5% minimum stop distance
-        max_sl_pct: Optional[float] = None,     # 3.0% maximum stop distance cap
+        atr_sl_multiplier: Optional[float] = None,
+        min_sl_pct: Optional[float] = None,              # 0.5% minimum stop distance
+        max_sl_pct: Optional[float] = None,              # 3.0% maximum stop distance cap
         tp1_r: Optional[float] = None,
         tp2_r: Optional[float] = None,
         tp3_r: Optional[float] = None,
-        tsl_atr_multiplier: float = 1.2,
-        tsl_hysteresis_atr_mult: float = 0.5,
-        tp1_trim_pct: float = 0.50,
-        tp2_trim_pct: float = 0.25,
-        tp3_trim_pct: float = 0.25,
-        target_annual_volatility: float = 0.20,
+        tsl_atr_multiplier: Optional[float] = None,
+        tsl_hysteresis_atr_mult: Optional[float] = None,
+        tp1_trim_pct: Optional[float] = None,
+        tp2_trim_pct: Optional[float] = None,
+        tp3_trim_pct: Optional[float] = None,
+        target_annual_volatility: Optional[float] = None,
         enforce_spread_gate: Optional[bool] = None,
         max_bid_ask_spread_pct: Optional[float] = None,
         enforce_correlation_limits: Optional[bool] = None,
@@ -98,20 +141,49 @@ class RiskManager:
         daily_max_drawdown_pct: Optional[float] = None,
     ):
         from trading_system.config import settings
+
+        self._explicit_args: set[str] = set()
+        raw_inputs = {
+            "max_risk_per_trade": max_risk_per_trade,
+            "max_position_pct": max_position_pct,
+            "atr_sl_multiplier": atr_sl_multiplier,
+            "min_sl_pct": min_sl_pct,
+            "max_sl_pct": max_sl_pct,
+            "tp1_r": tp1_r,
+            "tp2_r": tp2_r,
+            "tp3_r": tp3_r,
+            "tsl_atr_multiplier": tsl_atr_multiplier,
+            "tsl_hysteresis_atr_mult": tsl_hysteresis_atr_mult,
+            "tp1_trim_pct": tp1_trim_pct,
+            "tp2_trim_pct": tp2_trim_pct,
+            "tp3_trim_pct": tp3_trim_pct,
+            "target_annual_volatility": target_annual_volatility,
+            "enforce_spread_gate": enforce_spread_gate,
+            "max_bid_ask_spread_pct": max_bid_ask_spread_pct,
+            "enforce_correlation_limits": enforce_correlation_limits,
+            "max_sector_positions": max_sector_positions,
+            "max_portfolio_beta_heat": max_portfolio_beta_heat,
+            "enforce_daily_circuit_breaker": enforce_daily_circuit_breaker,
+            "daily_max_drawdown_pct": daily_max_drawdown_pct,
+        }
+        for name, val in raw_inputs.items():
+            if val is not None:
+                self._explicit_args.add(name)
+
         self.max_risk_per_trade = getattr(settings, "MAX_RISK_PER_TRADE", 0.015) if max_risk_per_trade is None else max_risk_per_trade
         self.max_position_pct = getattr(settings, "MAX_POSITION_PCT", 0.20) if max_position_pct is None else max_position_pct
-        self.atr_sl_multiplier = atr_sl_multiplier
-        self.min_sl_pct = min_sl_pct
+        self.atr_sl_multiplier = getattr(settings, "ATR_SL_MULTIPLIER", 1.5) if atr_sl_multiplier is None else atr_sl_multiplier
+        self.min_sl_pct = getattr(settings, "MIN_SL_PCT", 0.005) if min_sl_pct is None else min_sl_pct
         self.max_sl_pct = getattr(settings, "MAX_SL_PCT", 0.03) if max_sl_pct is None else max_sl_pct
         self.tp1_r = getattr(settings, "TP1_R_MULTIPLE", 1.5) if tp1_r is None else tp1_r
         self.tp2_r = getattr(settings, "TP2_R_MULTIPLE", 2.5) if tp2_r is None else tp2_r
         self.tp3_r = getattr(settings, "TP3_R_MULTIPLE", 3.5) if tp3_r is None else tp3_r
-        self.tsl_atr_multiplier = tsl_atr_multiplier
-        self.tsl_hysteresis_atr_mult = tsl_hysteresis_atr_mult
-        self.tp1_trim_pct = tp1_trim_pct
-        self.tp2_trim_pct = tp2_trim_pct
-        self.tp3_trim_pct = tp3_trim_pct
-        self.target_annual_volatility = target_annual_volatility
+        self.tsl_atr_multiplier = getattr(settings, "TSL_ATR_MULTIPLIER", 1.2) if tsl_atr_multiplier is None else tsl_atr_multiplier
+        self.tsl_hysteresis_atr_mult = getattr(settings, "TSL_HYSTERESIS_ATR_MULT", 0.5) if tsl_hysteresis_atr_mult is None else tsl_hysteresis_atr_mult
+        self.tp1_trim_pct = getattr(settings, "TP1_TRIM_PCT", 0.50) if tp1_trim_pct is None else tp1_trim_pct
+        self.tp2_trim_pct = getattr(settings, "TP2_TRIM_PCT", 0.25) if tp2_trim_pct is None else tp2_trim_pct
+        self.tp3_trim_pct = getattr(settings, "TP3_TRIM_PCT", 0.25) if tp3_trim_pct is None else tp3_trim_pct
+        self.target_annual_volatility = getattr(settings, "TARGET_ANNUAL_VOLATILITY", 0.20) if target_annual_volatility is None else target_annual_volatility
 
         # Advanced Risk & Safety Gates
         self.enforce_spread_gate = getattr(settings, "ENFORCE_SPREAD_GATE", True) if enforce_spread_gate is None else enforce_spread_gate
@@ -124,6 +196,12 @@ class RiskManager:
         self.trade_loss_cooldown_seconds = getattr(settings, "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0)
         self.max_spread_to_stop_ratio = getattr(settings, "MAX_SPREAD_TO_STOP_RATIO", 0.50)
 
+        self._init_snapshot_values: Dict[str, Any] = {
+            attr: getattr(self, attr) for attr in raw_inputs
+        }
+        self._init_snapshot_values["trade_loss_cooldown_seconds"] = self.trade_loss_cooldown_seconds
+        self._init_snapshot_values["max_spread_to_stop_ratio"] = self.max_spread_to_stop_ratio
+
         self.loss_cooldowns: Dict[str, float] = {}
         self.is_circuit_breaker_tripped: bool = False
         self.session_start_equity: Optional[float] = None
@@ -131,15 +209,81 @@ class RiskManager:
 
         logger.debug("Initialized RiskManager with max_risk_per_trade=%s", max_risk_per_trade)
 
+    def _resolve_field(
+        self,
+        attr: str,
+        setting_key: str,
+        default: Any,
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> Any:
+        """Resolve a risk setting from snapshot first, preserving explicit legacy overrides."""
+        if config_snapshot is not None:
+            return getattr(config_snapshot, setting_key, default)
+        current_val = getattr(self, attr, default)
+        if attr in self._explicit_args or current_val != self._init_snapshot_values.get(attr, current_val):
+            return current_val
+        from trading_system.config import settings
+
+        return getattr(settings, setting_key, current_val)
+
+    def _resolve_params(
+        self, config_snapshot: Optional[ConfigSnapshot] = None
+    ) -> Dict[str, Any]:
+        """Resolve all risk sizing, exit, and safety thresholds for the active epoch."""
+        from trading_system.config import settings
+
+        source = config_snapshot if config_snapshot is not None else settings
+        return {
+            "config_epoch_id": getattr(config_snapshot, "config_epoch_id", None) if config_snapshot is not None else None,
+            "max_risk_per_trade": float(self._resolve_field("max_risk_per_trade", "MAX_RISK_PER_TRADE", 0.015, config_snapshot)),
+            "max_position_pct": float(self._resolve_field("max_position_pct", "MAX_POSITION_PCT", 0.20, config_snapshot)),
+            "atr_sl_multiplier": float(self._resolve_field("atr_sl_multiplier", "ATR_SL_MULTIPLIER", 1.5, config_snapshot)),
+            "min_sl_pct": float(self._resolve_field("min_sl_pct", "MIN_SL_PCT", 0.005, config_snapshot)),
+            "max_sl_pct": float(self._resolve_field("max_sl_pct", "MAX_SL_PCT", 0.03, config_snapshot)),
+            "etp_min_sl_pct": float(getattr(source, "ETP_MIN_SL_PCT", 0.025)),
+            "etp_max_sl_pct": float(getattr(source, "ETP_MAX_SL_PCT", 0.080)),
+            "tp1_r": float(self._resolve_field("tp1_r", "TP1_R_MULTIPLE", 1.5, config_snapshot)),
+            "tp2_r": float(self._resolve_field("tp2_r", "TP2_R_MULTIPLE", 2.5, config_snapshot)),
+            "tp3_r": float(self._resolve_field("tp3_r", "TP3_R_MULTIPLE", 3.5, config_snapshot)),
+            "tsl_atr_multiplier": float(self._resolve_field("tsl_atr_multiplier", "TSL_ATR_MULTIPLIER", 1.2, config_snapshot)),
+            "tsl_hysteresis_atr_mult": float(self._resolve_field("tsl_hysteresis_atr_mult", "TSL_HYSTERESIS_ATR_MULT", 0.5, config_snapshot)),
+            "target_annual_volatility": float(self._resolve_field("target_annual_volatility", "TARGET_ANNUAL_VOLATILITY", 0.20, config_snapshot)),
+            "enforce_spread_gate": bool(self._resolve_field("enforce_spread_gate", "ENFORCE_SPREAD_GATE", True, config_snapshot)),
+            "max_bid_ask_spread_pct": float(self._resolve_field("max_bid_ask_spread_pct", "MAX_BID_ASK_SPREAD_PCT", 0.0150, config_snapshot)),
+            "max_spread_to_stop_ratio": float(self._resolve_field("max_spread_to_stop_ratio", "MAX_SPREAD_TO_STOP_RATIO", 0.50, config_snapshot)),
+            "enforce_correlation_limits": bool(self._resolve_field("enforce_correlation_limits", "ENFORCE_CORRELATION_LIMITS", True, config_snapshot)),
+            "max_sector_positions": int(self._resolve_field("max_sector_positions", "MAX_SECTOR_POSITIONS", 4, config_snapshot)),
+            "max_portfolio_beta_heat": float(self._resolve_field("max_portfolio_beta_heat", "MAX_PORTFOLIO_BETA_HEAT", 6.0, config_snapshot)),
+            "enforce_daily_circuit_breaker": bool(self._resolve_field("enforce_daily_circuit_breaker", "ENFORCE_DAILY_CIRCUIT_BREAKER", True, config_snapshot)),
+            "daily_max_drawdown_pct": float(self._resolve_field("daily_max_drawdown_pct", "DAILY_MAX_DRAWDOWN_PCT", 0.02, config_snapshot)),
+            "trade_loss_cooldown_seconds": float(self._resolve_field("trade_loss_cooldown_seconds", "TRADE_LOSS_COOLDOWN_SECONDS", 3600.0, config_snapshot)),
+            "enable_5x_leverage": bool(getattr(source, "ENABLE_5X_LEVERAGE", False)),
+            "prefer_5x_leverage": bool(getattr(source, "PREFER_5X_LEVERAGE", False)),
+            "use_leveraged_3x": bool(getattr(source, "USE_LEVERAGED_3X", True)),
+            "max_leverage": int(getattr(source, "MAX_LEVERAGE", 3)),
+            "pure_tsl_mode": bool(getattr(source, "PURE_TSL_MODE", True)),
+        }
+
+    def get_etp_sl_bounds(
+        self, config_snapshot: Optional[ConfigSnapshot] = None
+    ) -> Tuple[float, float]:
+        """Return resolved (ETP_MIN_SL_PCT, ETP_MAX_SL_PCT) stop clamp bounds."""
+        params = self._resolve_params(config_snapshot)
+        return params["etp_min_sl_pct"], params["etp_max_sl_pct"]
+
     def check_circuit_breaker(
-        self, current_equity: float, session_start_equity: Optional[float] = None
+        self,
+        current_equity: float,
+        session_start_equity: Optional[float] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Tuple[bool, str]:
         """Check if portfolio daily drawdown exceeds circuit breaker threshold.
 
         Returns:
             Tuple[bool, str]: (is_tripped, explanation)
         """
-        if not self.enforce_daily_circuit_breaker:
+        params = self._resolve_params(config_snapshot)
+        if not params["enforce_daily_circuit_breaker"]:
             return False, "Circuit breaker disabled"
 
         if session_start_equity is not None and session_start_equity > 0:
@@ -153,18 +297,19 @@ class RiskManager:
 
         drawdown = (current_equity - self.session_start_equity) / self.session_start_equity
         self.current_drawdown_pct = drawdown
+        max_dd = params["daily_max_drawdown_pct"]
 
-        if drawdown <= -self.daily_max_drawdown_pct:
+        if drawdown <= -max_dd:
             self.is_circuit_breaker_tripped = True
             msg = (
                 f"🚨 CIRCUIT BREAKER TRIPPED: Daily drawdown {drawdown*100:.2f}% "
-                f"breached -{self.daily_max_drawdown_pct*100:.1f}% limit! "
+                f"breached -{max_dd*100:.1f}% limit! "
                 f"Equity: ${current_equity:.2f} vs Start: ${self.session_start_equity:.2f}."
             )
             logger.critical(msg)
             return True, msg
 
-        return False, f"Drawdown {drawdown*100:.2f}% within safe threshold (-{self.daily_max_drawdown_pct*100:.1f}%)"
+        return False, f"Drawdown {drawdown*100:.2f}% within safe threshold (-{max_dd*100:.1f}%)"
 
     def reset_circuit_breaker(self, new_session_equity: Optional[float] = None) -> None:
         """Reset the circuit breaker for a new session day."""
@@ -174,10 +319,15 @@ class RiskManager:
             self.session_start_equity = new_session_equity
 
     def register_loss_exit(
-        self, ticker: str, underlying: Optional[str] = None, cooldown_seconds: Optional[float] = None
+        self,
+        ticker: str,
+        underlying: Optional[str] = None,
+        cooldown_seconds: Optional[float] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> None:
         """Place a ticker and its underlying on anti-churn cooldown after a stop loss exit."""
-        duration = cooldown_seconds if cooldown_seconds is not None else self.trade_loss_cooldown_seconds
+        params = self._resolve_params(config_snapshot)
+        duration = cooldown_seconds if cooldown_seconds is not None else params["trade_loss_cooldown_seconds"]
         expiry = time.time() + duration
         t_clean = (ticker or "").upper().strip()
         u_clean = (underlying or "").upper().strip()
@@ -224,15 +374,26 @@ class RiskManager:
             return False
         return dir_u in ("SHORT", "SELL")
 
-    def calculate_stop_loss(self, entry_price: float, atr: float, direction: str = "LONG", ticker: str = "") -> float:
+    def calculate_stop_loss(
+        self,
+        entry_price: float,
+        atr: float,
+        direction: str = "LONG",
+        ticker: str = "",
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> float:
         """Calculate stop loss based on ATR, bounded between min_sl_pct and max_sl_pct.
 
         For LONG:  SL = Entry - clamp(multiplier * ATR, Entry * min_sl_pct, Entry * max_sl_pct)
         For SHORT (if CFD): SL = Entry + clamp(multiplier * ATR, Entry * min_sl_pct, Entry * max_sl_pct)
         Note: When buying an Inverse 3x/5x ETP, treat the ETP as a Long position with respect to its own price.
         """
-        raw_sl_distance = max(self.atr_sl_multiplier * atr, entry_price * self.min_sl_pct)
-        max_distance = entry_price * getattr(self, "max_sl_pct", 0.03)
+        params = self._resolve_params(config_snapshot)
+        raw_sl_distance = max(
+            params["atr_sl_multiplier"] * atr,
+            entry_price * params["min_sl_pct"],
+        )
+        max_distance = entry_price * params["max_sl_pct"]
         sl_distance = min(raw_sl_distance, max_distance)
         is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
         if is_cfd_short:
@@ -242,7 +403,12 @@ class RiskManager:
         return round(stop_loss, 2)
 
     def calculate_take_profits(
-        self, entry_price: float, stop_loss: float, direction: str = "LONG", ticker: str = ""
+        self,
+        entry_price: float,
+        stop_loss: float,
+        direction: str = "LONG",
+        ticker: str = "",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Tuple[float, float, float]:
         """Calculate multiple take profit levels based on Risk (R).
 
@@ -250,16 +416,17 @@ class RiskManager:
         For LONG:  TP = Entry + (multiplier * R)
         For SHORT (if CFD): TP = Entry - (multiplier * R)
         """
+        params = self._resolve_params(config_snapshot)
         r_distance = abs(entry_price - stop_loss)
         is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
         if is_cfd_short:
-            tp1 = max(0.01, entry_price - (self.tp1_r * r_distance))
-            tp2 = max(0.01, entry_price - (self.tp2_r * r_distance))
-            tp3 = max(0.01, entry_price - (self.tp3_r * r_distance))
+            tp1 = max(0.01, entry_price - (params["tp1_r"] * r_distance))
+            tp2 = max(0.01, entry_price - (params["tp2_r"] * r_distance))
+            tp3 = max(0.01, entry_price - (params["tp3_r"] * r_distance))
         else:
-            tp1 = entry_price + (self.tp1_r * r_distance)
-            tp2 = entry_price + (self.tp2_r * r_distance)
-            tp3 = entry_price + (self.tp3_r * r_distance)
+            tp1 = entry_price + (params["tp1_r"] * r_distance)
+            tp2 = entry_price + (params["tp2_r"] * r_distance)
+            tp3 = entry_price + (params["tp3_r"] * r_distance)
         return round(tp1, 2), round(tp2, 2), round(tp3, 2)
 
     def calculate_escape_threshold(
@@ -269,13 +436,15 @@ class RiskManager:
         direction: str = "LONG",
         multiplier: Optional[float] = None,
         ticker: str = "",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> float:
         """Calculate the escape threshold for Schmitt Hysteresis past TP1.
 
         Requires price to advance beyond TP1 by (multiplier * ATR) before
         elevating the Stop Loss to TP1, eliminating zero-distance stop liquidations.
         """
-        mult = multiplier if multiplier is not None else self.tsl_hysteresis_atr_mult
+        params = self._resolve_params(config_snapshot)
+        mult = multiplier if multiplier is not None else params["tsl_hysteresis_atr_mult"]
         buffer = mult * atr if atr > 0 else tp1 * 0.015
         is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
         if is_cfd_short:
@@ -285,20 +454,28 @@ class RiskManager:
         return round(escape_price, 2)
 
     @classmethod
-    def get_decay_atr_multiplier(cls, session_count: int = 1, is_runner: bool = False) -> float:
-        """Calculate the active ATR trailing stop multiplier with session-day decay.
-        
-        - If is_runner is True: decay is frozen at 2.00x ATR to let multi-week trends ride.
-        - Otherwise, compresses by 0.35x ATR per elapsed completed session:
-            Day 1: 2.20x ATR
-            Day 2: 1.85x ATR
-            Day 3: 1.50x ATR
-            Day 4+: 1.15x ATR (compression floor)
-        """
+    def get_decay_atr_multiplier(
+        cls,
+        session_count: int = 1,
+        is_runner: bool = False,
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> float:
+        """Calculate the active ATR trailing stop multiplier with session-day decay."""
+        if config_snapshot is not None:
+            source: Any = config_snapshot
+        else:
+            from trading_system.config import settings
+            source = settings
+
+        runner_mult = float(getattr(source, "TSL_DECAY_RUNNER_MULT", 2.00))
         if is_runner:
-            return 2.00
-        decayed = 2.20 - (0.35 * max(0, session_count - 1))
-        return round(max(1.15, decayed), 2)
+            return round(runner_mult, 2)
+
+        day1_mult = float(getattr(source, "TSL_DECAY_DAY1_MULT", 2.20))
+        step_mult = float(getattr(source, "TSL_DECAY_STEP_MULT", 0.35))
+        floor_mult = float(getattr(source, "TSL_DECAY_FLOOR_MULT", 1.15))
+        decayed = day1_mult - (step_mult * max(0, session_count - 1))
+        return round(max(floor_mult, decayed), 2)
 
     def calculate_trailing_stop(
         self,
@@ -310,12 +487,17 @@ class RiskManager:
         ticker: str = "",
         session_count: int = 1,
         is_runner: bool = False,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> float:
         """Calculate dynamic trailing stop level with session-day decay envelope.
 
         The trailing stop ratchets ONLY in the favorable direction (never widens).
         """
-        effective_mult = self.get_decay_atr_multiplier(session_count=session_count, is_runner=is_runner)
+        effective_mult = self.get_decay_atr_multiplier(
+            session_count=session_count,
+            is_runner=is_runner,
+            config_snapshot=config_snapshot,
+        )
         distance = max(effective_mult * atr, peak_price * 0.02)
         is_cfd_short = self.is_true_short_contract(ticker=ticker, direction=direction)
         if is_cfd_short:
@@ -335,12 +517,14 @@ class RiskManager:
         current_sl: float,
         direction: str = "LONG",
         ticker: str = "",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> float:
         """Lock in gains progressively:
         - At +1.5% unrealized profit: move stop loss to Entry Price (Breakeven).
         - At +3.0% unrealized profit: move stop loss to Entry Price + 1.5% (lock profit cushion).
         - Stop never loosens.
         """
+        _ = config_snapshot
         is_short = cls.is_true_short_contract(ticker=ticker, direction=direction)
         if is_short:
             gain_pct = ((entry_price - current_price) / entry_price * 100.0) if entry_price > 0 else 0.0
@@ -367,18 +551,12 @@ class RiskManager:
         annualized_vol: float,
         target_vol: Optional[float] = None,
         leverage: int = 3,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> float:
-        """Calculate dynamic volatility-targeted position notional.
-
-        Formula:
-            Target Notional = (Account Equity * max_position_pct) * (Target Vol / max(0.10, leverage * annualized_vol))
-            Capped at Max Position Notional (Account Equity * max_position_pct).
-
-        Reduces position size proportionally when realized volatility spikes to protect against
-        beta decay and extreme adverse excursion on leveraged products.
-        """
-        tgt_vol = target_vol if target_vol is not None else self.target_annual_volatility
-        max_position_notional = account_equity * self.max_position_pct
+        """Calculate dynamic volatility-targeted position notional."""
+        params = self._resolve_params(config_snapshot)
+        tgt_vol = target_vol if target_vol is not None else params["target_annual_volatility"]
+        max_position_notional = account_equity * params["max_position_pct"]
         if annualized_vol <= 0 or account_equity <= 0:
             return max_position_notional
 
@@ -395,17 +573,13 @@ class RiskManager:
         leverage: int = 3,
         ticker: Optional[str] = None,
         currency: Optional[str] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Tuple[float, float, float]:
-        """Calculate number of shares, notional position, and actual risk amount.
-
-        Formula:
-            Risk Notional = (Account Equity * max_risk) / Stop_Distance_Pct
-            Max Notional = Account Equity * max_position_pct
-            Vol Notional = calculate_volatility_targeted_size(...)
-            Position Notional = min(Risk Notional, Max Notional, [Vol Notional if realized_vol])
-        """
+        """Calculate number of shares, notional position, and actual risk amount."""
         if entry_price <= 0 or account_equity <= 0:
             return 0.0, 0.0, 0.0
+
+        params = self._resolve_params(config_snapshot)
 
         from trading_system.data.leveraged_universe import LeveragedUniverse, GBX_TICKERS
         price_in_eur = LeveragedUniverse.normalize_quote_to_eur(ticker or "", entry_price, currency)
@@ -413,14 +587,14 @@ class RiskManager:
             price_in_eur = entry_price
 
         stop_distance_pct = abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.0
-        risk_amount = account_equity * self.max_risk_per_trade
+        risk_amount = account_equity * params["max_risk_per_trade"]
 
         if stop_distance_pct <= 0:
             position_notional_from_risk = 0.0
         else:
             position_notional_from_risk = risk_amount / stop_distance_pct
 
-        max_position_notional = account_equity * self.max_position_pct
+        max_position_notional = account_equity * params["max_position_pct"]
         position_notional = min(position_notional_from_risk, max_position_notional)
 
         # Apply volatility-targeted sizing if realized_vol is available
@@ -429,6 +603,7 @@ class RiskManager:
                 account_equity=account_equity,
                 annualized_vol=realized_vol,
                 leverage=leverage,
+                config_snapshot=config_snapshot,
             )
             position_notional = min(position_notional, vol_notional)
 
@@ -476,43 +651,62 @@ class RiskManager:
         account_equity: float,
         strategy_type: str = "directional_trend",
         leverage: Optional[int] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> DecisionCard:
         """Generate a complete DecisionCard from technical metrics and debate consensus."""
-        entry_price = metrics.get("close", 0.0)
-        atr = metrics.get("atr", 0.0)
-        realized_vol = metrics.get("realized_vol")
+        params = self._resolve_params(config_snapshot)
+        epoch_id: Optional[str] = params["config_epoch_id"]
+
+        atr = _safe_float(metrics.get("atr"), 0.0) or 0.0
 
         # Multi-Tier Allocation: Support both 3x and 5x dynamically based on conviction and volatility
         from trading_system.data.leveraged_universe import LeveragedUniverse
-        from trading_system.config import settings
+
         universe = LeveragedUniverse()
         has_5x = universe.has_5x_leverage(ticker, direction)
-        enable_5x = getattr(settings, "ENABLE_5X_LEVERAGE", True)
+        enable_5x = params["enable_5x_leverage"]
+        prefer_5x = params["prefer_5x_leverage"]
+        use_3x = params["use_leveraged_3x"]
+        max_lev = params["max_leverage"]
 
-        conviction_score = getattr(debate_outcome, "conviction_score", 0.0)
-        realized_vol = float(metrics.get("realized_vol") or metrics.get("historical_vol") or 0.25)
+        conviction_score = _safe_float(getattr(debate_outcome, "conviction_score", 0.0), 0.0) or 0.0
+        rvol_raw = metrics.get("realized_vol") if metrics.get("realized_vol") is not None else metrics.get("historical_vol")
+        realized_vol = _safe_float(rvol_raw, 0.25) or 0.25
 
-        if has_5x and enable_5x:
+        if has_5x and enable_5x and max_lev >= 5:
             if leverage == 5:
                 resolved_leverage = 5
             elif leverage == 3:
                 resolved_leverage = 3
-            elif conviction_score >= 0.85 and realized_vol <= 0.35:
+            elif prefer_5x or (conviction_score >= 0.85 and realized_vol <= 0.35):
                 resolved_leverage = 5
             else:
                 resolved_leverage = 3
         else:
-            resolved_leverage = 3 if settings.USE_LEVERAGED_3X else 1
+            resolved_leverage = 3 if (use_3x and max_lev >= 3) else 1
 
-        sanitized_t212_ticker = universe.get_execution_ticker(ticker, direction, leverage=resolved_leverage) or trading212_ticker
+        sanitized_t212_ticker: Optional[str] = None
+        if enable_5x and resolved_leverage >= 5:
+            pair = universe.get_pair_for_underlying(ticker)
+            if pair and pair.has_5x:
+                dir_u = direction.upper()
+                if dir_u in ("LONG", "BUY", "BULLISH") and pair.long_5x_ticker:
+                    sanitized_t212_ticker = pair.long_5x_ticker
+                elif dir_u in ("SHORT", "SELL", "BEARISH") and pair.short_5x_ticker and pair.short_5x_ticker != "None":
+                    sanitized_t212_ticker = pair.short_5x_ticker
+        if not sanitized_t212_ticker:
+            sanitized_t212_ticker = (
+                universe.get_execution_ticker(ticker, direction, leverage=resolved_leverage)
+                or trading212_ticker
+            )
 
         # Query live quote and currency of execution ticker before sizing
         from trading_system.data.trading212_client import MarketDataProvider
         etp_quote = MarketDataProvider.get_quote(sanitized_t212_ticker)
-        etp_price = float(etp_quote.get("price") or 0.0) if etp_quote else 0.0
+        etp_price = _safe_float(etp_quote.get("price") if etp_quote else None, 0.0) or 0.0
         etp_currency = (etp_quote.get("currency") if etp_quote else "") or universe.get_ticker_currency(sanitized_t212_ticker)
 
-        underlying_price = float(metrics.get("close", 0.0) or 0.0)
+        underlying_price = _safe_float(metrics.get("close"), 0.0) or 0.0
         is_derivative_etp = sanitized_t212_ticker.upper() != ticker.upper()
         if etp_price > 0:
             actual_entry_price = etp_price
@@ -555,20 +749,39 @@ class RiskManager:
                 rationale="Scale guard veto: Invalid or unresolvable ETP execution price.",
                 strategy_type=strategy_type,
                 leverage=resolved_leverage,
+                config_epoch_id=epoch_id,
+                gate_rejections=[
+                    {
+                        "gate_id": "scale_guard_veto",
+                        "param_keys": [],
+                        "observed": actual_entry_price,
+                        "threshold": "> 0",
+                        "label": "Execution Quote Scale Guard",
+                        "ticker": ticker,
+                    }
+                ],
             )
 
         stop_loss = self.calculate_stop_loss(
-            actual_entry_price, etp_atr, direction=direction, ticker=sanitized_t212_ticker
+            actual_entry_price,
+            etp_atr,
+            direction=direction,
+            ticker=sanitized_t212_ticker,
+            config_snapshot=config_snapshot,
         )
         stop_distance_pct = (
             abs(actual_entry_price - stop_loss) / actual_entry_price if actual_entry_price > 0 else 0.0
         )
         tp1, tp2, tp3 = self.calculate_take_profits(
-            actual_entry_price, stop_loss, direction=direction, ticker=sanitized_t212_ticker
+            actual_entry_price,
+            stop_loss,
+            direction=direction,
+            ticker=sanitized_t212_ticker,
+            config_snapshot=config_snapshot,
         )
 
         consensus = getattr(debate_outcome, "consensus_decision", "DO_NOT_TRADE")
-        conviction_score = getattr(debate_outcome, "conviction_score", 0.0)
+        conviction_score = _safe_float(getattr(debate_outcome, "conviction_score", 0.0), 0.0) or 0.0
         synthesis = getattr(debate_outcome, "synthesis", "No synthesis provided.")
 
         dir_upper = direction.upper()
@@ -576,18 +789,39 @@ class RiskManager:
         is_short = dir_upper in ("SHORT", "SELL", "BEARISH")
 
         # Directional alignment gate: If debate specifically concluded the opposite direction won, veto entry!
-        # E.g. Candidate requested SHORT, but System 2 debate concluded BULL won (consensus=BUY_ENTRY).
         winning_side = str(getattr(debate_outcome, "winning_side", "") or "").lower()
         if isinstance(winning_side, str):
             direction_mismatch = (is_short and winning_side == "bull") or (is_long and winning_side == "bear")
         else:
             direction_mismatch = False
 
+        card_rejections: List[Dict[str, Any]] = []
         if consensus in ("DO_NOT_TRADE", "EXIT") or direction_mismatch:
             if direction_mismatch:
                 logger.warning(
                     "Directional conflict veto for %s: candidate requested %s but debate winning side was %s (consensus=%s). Setting DO_NOT_TRADE.",
                     ticker, direction, winning_side, consensus
+                )
+                card_rejections.append(
+                    {
+                        "gate_id": "directional_conflict_veto",
+                        "param_keys": [],
+                        "observed": f"{direction}/{winning_side}",
+                        "threshold": direction,
+                        "label": "Debate Directional Alignment",
+                        "ticker": ticker,
+                    }
+                )
+            else:
+                card_rejections.append(
+                    {
+                        "gate_id": "debate_consensus_veto",
+                        "param_keys": [],
+                        "observed": consensus,
+                        "threshold": "BUY_ENTRY/SELL_ENTRY",
+                        "label": "Debate Consensus Gate",
+                        "ticker": ticker,
+                    }
                 )
             shares, position_notional, actual_risk, risk_pct_of_equity = 0.0, 0.0, 0.0, 0.0
             decision_action = "DO_NOT_TRADE"
@@ -600,6 +834,7 @@ class RiskManager:
                 leverage=resolved_leverage,
                 ticker=sanitized_t212_ticker,
                 currency=etp_currency,
+                config_snapshot=config_snapshot,
             )
             risk_pct_of_equity = (
                 actual_risk / account_equity if account_equity > 0 else 0.0
@@ -626,15 +861,12 @@ class RiskManager:
             rationale=synthesis,
             strategy_type=strategy_type,
             leverage=resolved_leverage,
-            earnings_in_days=(
-                float(metrics.get("earnings_in_days"))
-                if metrics.get("earnings_in_days") is not None
-                and str(metrics.get("earnings_in_days")).replace(".", "", 1).isdigit()
-                else None
-            ),
+            earnings_in_days=_safe_float(metrics.get("earnings_in_days"), None),
             realized_vol=realized_vol,
             is_synthetic=MarketDataProvider.is_ticker_synthetic(ticker),
             timestamp=datetime.now(timezone.utc).isoformat(),
+            config_epoch_id=epoch_id,
+            gate_rejections=card_rejections,
         )
 
     calculate_decision_card = generate_decision_card
@@ -646,61 +878,149 @@ class RiskManager:
         existing_positions: List[Any],
         spread_pct: Optional[float] = None,
         account_equity: Optional[float] = None,
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Tuple[bool, str]:
         """Validate whether a trade should be executed."""
+        params = self._resolve_params(config_snapshot)
+        if config_snapshot is not None and card.config_epoch_id is None:
+            card.config_epoch_id = params["config_epoch_id"]
+
         if card.decision not in ("BUY_ENTRY", "SELL_ENTRY"):
+            _append_card_rejection(
+                card,
+                "decision_not_entry",
+                [],
+                card.decision,
+                "BUY_ENTRY/SELL_ENTRY",
+                "Entry Decision Required",
+            )
             return False, f"Decision is {card.decision}, not an entry decision"
 
         # 1. Anti-Churn Loss Cooldown Gate
         in_cooldown, remaining_sec = self.is_in_loss_cooldown(card.trading212_ticker, card.ticker)
         if in_cooldown:
+            _append_card_rejection(
+                card,
+                "cooldown_gate",
+                ["TRADE_LOSS_COOLDOWN_SECONDS"],
+                round(remaining_sec, 1),
+                0.0,
+                "Anti-Churn Loss Cooldown",
+            )
             return (
                 False,
                 f"Anti-churn cooldown active for {card.trading212_ticker} ({card.ticker}) after recent stop-loss exit ({remaining_sec:.0f}s remaining)",
             )
 
         # 2. Daily Drawdown Circuit Breaker Gate
-        if self.enforce_daily_circuit_breaker and self.is_circuit_breaker_tripped:
+        if params["enforce_daily_circuit_breaker"] and self.is_circuit_breaker_tripped:
+            _append_card_rejection(
+                card,
+                "circuit_breaker_gate",
+                ["ENFORCE_DAILY_CIRCUIT_BREAKER", "DAILY_MAX_DRAWDOWN_PCT"],
+                round(self.current_drawdown_pct, 4),
+                -params["daily_max_drawdown_pct"],
+                "Daily Drawdown Circuit Breaker",
+            )
             return (
                 False,
-                f"Daily circuit breaker tripped (Drawdown {self.current_drawdown_pct*100:.2f}% breached -{self.daily_max_drawdown_pct*100:.1f}%)",
+                f"Daily circuit breaker tripped (Drawdown {self.current_drawdown_pct*100:.2f}% breached -{params['daily_max_drawdown_pct']*100:.1f}%)",
             )
 
         # 3. Bid-Ask Spread Gate & Spread-to-Stop Ratio Gate
-        if self.enforce_spread_gate and spread_pct is not None:
-            if spread_pct > self.max_bid_ask_spread_pct:
-                return (
-                    False,
-                    f"Bid-ask spread too wide ({spread_pct*100:.2f}% > {self.max_bid_ask_spread_pct*100:.2f}%)",
+        if params["enforce_spread_gate"] and spread_pct is not None:
+            max_spread = params["max_bid_ask_spread_pct"]
+            max_ratio = params["max_spread_to_stop_ratio"]
+            if spread_pct > max_spread:
+                _append_card_rejection(
+                    card,
+                    "spread_gate",
+                    ["ENFORCE_SPREAD_GATE", "MAX_BID_ASK_SPREAD_PCT"],
+                    round(spread_pct, 6),
+                    max_spread,
+                    "Max Bid-Ask Spread Gate",
                 )
-            if card.stop_distance_pct > 0 and spread_pct >= (card.stop_distance_pct * self.max_spread_to_stop_ratio):
                 return (
                     False,
-                    f"Spread ({spread_pct*100:.2f}%) exceeds {self.max_spread_to_stop_ratio*100:.0f}% of planned stop loss ({card.stop_distance_pct*100:.2f}%), trade would be vulnerable to immediate spread-stop whipsaw",
+                    f"Bid-ask spread too wide ({spread_pct*100:.2f}% > {max_spread*100:.2f}%)",
+                )
+            if card.stop_distance_pct > 0 and spread_pct >= (card.stop_distance_pct * max_ratio):
+                _append_card_rejection(
+                    card,
+                    "spread_gate",
+                    ["ENFORCE_SPREAD_GATE", "MAX_SPREAD_TO_STOP_RATIO"],
+                    round(spread_pct, 6),
+                    round(card.stop_distance_pct * max_ratio, 6),
+                    "Max Spread-to-Stop Ratio Gate",
+                )
+                return (
+                    False,
+                    f"Spread ({spread_pct*100:.2f}%) exceeds {max_ratio*100:.0f}% of planned stop loss ({card.stop_distance_pct*100:.2f}%), trade would be vulnerable to immediate spread-stop whipsaw",
                 )
 
-        from trading_system.config import settings
-        max_allowed_leverage = getattr(settings, "MAX_LEVERAGE", 5)
-        if card.leverage > max_allowed_leverage:
-            return False, f"Leverage {card.leverage}x exceeds maximum allowed cap of {max_allowed_leverage}x"
+        max_allowed_leverage = params["max_leverage"]
+        if card.leverage > max_allowed_leverage or (card.leverage >= 5 and not params["enable_5x_leverage"]):
+            cap = min(max_allowed_leverage, 3 if not params["enable_5x_leverage"] else max_allowed_leverage)
+            _append_card_rejection(
+                card,
+                "leverage_cap_gate",
+                ["MAX_LEVERAGE", "ENABLE_5X_LEVERAGE"],
+                card.leverage,
+                cap,
+                "Max Leverage Gate",
+            )
+            return False, f"Leverage {card.leverage}x exceeds maximum allowed cap of {cap}x"
 
         if card.position_notional > account_cash:
+            _append_card_rejection(
+                card,
+                "insufficient_capital_gate",
+                ["MAX_POSITION_PCT"],
+                round(card.position_notional, 2),
+                round(account_cash, 2),
+                "Free Cash Capital Check",
+            )
             return False, f"Insufficient free capital (${account_cash:.2f} < ${card.position_notional:.2f})"
 
-        if card.risk_pct_of_equity > self.max_risk_per_trade * 3.0:
+        max_risk_per_trade = params["max_risk_per_trade"]
+        if card.risk_pct_of_equity > max_risk_per_trade * 3.0:
+            _append_card_rejection(
+                card,
+                "risk_ceiling_gate",
+                ["MAX_RISK_PER_TRADE"],
+                round(card.risk_pct_of_equity, 6),
+                round(max_risk_per_trade * 3.0, 6),
+                "Max Risk Tolerance Gate",
+            )
             return False, "Risk exceeds maximum allowed by more than tolerance"
 
-        if card.stop_distance_pct < self.min_sl_pct:
+        if card.stop_distance_pct < params["min_sl_pct"]:
+            _append_card_rejection(
+                card,
+                "min_sl_gate",
+                ["MIN_SL_PCT"],
+                round(card.stop_distance_pct, 6),
+                params["min_sl_pct"],
+                "Min Stop Loss Distance",
+            )
             return False, "Stop distance percentage is below minimum allowed"
 
         # Check existing positions to avoid duplicate exposure
         for pos in existing_positions:
             pos_ticker = getattr(pos, "ticker", None)
             if pos_ticker == card.trading212_ticker or pos_ticker == card.ticker:
+                _append_card_rejection(
+                    card,
+                    "duplicate_position_gate",
+                    [],
+                    card.trading212_ticker,
+                    "unique",
+                    "Duplicate Position Gate",
+                )
                 return False, f"Already holding a position in {card.trading212_ticker}"
 
         # 3. Sector Concentration & Aggregate Beta Heat Limits
-        if self.enforce_correlation_limits:
+        if params["enforce_correlation_limits"]:
             from trading_system.data.leveraged_universe import LeveragedUniverse
             univ = LeveragedUniverse()
             candidate_sector = univ.get_category_for_symbol(card.ticker)
@@ -723,25 +1043,47 @@ class RiskManager:
                     pos_lev = 3 if any(k in pos_ticker for k in ("3l_EQ", "3Sl_EQ", "3L", "3S", "3US", "QQQ3", "3NVD", "3LTS", "AAP3", "MSF3")) else 1
                     total_active_beta_notional += (pos_notional * pos_lev)
 
-                if sector_count >= self.max_sector_positions:
-                    return False, f"Sector concentration limit reached for {candidate_sector} ({sector_count} >= {self.max_sector_positions})"
+                max_sector = params["max_sector_positions"]
+                if sector_count >= max_sector:
+                    _append_card_rejection(
+                        card,
+                        "correlation_gate",
+                        ["ENFORCE_CORRELATION_LIMITS", "MAX_SECTOR_POSITIONS"],
+                        sector_count,
+                        max_sector,
+                        "Sector Concentration Gate",
+                    )
+                    return False, f"Sector concentration limit reached for {candidate_sector} ({sector_count} >= {max_sector})"
 
             effective_equity = account_equity if (account_equity and account_equity > 0) else (account_cash + total_active_beta_notional / 3.0)
             if effective_equity > 0:
                 candidate_beta_notional = card.position_notional * card.leverage
                 new_total_beta_heat = (total_active_beta_notional + candidate_beta_notional) / effective_equity
-                if new_total_beta_heat > self.max_portfolio_beta_heat:
+                max_heat = params["max_portfolio_beta_heat"]
+                if new_total_beta_heat > max_heat:
+                    _append_card_rejection(
+                        card,
+                        "correlation_gate",
+                        ["ENFORCE_CORRELATION_LIMITS", "MAX_PORTFOLIO_BETA_HEAT"],
+                        round(new_total_beta_heat, 4),
+                        max_heat,
+                        "Portfolio Beta Heat Gate",
+                    )
                     return (
                         False,
-                        f"Aggregate portfolio beta heat ceiling exceeded ({new_total_beta_heat:.2f}x > {self.max_portfolio_beta_heat:.2f}x)",
+                        f"Aggregate portfolio beta heat ceiling exceeded ({new_total_beta_heat:.2f}x > {max_heat:.2f}x)",
                     )
 
         return True, "All checks passed"
 
-    def format_decision_card(self, card: DecisionCard) -> str:
+    def format_decision_card(
+        self,
+        card: DecisionCard,
+        config_snapshot: Optional[ConfigSnapshot] = None,
+    ) -> str:
         """Format the DecisionCard into a readable string block."""
-        from trading_system.config import settings
-        pure_tsl = getattr(settings, "PURE_TSL_MODE", True)
+        params = self._resolve_params(config_snapshot)
+        pure_tsl = params["pure_tsl_mode"]
         exit_line = (
             "Exit Protocol:   100% Pure Trailing Stop Loss (+1.5% BE, +3.0% Cushion, Dynamic ATR Trail)"
             if pure_tsl
