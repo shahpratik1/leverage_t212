@@ -8,24 +8,45 @@ and manually execute orders in any broker.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import asdict
+from datetime import datetime, timezone
+import errno
 import http.server
 import json
 import logging
+import math
 import os
+from pathlib import Path
+import queue
+import re
 import socket
 import socketserver
 import sys
+import tempfile
 import threading
 import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+import urllib.parse
 import webbrowser
-import queue
-from dataclasses import asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 from trading_system.agents.risk_manager import RiskManager
 from trading_system.config import settings
+from trading_system.config_bus import (
+    ConfigBus,
+    ConfigConflictError,
+    ConfigSnapshot,
+    ConfigValidationError,
+)
+from trading_system.config_schema import export_config_schema, get_builtin_profiles
+from trading_system.dashboard.auth import (
+    DashboardAuthManager,
+    is_sensitive_key,
+    is_valid_host_header,
+    is_valid_origin_header,
+    json_safe_for_inline_script,
+    scrub_error_message,
+)
 from trading_system.data.leveraged_universe import (
     CURATED_3X_PAIRS,
     GBX_TICKERS,
@@ -35,60 +56,186 @@ from trading_system.data.leveraged_universe import (
     get_ticker_currency,
 )
 from trading_system.data.trading212_client import Trading212Client
-from trading_system.execution.position_monitor import PositionMonitor
-from trading_system.notifications.notifier import Notifier
+from trading_system.execution.position_monitor import (
+    PositionEpochConflictError,
+    ResumeBlockedError,
+)
 
 logger = logging.getLogger(__name__)
+
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+STYLES_ASSET_PATH = ASSETS_DIR / "styles.css"
+WORKBENCH_ASSET_PATH = ASSETS_DIR / "workbench.js"
+MAX_REQUEST_BODY_BYTES = 131_072
+MAX_SSE_SUBSCRIBERS = 32
+DEFAULT_STREAM_HEARTBEAT_SECONDS = 10.0
+REQUEST_SOCKET_TIMEOUT_SECONDS = 5.0
+DEFAULT_CSP_HEADER = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'"
+)
+READ_ONLY_REASON_DEFAULT = (
+    "Standalone dashboard process has no attached Orchestrator controller (HTTP 503 on mutations)."
+)
+SENSITIVE_FILENAMES = {
+    ".env",
+    ".dashboard_token",
+    "active_trades.json",
+    "trades.jsonl",
+    "notifications.jsonl",
+    "config_overrides.json",
+    "dynamic_parameters.json",
+    "config_epochs.jsonl",
+    "audit_history.jsonl",
+    "funnel_state.json",
+}
+_SAFE_SSE_EVENT_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 
 
 class ThreadingDashboardServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     """Threaded TCP server allowing multiple concurrent long-lived SSE connections."""
+
     daemon_threads = True
     allow_reuse_address = True
+
+    def shutdown(self) -> None:
+        """Wake active SSE streams before shutting down the TCP accept loop."""
+        SSEBroadcaster.get_instance().close_all()
+        super().shutdown()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Suppress expected client disconnect noise while surfacing real errors."""
+        exc = sys.exc_info()[1]
+        if isinstance(
+            exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)
+        ):
+            return
+        super().handle_error(request, client_address)
 
 
 class SSEBroadcaster:
     """Thread-safe event broadcaster for Server-Sent Events (SSE)."""
+
     _instance: Optional[SSEBroadcaster] = None
+    _instance_lock = threading.Lock()
 
     def __init__(self) -> None:
         self._subscribers: List[queue.Queue] = []
+        self._drop_oldest_ids: Set[int] = set()
+        self._stream_ids: Set[int] = set()
         self._lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> SSEBroadcaster:
-        if cls._instance is None:
-            cls._instance = SSEBroadcaster()
-        return cls._instance
+        """Return the process-wide SSEBroadcaster singleton."""
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = SSEBroadcaster()
+            return cls._instance
 
-    def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=100)
+    def subscribe(self, drop_oldest: bool = False, maxsize: int = 100) -> queue.Queue:
+        """Register a subscriber queue; dead-queue pruning stays active unless ``drop_oldest=True``."""
+        q: queue.Queue = queue.Queue(maxsize=maxsize)
         with self._lock:
             self._subscribers.append(q)
+            if drop_oldest:
+                self._drop_oldest_ids.add(id(q))
+        return q
+
+    def subscribe_stream(
+        self,
+        max_subscribers: int = MAX_SSE_SUBSCRIBERS,
+        drop_oldest: bool = True,
+        maxsize: int = 64,
+    ) -> Optional[queue.Queue]:
+        """Acquire a capped HTTP SSE stream slot or return ``None`` when at capacity."""
+        q: queue.Queue = queue.Queue(maxsize=maxsize)
+        with self._lock:
+            if len(self._stream_ids) >= max_subscribers:
+                return None
+            self._subscribers.append(q)
+            self._stream_ids.add(id(q))
+            if drop_oldest:
+                self._drop_oldest_ids.add(id(q))
         return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
+        """Remove a subscriber queue cleanly."""
         with self._lock:
             if q in self._subscribers:
                 self._subscribers.remove(q)
+            q_id = id(q)
+            self._drop_oldest_ids.discard(q_id)
+            self._stream_ids.discard(q_id)
+
+    unsubscribe_stream = unsubscribe
+
+    def active_stream_count(self) -> int:
+        """Return current number of active HTTP SSE stream subscribers."""
+        with self._lock:
+            return len(self._stream_ids)
 
     def broadcast(self, event_type: str, data: Any) -> None:
+        """Broadcast an event payload to all subscribers, pruning or dropping oldest on backpressure."""
+        safe_event = _SAFE_SSE_EVENT_RE.sub("_", str(event_type or "message"))
         payload = {
-            "event": event_type,
+            "event": safe_event,
             "data": data,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         with self._lock:
-            dead = []
-            for q in self._subscribers:
-                try:
-                    q.put_nowait(payload)
-                except queue.Full:
-                    dead.append(q)
+            dead: List[queue.Queue] = []
+            for q in list(self._subscribers):
+                q_id = id(q)
+                if q_id in self._drop_oldest_ids:
+                    try:
+                        q.put_nowait(payload)
+                    except queue.Full:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            q.put_nowait(payload)
+                        except queue.Full:
+                            dead.append(q)
+                else:
+                    try:
+                        q.put_nowait(payload)
+                    except queue.Full:
+                        dead.append(q)
             for q in dead:
-                self._subscribers.remove(q)
+                if q in self._subscribers:
+                    self._subscribers.remove(q)
+                q_id = id(q)
+                self._drop_oldest_ids.discard(q_id)
+                self._stream_ids.discard(q_id)
 
     publish = broadcast
+
+    def close_all(self) -> None:
+        """Signal all active HTTP stream subscribers to exit cleanly during shutdown."""
+        with self._lock:
+            stream_queues = [q for q in self._subscribers if id(q) in self._stream_ids]
+            for q in stream_queues:
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        pass
+            self._subscribers = [q for q in self._subscribers if id(q) not in self._stream_ids]
+            self._drop_oldest_ids.difference_update(self._stream_ids)
+            self._stream_ids.clear()
 
 
 def load_active_signals(
@@ -467,95 +614,456 @@ def fetch_live_broker_notifications(
 
 _DASHBOARD_DATA_CACHE: Optional[Dict[str, Any]] = None
 _DASHBOARD_DATA_CACHE_TIME: float = 0.0
+_DASHBOARD_DATA_CACHE_STAMP: Optional[Tuple[Any, ...]] = None
 _DASHBOARD_DATA_LOCK = threading.Lock()
+# Explicit test injection hook ONLY — never auto-instantiated in production/standalone reads.
 _DASHBOARD_SHARED_CLIENT: Optional[Trading212Client] = None
 
 
-def build_dashboard_data(force: bool = False, client: Optional[Trading212Client] = None) -> Dict[str, Any]:
-    """Compile comprehensive dashboard dataset with fast TTL caching to avoid API rate limits."""
-    global _DASHBOARD_DATA_CACHE, _DASHBOARD_DATA_CACHE_TIME, _DASHBOARD_SHARED_CLIENT
+def _invalidate_dashboard_cache() -> None:
+    """Clear the cached standalone dashboard payload."""
+    global _DASHBOARD_DATA_CACHE, _DASHBOARD_DATA_CACHE_TIME, _DASHBOARD_DATA_CACHE_STAMP
+    with _DASHBOARD_DATA_LOCK:
+        _DASHBOARD_DATA_CACHE = None
+        _DASHBOARD_DATA_CACHE_TIME = 0.0
+        _DASHBOARD_DATA_CACHE_STAMP = None
+
+
+def _sanitize_mapping(value: Any) -> Any:
+    """Recursively strip sensitive config keys from JSON payloads."""
+    if isinstance(value, ConfigSnapshot):
+        value = value.to_dict(include_specs=True)
+    if isinstance(value, Mapping):
+        cleaned: Dict[str, Any] = {}
+        for k, v in value.items():
+            key_str = str(k)
+            if is_sensitive_key(key_str):
+                continue
+            cleaned[key_str] = _sanitize_mapping(v)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_mapping(item) for item in value]
+    return value
+
+
+def _read_json_file(path: Path, default: Any = None) -> Any:
+    """Safely load a JSON file from disk, returning ``default`` if missing or invalid."""
+    try:
+        if not path.is_file():
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return default
+
+
+def _read_jsonl_tail(path: Path, limit: int = 50) -> List[Dict[str, Any]]:
+    """Read up to ``limit`` most recent valid JSON objects from a JSONL file."""
+    if limit <= 0 or not path.is_file():
+        return []
+    rows: deque[Dict[str, Any]] = deque(maxlen=limit)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    rows.append(parsed)
+    except OSError:
+        return []
+    return list(rows)
+
+
+def _disk_cache_stamp(data_dir: Path) -> Tuple[Any, ...]:
+    """Compute a lightweight mtime/cwd stamp for read-only disk inputs."""
+    watched = [
+        Path(settings.ACTIVE_TRADES_PATH),
+        Path(settings.TRADES_LOG_PATH),
+        Path(settings.NOTIFICATIONS_LOG_PATH),
+        data_dir / "funnel_state.json",
+        data_dir / "audit_history.jsonl",
+        data_dir / "config_overrides.json",
+        data_dir / "dynamic_parameters.json",
+        data_dir / "config_epochs.jsonl",
+    ]
+    mtimes: List[Optional[int]] = []
+    for p in watched:
+        try:
+            st = p.stat()
+            mtimes.append(st.st_mtime_ns)
+        except OSError:
+            mtimes.append(None)
+    return (os.getcwd(), *mtimes)
+
+
+def _build_pairs_watchlist(universe: LeveragedUniverse) -> List[Dict[str, Any]]:
+    """Construct curated leveraged pairs watchlist metadata."""
+    return [
+        {
+            "underlying": p.underlying_symbol,
+            "name": p.name,
+            "category": p.category,
+            "long_ticker": p.long_3x_ticker,
+            "short_ticker": p.short_3x_ticker,
+            "long_currency": universe.get_ticker_currency(p.long_3x_ticker),
+            "short_currency": universe.get_ticker_currency(p.short_3x_ticker),
+            "has_5x": p.has_5x,
+            "long_5x_ticker": p.long_5x_ticker or "—",
+            "short_5x_ticker": p.short_5x_ticker or "—",
+            "long_5x_name": p.long_5x_name or "",
+            "short_5x_name": p.short_5x_name or "",
+            "currency": p.currency,
+        }
+        for p in CURATED_3X_PAIRS
+    ]
+
+
+def _compute_eur_ratio(
+    active_signals: Sequence[Mapping[str, Any]],
+    pairs_watchlist: Sequence[Mapping[str, Any]],
+) -> str:
+    """Compute percentage of EUR-denominated instruments dynamically without placeholders."""
+    if active_signals:
+        eur_count = sum(
+            1
+            for s in active_signals
+            if str(s.get("currency_code") or s.get("currency") or "").upper() == "EUR"
+        )
+        pct = round((eur_count / len(active_signals)) * 100)
+        return f"{pct}% EUR"
+    if pairs_watchlist:
+        eur_count = sum(
+            1
+            for p in pairs_watchlist
+            if str(p.get("long_currency") or p.get("currency") or "").upper() == "EUR"
+        )
+        pct = round((eur_count / len(pairs_watchlist)) * 100)
+        return f"{pct}% EUR"
+    return "0% EUR"
+
+
+def _enrich_active_signals_from_raw_state(
+    signals: List[Dict[str, Any]],
+    raw_state: Any,
+) -> List[Dict[str, Any]]:
+    """Attach U1-U4 epoch and panic/protection metadata preserved on disk to active signal cards."""
+    if not isinstance(raw_state, Mapping):
+        return signals
+    passthrough_keys = (
+        "config_epoch_id",
+        "panic_failed",
+        "unprotected_reason",
+        "broker_stop_order_id",
+        "is_tsl_active",
+        "initial_stop_loss",
+        "entry_config_snapshot",
+    )
+    for sig in signals:
+        ticker = str(sig.get("ticker") or "")
+        raw_entry = raw_state.get(ticker)
+        if not isinstance(raw_entry, Mapping):
+            continue
+        for key in passthrough_keys:
+            if key in raw_entry and key not in sig:
+                val = raw_entry[key]
+                sig[key] = _sanitize_mapping(val) if key == "entry_config_snapshot" else val
+        if sig.get("panic_failed"):
+            sig["unprotected"] = True
+    return signals
+
+
+def _load_read_only_config_bundle(data_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Load effective configuration, schema, presets, and epoch history strictly read-only."""
+    resolved_dir = data_dir or Path("data")
+    try:
+        bus = ConfigBus(data_dir=resolved_dir)
+        snapshot_dict = _sanitize_mapping(bus.active_snapshot().to_dict(include_specs=True))
+        schema = _sanitize_mapping(bus.get_schema())
+        epoch_history = list(reversed(bus.epoch_history(limit=50)))
+        epoch_id = bus.active_epoch_id
+        pending_restart_keys = list(snapshot_dict.get("pending_restart_keys") or [])
+        quarantine_warnings = list(bus.get_quarantine_warnings())
+    except Exception as exc:
+        logger.debug("Falling back to default read-only schema bundle: %s", exc)
+        fallback_snap = ConfigSnapshot.from_dict(
+            {"config_epoch_id": "epoch-0"},
+            dynamic_specs=(),
+        )
+        snapshot_dict = _sanitize_mapping(fallback_snap.to_dict(include_specs=True))
+        schema = _sanitize_mapping(export_config_schema())
+        epoch_history = []
+        epoch_id = "epoch-0"
+        pending_restart_keys = []
+        quarantine_warnings = []
+
+    return {
+        "config_epoch_id": epoch_id,
+        "config": snapshot_dict,
+        "schema": schema,
+        "presets": _sanitize_mapping(get_builtin_profiles()),
+        "epoch_history": epoch_history,
+        "pending_restart_keys": pending_restart_keys,
+        "config_quarantine_warnings": quarantine_warnings,
+    }
+
+
+def _load_funnel_and_audit(data_dir: Optional[Path] = None) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """Read persisted screening funnel and strategy improvement audit history from disk."""
+    resolved_dir = data_dir or Path("data")
+    funnel_raw = _read_json_file(resolved_dir / "funnel_state.json", default=None)
+    if not isinstance(funnel_raw, dict):
+        funnel: Dict[str, Any] = {
+            "timestamp": "",
+            "config_epoch_id": None,
+            "stage_counts": {
+                "universe": 0,
+                "screened": 0,
+                "strategy": 0,
+                "debate": 0,
+                "gates": 0,
+                "executed": 0,
+            },
+            "gate_breakdown": [],
+            "_compact_indicators": {},
+            "metric_percentiles": {},
+            "passed_tickers": [],
+            "executed_tickers": [],
+        }
+    else:
+        funnel = dict(funnel_raw)
+
+    audit_rows = _read_jsonl_tail(resolved_dir / "audit_history.jsonl", limit=30)
+    audit_desc = list(reversed(audit_rows))
+    audit_obj = {
+        "latest": audit_desc[0] if audit_desc else None,
+        "history": audit_desc,
+    }
+    return funnel, audit_obj, audit_desc
+
+
+def _normalize_dashboard_snapshot(
+    raw: Mapping[str, Any],
+    *,
+    orchestrator: Optional[Any] = None,
+    active_client: Optional[Trading212Client] = None,
+) -> Dict[str, Any]:
+    """Normalize orchestrator or disk-built snapshot into the full workbench JSON contract."""
+    snap = dict(raw)
+    controller_attached = orchestrator is not None
+    snap.setdefault("generated_at", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+    snap["controller_attached"] = bool(snap.get("controller_attached", controller_attached))
+    if snap["controller_attached"]:
+        snap["read_only_reason"] = str(snap.get("read_only_reason") or "")
+    else:
+        snap["read_only_reason"] = str(snap.get("read_only_reason") or READ_ONLY_REASON_DEFAULT)
+
+    use_live = bool(getattr(settings, "USE_LIVE", False))
+    snap.setdefault("mode", "LIVE" if use_live else "DEMO")
+
+    active_signals = list(snap.get("active_signals") or [])
+    snap["active_signals"] = active_signals
+    snap["active_signals_count"] = int(snap.get("active_signals_count", len(active_signals)))
+    snap.setdefault("recent_notifications", [])
+    snap.setdefault("history", [])
+
+    universe = LeveragedUniverse()
+    if not snap.get("pairs_watchlist"):
+        snap["pairs_watchlist"] = _build_pairs_watchlist(universe)
+
+    equity_series = snap.get("equity_points") or snap.get("equity_history") or []
+    snap["equity_points"] = list(equity_series)
+    snap["equity_history"] = list(equity_series)
+
+    default_equity = float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0) or 10000.0)
+    if snap.get("base_equity") is None:
+        snap["base_equity"] = default_equity
+    if snap.get("starting_equity") is None:
+        snap["starting_equity"] = snap["base_equity"]
+    if snap.get("current_equity") is None:
+        snap["current_equity"] = snap["base_equity"]
+
+    if "rate_limit_telemetry" not in snap or not isinstance(snap.get("rate_limit_telemetry"), Mapping):
+        if active_client is not None and hasattr(active_client, "get_rate_limit_telemetry"):
+            try:
+                snap["rate_limit_telemetry"] = active_client.get_rate_limit_telemetry()
+            except Exception:
+                snap["rate_limit_telemetry"] = Trading212Client.get_rate_limit_telemetry()
+        else:
+            snap["rate_limit_telemetry"] = Trading212Client.get_rate_limit_telemetry()
+
+    if (
+        "config" not in snap
+        or "schema" not in snap
+        or "presets" not in snap
+        or "config_epoch_id" not in snap
+    ):
+        config_bus = getattr(orchestrator, "config_bus", None) if orchestrator is not None else None
+        if config_bus is not None:
+            try:
+                cfg_dict = _sanitize_mapping(config_bus.active_snapshot().to_dict(include_specs=True))
+                snap.setdefault("config_epoch_id", config_bus.active_epoch_id)
+                snap.setdefault("config", cfg_dict)
+                snap.setdefault("schema", _sanitize_mapping(config_bus.get_schema()))
+                snap.setdefault("presets", _sanitize_mapping(get_builtin_profiles()))
+                snap.setdefault("epoch_history", list(reversed(config_bus.epoch_history(limit=50))))
+                snap.setdefault(
+                    "pending_restart_keys",
+                    list(cfg_dict.get("pending_restart_keys") or []),
+                )
+                snap.setdefault(
+                    "config_quarantine_warnings",
+                    list(config_bus.get_quarantine_warnings()),
+                )
+            except Exception as exc:
+                logger.debug("Failed to augment snapshot from orchestrator.config_bus: %s", exc)
+        if "config" not in snap or "schema" not in snap or "presets" not in snap:
+            disk_cfg = _load_read_only_config_bundle()
+            for k, v in disk_cfg.items():
+                snap.setdefault(k, v)
+
+    snap["config"] = _sanitize_mapping(snap.get("config") or {})
+    snap["schema"] = _sanitize_mapping(snap.get("schema") or {})
+    snap["presets"] = _sanitize_mapping(snap.get("presets") or get_builtin_profiles())
+    snap.setdefault("epoch_history", [])
+    snap.setdefault("pending_restart_keys", list(snap["config"].get("pending_restart_keys") or []))
+    snap.setdefault(
+        "config_quarantine_warnings",
+        list(snap["config"].get("config_quarantine_warnings") or []),
+    )
+
+    if "funnel" not in snap or "audit" not in snap or "audit_history" not in snap:
+        funnel_disk, audit_disk, audit_hist_disk = _load_funnel_and_audit()
+        snap.setdefault("funnel", funnel_disk)
+        snap.setdefault("audit", audit_disk)
+        snap.setdefault("audit_history", audit_hist_disk)
+
+    halted = bool(snap.get("is_halted") or snap.get("system_halted"))
+    snap["is_halted"] = halted
+    snap["system_halted"] = halted
+    snap.setdefault("halt_reason", "")
+
+    if not isinstance(snap.get("broker_status"), Mapping):
+        snap["broker_status"] = {}
+    else:
+        snap["broker_status"] = dict(snap["broker_status"])
+
+    bs = snap["broker_status"]
+    bs.setdefault("broker_name", "Trading 212 (Live)" if use_live else "Trading 212 (Demo)")
+    bs.setdefault("is_connected", bool(controller_attached or active_client is not None))
+    bs.setdefault(
+        "active_server_stops",
+        sum(1 for s in active_signals if s.get("broker_stop_order_id")),
+    )
+    bs.setdefault("active_positions_count", len(active_signals))
+    active_strategy = str((snap["config"] or {}).get("ACTIVE_STRATEGY") or "S3 Dual-Core")
+    pure_tsl = bool((snap["config"] or {}).get("PURE_TSL_MODE", True))
+    bs.setdefault(
+        "execution_mode",
+        f"{active_strategy} ({'Pure TSL' if pure_tsl else 'Standard TP/SL'})",
+    )
+    bs.setdefault("runner_status", "ONLINE (Controller)" if controller_attached else "READ-ONLY")
+    bs.setdefault("monitored_assets", len(CURATED_3X_PAIRS))
+    bs.setdefault("eur_ratio", _compute_eur_ratio(active_signals, snap["pairs_watchlist"]))
+    return snap
+
+
+def build_dashboard_data(
+    force: bool = False,
+    client: Optional[Trading212Client] = None,
+    orchestrator: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Compile dashboard payload from attached Orchestrator, explicit test client, or read-only disk state."""
+    global _DASHBOARD_DATA_CACHE, _DASHBOARD_DATA_CACHE_TIME, _DASHBOARD_DATA_CACHE_STAMP
+
+    active_client = client if client is not None else _DASHBOARD_SHARED_CLIENT
+
+    if orchestrator is not None:
+        raw_snapshot = orchestrator.get_dashboard_snapshot()
+        return _normalize_dashboard_snapshot(
+            raw_snapshot, orchestrator=orchestrator, active_client=active_client
+        )
+
+    data_dir = Path("data")
     now = time.time()
-    if not force and client is None and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
-        return _DASHBOARD_DATA_CACHE
+    stamp = _disk_cache_stamp(data_dir)
+    if not force and active_client is None:
+        with _DASHBOARD_DATA_LOCK:
+            if (
+                _DASHBOARD_DATA_CACHE is not None
+                and _DASHBOARD_DATA_CACHE_STAMP == stamp
+                and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5
+            ):
+                return dict(_DASHBOARD_DATA_CACHE)
 
     with _DASHBOARD_DATA_LOCK:
-        if not force and client is None and _DASHBOARD_DATA_CACHE is not None and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5:
-            return _DASHBOARD_DATA_CACHE
+        now = time.time()
+        if (
+            not force
+            and active_client is None
+            and _DASHBOARD_DATA_CACHE is not None
+            and _DASHBOARD_DATA_CACHE_STAMP == stamp
+            and (now - _DASHBOARD_DATA_CACHE_TIME) < 2.5
+        ):
+            return dict(_DASHBOARD_DATA_CACHE)
 
         universe = LeveragedUniverse()
-        pairs = [
-            {
-                "underlying": p.underlying_symbol,
-                "name": p.name,
-                "category": p.category,
-                "long_ticker": p.long_3x_ticker,
-                "short_ticker": p.short_3x_ticker,
-                "long_currency": universe.get_ticker_currency(p.long_3x_ticker),
-                "short_currency": universe.get_ticker_currency(p.short_3x_ticker),
-                "has_5x": p.has_5x,
-                "long_5x_ticker": p.long_5x_ticker or "—",
-                "short_5x_ticker": p.short_5x_ticker or "—",
-                "long_5x_name": p.long_5x_name or "",
-                "short_5x_name": p.short_5x_name or "",
-                "currency": p.currency,
-            }
-            for p in CURATED_3X_PAIRS
-        ]
+        pairs = _build_pairs_watchlist(universe)
 
         portfolio_prices: Dict[str, float] = {}
         broker_positions_map: Optional[Dict[str, Any]] = None
         live_server_stops_count: Optional[int] = None
-        active_client = client
-
-        if active_client is None and settings.TRADING212_API_KEY:
-            try:
-                if _DASHBOARD_SHARED_CLIENT is None:
-                    _DASHBOARD_SHARED_CLIENT = Trading212Client(
-                        api_key=settings.TRADING212_API_KEY,
-                        api_secret=settings.TRADING212_API_SECRET,
-                        base_url=settings.api_base_url,
-                    )
-                active_client = _DASHBOARD_SHARED_CLIENT
-            except Exception as exc:
-                logger.debug("Failed to initialize Trading212Client for dashboard: %s", exc)
-
         live_account_cash_total: Optional[float] = None
+
+        # Only query broker client if explicitly passed or explicitly test-patched via _DASHBOARD_SHARED_CLIENT.
         if active_client is not None:
             try:
                 cash = active_client.get_account_cash()
-                if cash is not None and getattr(cash, "total", 0.0) > 0:
-                    live_account_cash_total = float(cash.total)
+                total_val = getattr(cash, "total", None) if cash is not None else None
+                if isinstance(total_val, (int, float)) and not isinstance(total_val, bool):
+                    live_account_cash_total = float(total_val)
             except Exception as cash_exc:
-                logger.debug("Failed to query live account cash for dashboard: %s", cash_exc)
+                logger.debug("Failed to query injected client account cash: %s", cash_exc)
 
             try:
                 portfolio = active_client.get_portfolio(force_refresh=False)
-                broker_positions_map = {p.ticker: p for p in portfolio if getattr(p, "quantity", 0.0) > 0}
-                for p in portfolio:
+                broker_positions_map = {
+                    p.ticker: p for p in (portfolio or []) if getattr(p, "quantity", 0.0) > 0
+                }
+                for p in portfolio or []:
                     if getattr(p, "current_price", 0.0) > 0:
                         portfolio_prices[p.ticker] = p.current_price
 
                 try:
                     open_orders = active_client.get_orders(force_refresh=False)
                     live_server_stops_count = sum(
-                        1 for o in open_orders
-                        if "STOP" in str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()
+                        1
+                        for o in (open_orders or [])
+                        if "STOP"
+                        in str(
+                            o.get("type") if isinstance(o, dict) else getattr(o, "type", "")
+                        ).upper()
                     )
                 except Exception as ord_exc:
-                    logger.debug("Failed to fetch live open orders count: %s", ord_exc)
+                    logger.debug("Failed to fetch injected client open orders: %s", ord_exc)
             except Exception as exc:
-                logger.debug("Failed to fetch live portfolio prices for dashboard: %s", exc)
+                logger.debug("Failed to fetch injected client portfolio prices: %s", exc)
 
-        # 1. Load active signals, strictly ignoring closed or zero-quantity positions
-        active_signals = load_active_signals(settings.ACTIVE_TRADES_PATH, live_prices=portfolio_prices)
+        # 1. Read active signals from local disk strictly read-only (ZERO writes to active_trades.json).
+        raw_trades_state = _read_json_file(Path(settings.ACTIVE_TRADES_PATH), default={})
+        active_signals = load_active_signals(
+            settings.ACTIVE_TRADES_PATH, live_prices=portfolio_prices, universe=universe
+        )
+        active_signals = _enrich_active_signals_from_raw_state(active_signals, raw_trades_state)
 
-        # 2. Reconcile with live broker portfolio as absolute ground truth
+        # 2. In-memory reconciliation when an explicit client was injected
         if broker_positions_map is not None:
             live_broker_tickers = set(broker_positions_map.keys())
-            # Filter out phantom/closed local signals that no longer exist on broker
             active_signals = [s for s in active_signals if s.get("ticker") in live_broker_tickers]
-
-            # Sync PnL in EUR directly from authoritative broker position
             for s in active_signals:
                 tk = s.get("ticker")
                 if tk in broker_positions_map:
@@ -563,54 +1071,60 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                     if getattr(bp_obj, "ppl", None) is not None:
                         s["pnl_amount_eur"] = round(float(bp_obj.ppl), 2)
 
-            # Clean up closed positions in active_trades.json so they don't linger on disk
-            try:
-                if os.path.exists(settings.ACTIVE_TRADES_PATH):
-                    with open(settings.ACTIVE_TRADES_PATH, "r", encoding="utf-8") as f:
-                        trades_data = json.load(f)
-                    changed = False
-                    for tk, p_entry in list(trades_data.items()):
-                        if tk not in live_broker_tickers and not p_entry.get("is_closed", False):
-                            p_entry["is_closed"] = True
-                            p_entry["remaining_quantity"] = 0.0
-                            changed = True
-                    if changed:
-                        with open(settings.ACTIVE_TRADES_PATH, "w", encoding="utf-8") as f:
-                            json.dump(trades_data, f, indent=2)
-            except Exception as clean_exc:
-                logger.debug("Failed to prune closed trades from active_trades.json: %s", clean_exc)
-
-            # Adopt any broker positions not yet tracked in active_signals
             known_tickers = {s.get("ticker") for s in active_signals}
             for b_ticker, bp in broker_positions_map.items():
-                if b_ticker not in known_tickers:
-                    pair = universe.get_pair_for_etp(b_ticker)
-                    underlying = pair.underlying_symbol if pair else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
-                    underlying_name = pair.name if pair else underlying
-                    direction = universe.get_etp_direction(b_ticker) if universe else get_etp_direction(b_ticker)
-                    avg_px = bp.average_price if bp.average_price > 0 else (bp.current_price if bp.current_price > 0 else 100.0)
-                    cur_px = bp.current_price if bp.current_price > 0 else avg_px
-                    sl_dist = round(avg_px * 0.05, 2)
-                    # All spot ETPs on Trading 212 are held long, so SL is below entry and TP is above entry
-                    sl = round(max(0.01, avg_px - sl_dist), 2)
-                    pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 else 0.0
-                    pnl_amount = round((cur_px - avg_px) * bp.quantity, 2)
-                    pnl_amount_eur = round(float(getattr(bp, "ppl", 0.0) or 0.0), 2)
+                if b_ticker in known_tickers:
+                    continue
+                pair = universe.get_pair_for_etp(b_ticker)
+                underlying = (
+                    pair.underlying_symbol
+                    if pair
+                    else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
+                )
+                underlying_name = pair.name if pair else underlying
+                direction = (
+                    universe.get_etp_direction(b_ticker)
+                    if universe
+                    else get_etp_direction(b_ticker)
+                )
+                avg_px = (
+                    bp.average_price
+                    if getattr(bp, "average_price", 0.0) > 0
+                    else (bp.current_price if getattr(bp, "current_price", 0.0) > 0 else 100.0)
+                )
+                cur_px = bp.current_price if getattr(bp, "current_price", 0.0) > 0 else avg_px
+                sl_dist = round(avg_px * 0.05, 2)
+                sl = round(max(0.01, avg_px - sl_dist), 2)
+                pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 else 0.0
+                pnl_amount = round((cur_px - avg_px) * bp.quantity, 2)
+                pnl_amount_eur = round(float(getattr(bp, "ppl", 0.0) or 0.0), 2)
 
-                    curr = universe.get_ticker_currency(b_ticker) if universe else get_ticker_currency(b_ticker)
-                    currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
+                curr = universe.get_ticker_currency(b_ticker) if universe else get_ticker_currency(b_ticker)
+                currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
 
-                    active_signals.append({
+                active_signals.append(
+                    {
                         "ticker": b_ticker,
                         "underlying": underlying,
                         "name": underlying_name,
                         "direction": direction,
                         "leverage": 5 if ("5" in b_ticker) else 3,
                         "strategy_type": "broker_placed",
-                        "rsi3": None, "rsi7": None, "rsi14": None, "sma5": None,
-                        "win_rate_exp": "85%",
-                        "overnight_status": "REQUIRES BREAKEVEN OR FLATTENS 16:20 UTC" if direction == "LONG" else "INTRADAY SHORT (Flattens 16:20 UTC / Winter Time)",
-                        "overnight_badge_class": "bg-sky-500/10 text-sky-300 border-sky-500/30" if direction == "LONG" else "bg-rose-500/10 text-rose-300 border-rose-500/30",
+                        "rsi3": None,
+                        "rsi7": None,
+                        "rsi14": None,
+                        "sma5": None,
+                        "win_rate_exp": "",
+                        "overnight_status": (
+                            "REQUIRES BREAKEVEN OR FLATTENS 16:20 UTC"
+                            if direction == "LONG"
+                            else "INTRADAY SHORT (Flattens 16:20 UTC / Winter Time)"
+                        ),
+                        "overnight_badge_class": (
+                            "bg-sky-500/10 text-sky-300 border-sky-500/30"
+                            if direction == "LONG"
+                            else "bg-rose-500/10 text-rose-300 border-rose-500/30"
+                        ),
                         "earnings_in_days": None,
                         "entry_price": round(avg_px, 2),
                         "current_price": round(cur_px, 2),
@@ -622,7 +1136,9 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                         "currency_suffix": currency_suffix,
                         "stop_loss": sl,
                         "trailing_stop_loss": sl,
-                        "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2) if avg_px > 0 else 5.0,
+                        "stop_distance_pct": round(abs(avg_px - sl) / avg_px * 100, 2)
+                        if avg_px > 0
+                        else 5.0,
                         "broker_stop_order_id": None,
                         "quantity": bp.quantity,
                         "remaining_quantity": bp.quantity,
@@ -630,16 +1146,16 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                         "entry_time": datetime.now(timezone.utc).isoformat(),
                         "atr": round(avg_px * 0.025, 2),
                         "copy_text": f"ADOPTED: {b_ticker} ({underlying}) Qty: {bp.quantity}",
-                    })
+                    }
+                )
 
         history = load_recent_history(settings.TRADES_LOG_PATH)
         recent_notifications = load_recent_notifications(
             settings.NOTIFICATIONS_LOG_PATH, limit=30, universe=universe
         )
 
-        # Merge live broker order executions from Trading 212
-        if client is not None:
-            broker_events = fetch_live_broker_notifications(client, universe, limit=25)
+        if active_client is not None:
+            broker_events = fetch_live_broker_notifications(active_client, universe, limit=25)
             if broker_events:
                 seen_orders = set()
                 merged_events = []
@@ -658,19 +1174,20 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
                         if auth_dir:
                             n["direction"] = auth_dir
                     merged_events.append(n)
-                # Sort chronologically descending
                 merged_events.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
                 recent_notifications = merged_events[:30]
 
-        active_stops = live_server_stops_count if live_server_stops_count is not None else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
+        active_stops = (
+            live_server_stops_count
+            if live_server_stops_count is not None
+            else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
+        )
 
-        # Construct session equity curve from trade history and current open P&L
-        if live_account_cash_total is not None and live_account_cash_total > 0:
+        if live_account_cash_total is not None:
             base_equity = round(live_account_cash_total, 2)
-            live_equity = round(live_account_cash_total, 2)
         else:
-            base_equity = float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 4923.05) or 4923.05)
-            live_equity = base_equity
+            default_eq = float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0) or 10000.0)
+            base_equity = round(default_eq, 2)
 
         equity_points = [{"time": "Start", "equity": base_equity}]
         running_equity = base_equity
@@ -682,7 +1199,9 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
             t_str = str(ev.get("timestamp") or "")[-12:-4] or "Trade"
             equity_points.append({"time": t_str, "equity": round(running_equity, 2)})
 
-        total_open_pnl = sum(float(s.get("pnl_amount_eur", s.get("pnl_amount", 0.0)) or 0.0) for s in active_signals)
+        total_open_pnl = sum(
+            float(s.get("pnl_amount_eur", s.get("pnl_amount", 0.0)) or 0.0) for s in active_signals
+        )
         if live_account_cash_total is not None and live_account_cash_total > 0:
             live_equity = round(live_account_cash_total + total_open_pnl, 2)
         else:
@@ -691,9 +1210,28 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
         now_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
         equity_points.append({"time": now_time, "equity": live_equity})
 
-        res = {
+        config_bundle = _load_read_only_config_bundle(data_dir)
+        funnel_data, audit_obj, audit_desc = _load_funnel_and_audit(data_dir)
+        use_live = bool(getattr(settings, "USE_LIVE", False))
+        cfg_values = config_bundle["config"]
+        active_strategy = str(cfg_values.get("ACTIVE_STRATEGY") or "S3 Dual-Core")
+        pure_tsl = bool(cfg_values.get("PURE_TSL_MODE", True))
+
+        is_halted = any(bool(s.get("panic_failed")) for s in active_signals)
+        halt_reason = (
+            "Panic liquidation failure detected in persisted position state."
+            if is_halted
+            else ""
+        )
+
+        res: Dict[str, Any] = {
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "mode": "MANUAL_SIGNALS_MODE",
+            "mode": "LIVE" if use_live else "DEMO",
+            "controller_attached": False,
+            "read_only_reason": READ_ONLY_REASON_DEFAULT,
+            "is_halted": is_halted,
+            "system_halted": is_halted,
+            "halt_reason": halt_reason,
             "active_signals_count": len(active_signals),
             "active_signals": active_signals,
             "recent_notifications": recent_notifications,
@@ -704,1180 +1242,1144 @@ def build_dashboard_data(force: bool = False, client: Optional[Trading212Client]
             "base_equity": base_equity,
             "starting_equity": base_equity,
             "current_equity": live_equity,
+            "rate_limit_telemetry": (
+                active_client.get_rate_limit_telemetry()
+                if active_client is not None and hasattr(active_client, "get_rate_limit_telemetry")
+                else Trading212Client.get_rate_limit_telemetry()
+            ),
+            "funnel": funnel_data,
+            "audit": audit_obj,
+            "audit_history": audit_desc,
             "broker_status": {
-                "broker_name": "Trading 212 Demo",
-                "is_connected": True,
+                "broker_name": "Trading 212 (Live)" if use_live else "Trading 212 (Demo)",
+                "is_connected": active_client is not None,
                 "active_server_stops": active_stops,
                 "active_positions_count": len(active_signals),
-                "execution_mode": "System 2 Pure TSL (Native GTC Stop + Algorithmic Trail)",
-                "runner_status": "ONLINE (24/7 Raspberry Pi)",
+                "execution_mode": (
+                    f"{active_strategy} ({'Pure TSL' if pure_tsl else 'Standard TP/SL'})"
+                ),
+                "runner_status": "READ-ONLY (Disk Snapshot)",
                 "monitored_assets": len(CURATED_3X_PAIRS),
-                "eur_ratio": "82%",
+                "eur_ratio": _compute_eur_ratio(active_signals, pairs),
             },
+            **config_bundle,
         }
-        _DASHBOARD_DATA_CACHE = res
-        _DASHBOARD_DATA_CACHE_TIME = time.time()
+        if active_client is None:
+            _DASHBOARD_DATA_CACHE = res
+            _DASHBOARD_DATA_CACHE_TIME = time.time()
+            _DASHBOARD_DATA_CACHE_STAMP = stamp
         return res
 
 
-def generate_html_dashboard(output_path: str) -> str:
-    """Render self-contained HTML dashboard with Tailwind and interactive controls."""
-    data = build_dashboard_data()
-    data_json = json.dumps(data)
+def _load_bundled_assets() -> Tuple[str, str]:
+    """Read packaged CSS and JS workbench assets from disk."""
+    css_text = STYLES_ASSET_PATH.read_text(encoding="utf-8") if STYLES_ASSET_PATH.is_file() else ""
+    js_text = WORKBENCH_ASSET_PATH.read_text(encoding="utf-8") if WORKBENCH_ASSET_PATH.is_file() else ""
+    safe_css = re.sub(r"</style", r"\\3c/style", css_text, flags=re.IGNORECASE)
+    safe_js = re.sub(r"</script", r"<\\/script", js_text, flags=re.IGNORECASE)
+    return safe_css, safe_js
 
-    html_content = f"""<!DOCTYPE html>
+
+def _render_dashboard_html_string(data: Mapping[str, Any]) -> str:
+    """Render self-hosted single-file HTML bundle with inline CSS, INITIAL_DATA, and workbench.js."""
+    sanitized = _sanitize_mapping(data)
+    safe_json = json_safe_for_inline_script(sanitized)
+    safe_css, safe_js = _load_bundled_assets()
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Trading 212 3x Quantitative Engine — Live Dashboard</title>
-  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <title>Trading 212 Leveraged Quantitative Engine — Control Workbench</title>
   <style>
-    @keyframes pulse-slow {{
-      0%, 100% {{ opacity: 1; }}
-      50% {{ opacity: 0.4; }}
-    }}
-    .animate-pulse-slow {{
-      animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }}
+{safe_css}
   </style>
 </head>
-<body class="bg-slate-950 text-slate-100 antialiased font-sans min-h-screen p-4 sm:p-6 lg:p-8">
-
-  <!-- Header -->
-  <header class="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4 border-b border-slate-800 pb-6">
-    <div>
-      <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-        <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></span>
-          🟢 24/7 RUNNER ACTIVE
-        </span>
-        <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-          <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
-          Trading 212 Demo Connected
-        </span>
-        <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-mono">
-          🛡️ <span id="header-stops-count">{data['broker_status']['active_server_stops']}</span> Native Stops Active
-        </span>
-        <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-sky-500/10 text-sky-300 border border-sky-500/20 font-mono">
-          120 Assets (84% EUR)
-        </span>
-        <span id="sync-pill" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          LIVE AUTO-SYNC (3s)
-        </span>
-      </div>
-      <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-white mt-2">
-        Trading 212 Leveraged Quantitative Engine
-      </h1>
-      <p class="text-slate-400 text-sm mt-1">
-        Connors 3-RSI Mean Reversion & Trend Momentum setups with crash-resilient native server stops.
-      </p>
-    </div>
-
-    <div class="flex flex-wrap items-center gap-3">
-      <button id="refresh-btn" onclick="fetchLiveData(true)" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition shadow-sm">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-        <span id="refresh-btn-text">Refresh Now</span>
-      </button>
-      <button onclick="panicFlatten()" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold transition shadow-sm border border-rose-400/30">
-        🚨 Emergency Panic Flatten
-      </button>
-      <div class="text-right text-xs text-slate-500 hidden sm:block">
-        <div>Last Synced:</div>
-        <div id="timestamp-text" class="text-slate-300 font-mono font-bold">{data['generated_at']}</div>
-      </div>
-    </div>
-  </header>
-
-  <!-- Metric Summary Badges -->
-  <div class="max-w-7xl mx-auto grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Active Positions</div>
-      <div id="metric-active" class="text-2xl font-bold text-white mt-1">{data['active_signals_count']} Open Trades</div>
-      <div class="text-xs text-emerald-400 mt-1">Live in Trading 212</div>
-    </div>
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Native Broker Stops</div>
-      <div id="metric-stops" class="text-2xl font-bold text-emerald-400 mt-1">{data['broker_status']['active_server_stops']} Active</div>
-      <div class="text-xs text-slate-400 mt-1">T212 Server-Side GTC</div>
-    </div>
-    <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-      <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Exit Engine</div>
-      <div class="text-2xl font-bold text-white mt-1">100% Pure TSL</div>
-      <div class="text-xs text-emerald-400 mt-1">🛡️ Native T212 Server GTC Ratchet</div>
-    </div>
-    <div class="bg-slate-900/80 border border-amber-500/30 rounded-xl p-4 relative overflow-hidden">
-      <div class="text-xs text-amber-400 uppercase tracking-wider font-semibold flex items-center justify-between">
-        <span>16:20 UTC Gap Cutoff</span>
-        <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-      </div>
-      <div id="cutoff-countdown" class="text-2xl font-bold text-amber-300 font-mono mt-1">--:--:--</div>
-      <div class="text-xs text-slate-400 mt-1">Intraday Risk Evacuation</div>
-    </div>
+<body>
+  <div id="workbench-app" class="wb-app-shell">
+    <noscript>JavaScript is required to run the Trading 212 Control Workbench.</noscript>
   </div>
-
-  <!-- Live Equity Trajectory Sparkline Card -->
-  <div class="max-w-7xl mx-auto mb-8 bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg">
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
-      <div>
-        <div class="text-xs text-slate-400 uppercase tracking-wider font-semibold flex items-center gap-2">
-          <span>📈 Portfolio Equity Curve &amp; Session Trajectory</span>
-          <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Live Closed + MTM</span>
-        </div>
-        <div class="flex items-baseline gap-3 mt-1">
-          <span id="equity-val-current" class="text-2xl sm:text-3xl font-black text-white font-mono">€{data.get('current_equity', 4923.05):.2f}</span>
-          <span id="equity-val-delta" class="text-sm font-bold text-slate-400 font-mono">+0.00 (+0.00%)</span>
-        </div>
-      </div>
-      <div class="flex flex-wrap items-center gap-4 text-xs font-mono text-slate-400">
-        <div>Session Start: <span id="equity-val-start" class="text-slate-200 font-bold">€{data.get('base_equity', 4923.05):,.2f}</span></div>
-        <div>Session High: <span id="equity-val-high" class="text-emerald-300 font-bold">—</span></div>
-        <div>Session Low: <span id="equity-val-low" class="text-rose-300 font-bold">—</span></div>
-      </div>
-    </div>
-    <div class="w-full h-24 sm:h-28 relative pt-2">
-      <svg id="equity-chart-svg" class="w-full h-full overflow-visible" preserveAspectRatio="none" viewBox="0 0 800 100">
-        <defs>
-          <linearGradient id="equity-gradient-emerald" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#10b981" stop-opacity="0.35" />
-            <stop offset="100%" stop-color="#10b981" stop-opacity="0.0" />
-          </linearGradient>
-          <linearGradient id="equity-gradient-rose" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#f43f5e" stop-opacity="0.35" />
-            <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.0" />
-          </linearGradient>
-        </defs>
-        <g id="equity-chart-group"></g>
-      </svg>
-    </div>
-  </div>
-
-  <!-- Main Container -->
-  <main class="max-w-7xl mx-auto space-y-8">
-
-    <!-- Active Positions Section (HERO SECTION - AT THE TOP) -->
-    <section id="active-trades-section">
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-xl font-bold text-white flex items-center gap-2">
-          <span>🎯 Active Positions / Open Trades</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-200 font-mono font-bold" id="signals-badge">{data['active_signals_count']}</span>
-        </h2>
-        <div class="flex flex-wrap gap-2 text-xs">
-          <button onclick="filterSignals('ALL')" id="filter-all" class="filter-btn px-3 py-1.5 rounded-md bg-slate-800 text-white font-medium hover:bg-slate-700">All</button>
-          <button onclick="filterSignals('LONG')" id="filter-long" class="filter-btn px-3 py-1.5 rounded-md bg-slate-900 text-slate-400 hover:text-white">Long Only</button>
-          <button onclick="filterSignals('SHORT')" id="filter-short" class="filter-btn px-3 py-1.5 rounded-md bg-slate-900 text-slate-400 hover:text-white">Short Only</button>
-        </div>
-      </div>
-
-      <div id="signals-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        <!-- Rendered by JavaScript dynamically -->
-      </div>
-    </section>
-
-    <!-- Recent Engine Activity History (AUDIT LOG - RIGHT BELOW TRADES) -->
-    <section class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6">
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
-        <div>
-          <h3 class="text-lg font-bold text-white flex items-center gap-2">
-            <span>🔔 Recent Trade & Alert History</span>
-            <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono" id="alerts-badge">0</span>
-          </h3>
-          <p class="text-xs text-slate-400">Real-time desktop alerts, trade entries, native stop registrations, and 100% Pure Trailing Stop Loss ratchets.</p>
-        </div>
-        <div class="text-xs text-slate-500 font-mono">Live Event Stream</div>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="w-full text-left text-sm text-slate-300">
-          <thead class="text-xs uppercase bg-slate-950/60 text-slate-400 border-b border-slate-800">
-            <tr>
-              <th class="py-3 px-4">Event</th>
-              <th class="py-3 px-4">Ticker / Asset</th>
-              <th class="py-3 px-4">Price</th>
-              <th class="py-3 px-4">Quantity / P&amp;L</th>
-              <th class="py-3 px-4">Milestone / Rationale</th>
-              <th class="py-3 px-4">Timestamp (UTC)</th>
-            </tr>
-          </thead>
-          <tbody id="alerts-table-body" class="divide-y divide-slate-800/60 font-mono text-xs">
-            <!-- Rendered by JS -->
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Monitored Asset Universe (COLLAPSIBLE TO PREVENT CLUTTER) -->
-    <details class="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden group">
-      <summary class="cursor-pointer p-5 font-bold text-white flex items-center justify-between hover:bg-slate-800/40 transition select-none">
-        <div>
-          <span class="text-base flex items-center gap-2">
-            <span>📋 Monitored Asset Directory</span>
-            <span class="text-xs font-mono font-normal px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">120 Pairs • 84% EUR</span>
-          </span>
-          <p class="text-xs text-slate-400 font-normal mt-0.5">High-liquidity 3x & 5x Leverage Shares ETPs on Trading 212 with zero borrowing drag.</p>
-        </div>
-        <span class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 group-open:rotate-180 transition-transform">
-          Click to View Directory ▾
-        </span>
-      </summary>
-
-      <div class="p-6 pt-0 border-t border-slate-800/60 overflow-x-auto">
-        <table class="w-full text-left text-sm text-slate-300 mt-4">
-          <thead class="text-xs uppercase bg-slate-950/60 text-slate-400 border-b border-slate-800">
-            <tr>
-              <th class="py-3 px-4">Underlying</th>
-              <th class="py-3 px-4">Name / Sector</th>
-              <th class="py-3 px-4 text-emerald-400 font-semibold">3x Long ETP</th>
-              <th class="py-3 px-4 text-rose-400 font-semibold">3x Short (Inverse) ETP</th>
-              <th class="py-3 px-4 text-amber-400 font-semibold">Leverage Policy</th>
-              <th class="py-3 px-4">Currency</th>
-            </tr>
-          </thead>
-          <tbody id="pairs-table-body" class="divide-y divide-slate-800/60 font-mono text-xs">
-            <!-- Rendered by JS -->
-          </tbody>
-        </table>
-      </div>
-    </details>
-
-  </main>
-
-  <footer class="max-w-7xl mx-auto mt-12 pt-6 border-t border-slate-900 text-center text-xs text-slate-600">
-    Trading 212 Quantitative Leveraged Engine &bull; 24/7 Autonomous Raspberry Pi Runner
-  </footer>
-
   <script>
-    let INITIAL_DATA = {data_json};
-    let rawSignals = INITIAL_DATA.active_signals || [];
-    let currentFilter = 'ALL';
-    let isFetching = false;
-
-    // Direct asynchronous real-time fetch from /api/data
-    async function fetchLiveData(isManual = false) {{
-      if (isFetching) return;
-      isFetching = true;
-      const btn = document.getElementById('refresh-btn-text');
-      if (isManual && btn) btn.innerText = 'Syncing...';
-      try {{
-        const resp = await fetch('/api/data?_t=' + Date.now(), {{ cache: 'no-store' }});
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const data = await resp.json();
-        updateUI(data);
-      }} catch (err) {{
-        console.debug('Polling fetch notice:', err);
-      }} finally {{
-        isFetching = false;
-        if (isManual && btn) {{
-          btn.innerText = 'Refreshed!';
-          setTimeout(() => {{ btn.innerText = 'Refresh Now'; }}, 1200);
-        }}
-      }}
-    }}
-
-    function updateUI(data) {{
-      if (!data) return;
-      if (data.active_signals !== undefined) {{
-        rawSignals = data.active_signals;
-        INITIAL_DATA.active_signals = data.active_signals;
-        const activeEl = document.getElementById('metric-active');
-        if (activeEl) activeEl.innerText = `${{rawSignals.length}} Open Trades`;
-        const badgeEl = document.getElementById('signals-badge');
-        if (badgeEl) badgeEl.innerText = rawSignals.length;
-        renderSignals(currentFilter);
-      }}
-      if (data.broker_status) {{
-        INITIAL_DATA.broker_status = data.broker_status;
-        const stopsEl = document.getElementById('metric-stops');
-        if (stopsEl && data.broker_status.active_server_stops !== undefined) {{
-          stopsEl.innerText = `${{data.broker_status.active_server_stops}} Active`;
-        }}
-        const headerStopsEl = document.getElementById('header-stops-count');
-        if (headerStopsEl && data.broker_status.active_server_stops !== undefined) {{
-          headerStopsEl.innerText = data.broker_status.active_server_stops;
-        }}
-      }}
-      if (data.recent_notifications) {{
-        INITIAL_DATA.recent_notifications = data.recent_notifications;
-        renderAlertsTable();
-      }}
-      if (data.equity_history || data.current_equity !== undefined) {{
-        if (data.equity_history) INITIAL_DATA.equity_history = data.equity_history;
-        if (data.current_equity !== undefined) INITIAL_DATA.current_equity = data.current_equity;
-        renderEquityChart(INITIAL_DATA.equity_history, INITIAL_DATA.current_equity);
-      }}
-      if (data.pairs_watchlist && (!INITIAL_DATA.pairs_watchlist || INITIAL_DATA.pairs_watchlist.length === 0)) {{
-        INITIAL_DATA.pairs_watchlist = data.pairs_watchlist;
-        renderPairsTable();
-      }}
-      const timeEl = document.getElementById('timestamp-text');
-      if (timeEl && data.generated_at) {{
-        timeEl.innerText = data.generated_at;
-      }}
-    }}
-
-    async function panicFlatten() {{
-      if (!confirm("⚠️ EMERGENCY ACTION: Are you sure you want to CANCEL ALL ACTIVE STOPS and LIQUIDATE all open positions immediately?")) {{
-        return;
-      }}
-      try {{
-        const resp = await fetch('/api/panic', {{
-          method: 'POST',
-          headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{confirm: true}})
-        }});
-        const res = await resp.json();
-        if (resp.ok) {{
-          alert("🚨 Panic flatten completed! All open positions liquidated and stops cancelled.");
-          fetchLiveData(true);
-        }} else {{
-          alert("Error executing panic flatten: " + (res.error || "Unknown error"));
-        }}
-      }} catch (err) {{
-        alert("Failed to reach server: " + err);
-      }}
-    }}
-
-    function renderSignals(filter = 'ALL') {{
-      currentFilter = filter;
-      const grid = document.getElementById('signals-grid');
-      if (!grid) return;
-      grid.innerHTML = '';
-
-      let signals = rawSignals || [];
-      if (filter !== 'ALL') {{
-        signals = signals.filter(s => s.direction === filter);
-      }}
-
-      if (signals.length === 0) {{
-        grid.innerHTML = `
-          <div class="col-span-full py-10 px-6 text-center bg-slate-900/40 border border-slate-800 rounded-2xl">
-            <div class="text-3xl mb-2">🟢</div>
-            <div class="text-lg font-bold text-white">Engine is Active & Scanning 120 Leveraged ETPs</div>
-            <div class="text-sm text-slate-400 mt-1 max-w-xl mx-auto">
-              No open trades right now. The engine runs 24/7 on the Raspberry Pi, screening every 15 minutes across 120 high-liquidity ETPs (84% EUR) for 3-RSI oversold pullbacks (&lt;25) and momentum triggers with pre-earnings radar tracking. Orders execute automatically on Trading 212 when criteria are met.
-            </div>
-            <div class="mt-4 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-800/80 text-emerald-400 text-xs font-mono">
-              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              24/7 Autonomous Raspberry Pi Runner
-            </div>
-          </div>
-        `;
-        return;
-      }}
-
-      signals.forEach(s => {{
-        const isLong = s.direction === 'LONG';
-        const lev = s.leverage || (s.ticker && s.ticker.includes('5') ? 5 : 3);
-        const levBadge = lev === 5
-          ? '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">5x Institutional</span>'
-          : '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">3x Daily</span>';
-        const badgeColor = isLong ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-        const actionText = isLong ? `🟢 BUY / LONG (${{lev}}x)` : `🔴 SELL / SHORT (${{lev}}x)`;
-        const code = (s.currency_code || '').toUpperCase();
-        const sTk = (s.ticker || '').toUpperCase();
-        let currPrefix = '';
-        let currSuffix = '';
-        if (code === 'GBX' || (s.currency_suffix && s.currency_suffix.includes('p')) || sTk.includes('SKOR') || sTk.includes('3XOM') || sTk.includes('3UNH') || sTk.endsWith('.L')) {{
-          currPrefix = '';
-          currSuffix = 'p';
-        }} else if (code === 'USD' || s.currency_prefix === '$' || sTk.includes('_US')) {{
-          currPrefix = '$';
-          currSuffix = '';
-        }} else if (code === 'GBP' || s.currency_prefix === '£') {{
-          currPrefix = '£';
-          currSuffix = '';
-        }} else {{
-          currPrefix = (s.currency_prefix !== undefined && s.currency_prefix !== null && s.currency_prefix !== '') ? s.currency_prefix : '€';
-          currSuffix = s.currency_suffix || '';
-        }}
-        const currBadge = (code === 'GBX' || currSuffix === 'p')
-          ? '<span class="text-amber-400 font-semibold">Penny (GBX / p)</span>'
-          : `<span class="text-slate-300 font-medium">${{code || 'EUR'}}</span>`;
-
-        const stopOrderBadge = s.broker_stop_order_id
-          ? `<div class="flex items-center justify-between text-xs px-2.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-semibold mb-2.5 shadow-sm">
-               <span class="flex items-center gap-1.5">
-                 <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                 🛡️ Native T212 Stop Order:
-               </span>
-               <span class="font-mono font-bold text-emerald-200">#${{s.broker_stop_order_id}}</span>
-             </div>`
-          : `<div class="flex items-center justify-between text-xs px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 mb-2.5">
-               <span>🛡️ Stop Protection:</span>
-               <span class="text-slate-300 font-medium">Software Polled</span>
-             </div>`;
-
-        const earningsBadge = (s.earnings_in_days !== undefined && s.earnings_in_days !== null)
-          ? `<div class="flex items-center justify-between text-xs px-2.5 py-1.5 rounded-lg bg-purple-500/10 border border-purple-500/30 text-purple-300 font-semibold mb-2.5">
-               <span class="flex items-center gap-1.5">
-                 <span>📅</span>
-                 <span>Earnings Catalyst:</span>
-               </span>
-               <span class="font-mono font-bold text-purple-200">${{Number(s.earnings_in_days).toFixed(0)}}d away</span>
-             </div>`
-          : '';
-
-        const pnlPct = (s.pnl_pct !== undefined && s.pnl_pct !== null) ? Number(s.pnl_pct) : 0.0;
-        const pnlColor = pnlPct > 0 ? 'text-emerald-400' : (pnlPct < 0 ? 'text-rose-400' : 'text-slate-300');
-        const pnlSign = pnlPct > 0 ? '+' : (pnlPct < 0 ? '-' : '');
-        const pnlAmount = s.pnl_amount !== undefined ? Number(s.pnl_amount) : 0.0;
-        const pnlAmountEur = s.pnl_amount_eur !== undefined ? Number(s.pnl_amount_eur) : (
-          s.currency_code === 'GBX' ? (pnlAmount / 100 * 1.204) : (s.currency_code === 'USD' ? (pnlAmount / 1.08) : pnlAmount)
-        );
-        const remQty = s.remaining_quantity !== undefined ? Number(s.remaining_quantity) : Number(s.quantity || 1.0);
-        const curPx = Number(s.current_price || s.entry_price || 0.0);
-        const entryPx = Number(s.entry_price || 0.0);
-        const posVal = (remQty * curPx).toFixed(2);
-        const posValEur = (s.currency_code === 'GBX' ? (Number(posVal) / 100 * 1.204) : (s.currency_code === 'USD' ? (Number(posVal) / 1.08) : Number(posVal))).toFixed(2);
-
-        const card = document.createElement('div');
-        card.className = "bg-slate-900 border border-slate-800 hover:border-slate-700 transition rounded-2xl p-5 shadow-lg flex flex-col justify-between relative overflow-hidden group";
-
-        card.innerHTML = `
-          <!-- Top Accent line -->
-          <div class="absolute top-0 left-0 right-0 h-1.5 ${{isLong ? 'bg-emerald-500' : 'bg-rose-500'}}"></div>
-
-          <div>
-            <!-- Header -->
-            <div class="flex items-start justify-between gap-3 mb-3">
-              <div>
-                <div class="flex items-center gap-2">
-                  <span class="text-lg font-black text-white tracking-wide">${{s.name || s.underlying}}</span>
-                  <span class="text-xs font-mono text-slate-400 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">${{s.ticker}}</span>
-                  ${{levBadge}}
-                </div>
-                <div class="text-xs text-slate-400 mt-0.5">${{lev}}x Leveraged ETP &bull; ${{currBadge}}</div>
-              </div>
-
-              <span class="px-2.5 py-1 rounded-md text-xs font-black uppercase tracking-wider border ${{badgeColor}}">
-                ${{actionText}}
-              </span>
-            </div>
-
-            <!-- Big P&L Box -->
-            <div class="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3.5 mb-3">
-              <div class="flex items-center justify-between">
-                <div>
-                  <div class="text-[10px] text-slate-400 uppercase font-semibold">Live P&L</div>
-                  <div class="text-xl font-black ${{pnlColor}} font-mono">
-                    ${{pnlSign}}${{currPrefix}}${{Math.abs(pnlAmount).toFixed(2)}}${{currSuffix}} (${{pnlPct >= 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)
-                  </div>
-                  ${{s.currency_code !== 'EUR' ? `<div class="text-xs ${{pnlColor}} font-mono font-semibold mt-0.5">≈ ${{pnlAmountEur >= 0 ? '+' : '-'}}€${{Math.abs(pnlAmountEur).toFixed(2)}}</div>` : ''}}
-                </div>
-                <div class="text-right">
-                  <div class="text-[10px] text-slate-400 uppercase font-semibold">Holdings</div>
-                  <div class="text-sm font-bold text-indigo-300 font-mono">${{remQty.toFixed(1)}} shares</div>
-                  <div class="text-[10px] text-slate-400 font-mono">Val: ${{currPrefix}}${{posVal}}${{currSuffix}}${{s.currency_code !== 'EUR' ? ` (≈ €${{posValEur}})` : ''}}</div>
-                </div>
-              </div>
-              <div class="mt-2.5 pt-2 border-t border-slate-800/60 flex items-center justify-between text-xs font-mono">
-                <span class="text-slate-400">Entry: <b class="text-white">${{currPrefix}}${{entryPx.toFixed(2)}}${{currSuffix}}</b></span>
-                <span class="text-slate-400">Live: <b class="${{pnlColor}}">${{currPrefix}}${{curPx.toFixed(2)}}${{currSuffix}}</b></span>
-              </div>
-            </div>
-
-            <!-- Native Broker Stop Order Badge -->
-            ${{stopOrderBadge}}
-            ${{earningsBadge}}
-
-            <!-- Targets & Stop Grid -->
-            <div class="space-y-2 text-xs mb-4">
-              <!-- Stop Loss -->
-              <div class="flex items-center justify-between p-2 rounded-lg bg-rose-500/5 border border-rose-500/10">
-                <span class="text-rose-300 font-semibold flex items-center gap-1.5">
-                  <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>
-                  Stop Loss (SL)
-                </span>
-                <span class="font-mono font-bold text-rose-200">${{currPrefix}}${{Number(s.stop_loss || 0).toFixed(2)}}${{currSuffix}} (-${{s.stop_distance_pct || 5.0}}%)</span>
-              </div>
-
-              <!-- Trailing Stop Loss -->
-              <div class="flex items-center justify-between p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
-                <span class="text-emerald-300 font-semibold flex items-center gap-1.5">
-                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  Trailing Stop (TSL)
-                </span>
-                <span class="font-mono font-bold text-emerald-200">
-                  ${{currPrefix}}${{Number(s.trailing_stop_loss || s.stop_loss || 0).toFixed(2)}}${{currSuffix}}
-                  <span class="text-emerald-400 ml-1 font-bold">[${{s.tsl_status || (s.trailing_stop_loss >= s.entry_price ? 'Breakeven Locked' : 'Active Trail')}}]</span>
-                </span>
-              </div>
-
-              <!-- Native Broker Protection -->
-              <div class="flex items-center justify-between p-2 rounded-lg bg-sky-500/5 border border-sky-500/10">
-                <span class="text-sky-300 font-semibold flex items-center gap-1.5">
-                  <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
-                  T212 GTC Stop
-                </span>
-                <span class="font-mono font-bold text-sky-200">
-                  ${{s.broker_stop_order_id ? '#' + s.broker_stop_order_id : 'Syncing Broker...'}}
-                  <span class="text-sky-400 ml-1 font-bold">[100% Protection]</span>
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Card Footer Status -->
-          <div class="pt-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
-            <span>Status: <b class="text-slate-200">${{s.status || 'ACTIVE'}}</b></span>
-            <span class="font-mono uppercase text-slate-500">${{(s.strategy_type || '').replace('_', ' ')}}</span>
-          </div>
-        `;
-        grid.appendChild(card);
-      }});
-    }}
-
-    function renderPairsTable() {{
-      const tbody = document.getElementById('pairs-table-body');
-      if (!tbody) return;
-      tbody.innerHTML = '';
-      (INITIAL_DATA.pairs_watchlist || []).forEach(p => {{
-        const row = document.createElement('tr');
-        row.className = "hover:bg-slate-900/80 transition";
-        const fiveXBadge = p.has_5x
-          ? `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30">5x Exists &rarr; 3x Exec</span>`
-          : `<span class="text-slate-500 text-[10px]">3x Standard</span>`;
-
-        const lCurr = p.long_currency || p.currency || 'EUR';
-        const sCurr = p.short_currency || p.currency || 'EUR';
-        let currCellHtml = `<span class="text-slate-400">${{p.currency || 'EUR'}}</span>`;
-        if (lCurr !== sCurr) {{
-          const lBadge = lCurr === 'GBX' ? 'GBX (p)' : lCurr;
-          const sBadge = sCurr === 'GBX' ? 'GBX (p)' : sCurr;
-          currCellHtml = `<span class="text-emerald-400 font-mono">${{lBadge}}</span> <span class="text-slate-600">/</span> <span class="text-rose-400 font-mono">${{sBadge}}</span>`;
-        }} else if (lCurr === 'GBX') {{
-          currCellHtml = `<span class="text-amber-400 font-semibold">GBX (Penny)</span>`;
-        }}
-
-        row.innerHTML = `
-          <td class="py-2.5 px-4 font-bold text-white">${{p.underlying}}</td>
-          <td class="py-2.5 px-4 font-sans text-slate-400">${{p.name}} <span class="text-slate-500">(${{p.category}})</span></td>
-          <td class="py-2.5 px-4 text-emerald-400 font-bold">${{p.long_ticker}}</td>
-          <td class="py-2.5 px-4 text-rose-400 font-bold">${{p.short_ticker}}</td>
-          <td class="py-2.5 px-4">${{fiveXBadge}}</td>
-          <td class="py-2.5 px-4">${{currCellHtml}}</td>
-        `;
-        tbody.appendChild(row);
-      }});
-    }}
-
-    function filterSignals(direction) {{
-      document.querySelectorAll('.filter-btn').forEach(btn => {{
-        btn.classList.remove('bg-slate-800', 'text-white');
-        btn.classList.add('bg-slate-900', 'text-slate-400');
-      }});
-      const activeBtn = direction === 'ALL' ? document.getElementById('filter-all') : (direction === 'LONG' ? document.getElementById('filter-long') : document.getElementById('filter-short'));
-      if (activeBtn) {{
-        activeBtn.classList.remove('bg-slate-900', 'text-slate-400');
-        activeBtn.classList.add('bg-slate-800', 'text-white');
-      }}
-      renderSignals(direction);
-    }}
-
-    function updateCountdown() {{
-      const now = new Date();
-      const nowUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
-      let targetUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 16, 20, 0);
-      let diff = targetUtc - nowUtc;
-      const countdownEl = document.getElementById('cutoff-countdown');
-      if (!countdownEl) return;
-      if (diff < 0) {{
-        if (diff > -600000) {{
-          countdownEl.innerHTML = '<span class="text-rose-400 animate-pulse text-lg">FLATTENING NOW</span>';
-          return;
-        }}
-        targetUtc += 86400000;
-        diff = targetUtc - nowUtc;
-      }}
-      const hours = Math.floor(diff / (1000 * 60 * 60));
-      const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-      const seconds = Math.floor((diff % (1000 * 60)) / 1000);
-      const pad = n => String(n).padStart(2, '0');
-      countdownEl.innerText = `${{pad(hours)}}:${{pad(minutes)}}:${{pad(seconds)}}`;
-    }}
-
-    function renderAlertsTable() {{
-      const tbody = document.getElementById('alerts-table-body');
-      if (!tbody) return;
-      tbody.innerHTML = '';
-      const notifs = INITIAL_DATA.recent_notifications || [];
-      const badge = document.getElementById('alerts-badge');
-      if (badge) badge.innerText = notifs.length;
-
-      if (notifs.length === 0) {{
-        tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-slate-500 font-sans">No recent alerts or execution events recorded.</td></tr>`;
-        return;
-      }}
-
-      notifs.forEach(n => {{
-        const row = document.createElement('tr');
-        row.className = "hover:bg-slate-900/80 transition";
-        const ev = (n.event_type || 'ALERT').toUpperCase();
-        let badgeColor = 'bg-slate-800 text-slate-300 border-slate-700';
-        let badgeIcon = '📢 ' + ev;
-
-        if (ev === 'BUY') {{
-          badgeColor = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
-          badgeIcon = '🟢 BUY';
-        }} else if (ev === 'SELL') {{
-          badgeColor = 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-          badgeIcon = '🔴 SELL';
-        }} else if (ev === 'TSL_BREAKEVEN') {{
-          badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
-          badgeIcon = '🛡️ TSL BREAKEVEN';
-        }} else if (ev === 'TSL_CUSHION') {{
-          badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
-          badgeIcon = '🛡️ TSL CUSHION (+1.5%)';
-        }} else if (ev === 'TSL' || ev === 'TSL_DYNAMIC' || ev === 'TSL_RATCHET') {{
-          badgeColor = 'bg-sky-500/10 text-sky-300 border-sky-500/30';
-          badgeIcon = '📈 TSL RATCHET';
-        }} else if (ev === 'TP1') {{
-          badgeColor = 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
-          badgeIcon = '🎯 TP1 (+1.0R)';
-        }} else if (ev === 'TP2') {{
-          badgeColor = 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30';
-          badgeIcon = '🎯 TP2 (+2.0R)';
-        }} else if (ev === 'TP3') {{
-          badgeColor = 'bg-purple-500/10 text-purple-300 border-purple-500/30';
-          badgeIcon = '🏆 TP3 (+3.0R RUNNER)';
-        }} else if (ev === 'SL') {{
-          badgeColor = 'bg-rose-500/10 text-rose-300 border-rose-500/30';
-          badgeIcon = '🛑 STOP LOSS';
-        }} else if (ev.includes('HYSTERESIS')) {{
-          badgeColor = 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30';
-          badgeIcon = '🛡️ TSL ELEVATED';
-        }}
-
-        const nCode = (n.currency || '').toUpperCase();
-        const nTk = (n.ticker || '').toUpperCase();
-        let nPrefix = '€';
-        let nSuffix = '';
-        if (nCode === 'GBX' || nTk.includes('SKOR') || nTk.includes('3XOM') || nTk.includes('3UNH') || nTk.endsWith('.L')) {{
-          nPrefix = '';
-          nSuffix = 'p';
-        }} else if (nCode === 'USD' || nTk.includes('_US') || nTk.includes('AMD') || nTk.includes('QQQ')) {{
-          nPrefix = '$';
-          nSuffix = '';
-        }} else if (nCode === 'GBP') {{
-          nPrefix = '£';
-          nSuffix = '';
-        }}
-
-        const pnlCode = (n.pnl_currency || 'EUR').toUpperCase();
-        let pnlPrefix = '€';
-        let pnlSuffix = '';
-        if (pnlCode === 'USD') {{
-          pnlPrefix = '$';
-        }} else if (pnlCode === 'GBP') {{
-          pnlPrefix = '£';
-        }} else if (pnlCode === 'GBX') {{
-          pnlPrefix = '';
-          pnlSuffix = 'p';
-        }}
-
-        const qty = (n.quantity !== null && n.quantity !== undefined && Math.abs(Number(n.quantity)) > 0)
-          ? Math.abs(Number(n.quantity))
-          : null;
-        const pnl = (n.pnl !== null && n.pnl !== undefined) ? Number(n.pnl) : null;
-        let pnlPct = (n.pnl_pct !== null && n.pnl_pct !== undefined) ? Number(n.pnl_pct) : null;
-
-        // If pnlPct is not provided but pnl, price and quantity exist, calculate dynamically
-        if (pnl !== null && pnlPct === null && n.price && qty && Number(n.price) > 0) {{
-          const exitNotional = Number(n.price) * qty;
-          const costBasis = exitNotional - pnl;
-          if (costBasis > 0) {{
-            pnlPct = (pnl / costBasis) * 100.0;
-          }} else if (exitNotional > 0) {{
-            pnlPct = (pnl / exitNotional) * 100.0;
-          }}
-        }}
-
-        const qtyDisplay = qty !== null ? `${{qty.toFixed(2)}} shs` : '—';
-        let pnlDisplay = '';
-        if (ev === 'BUY') {{
-          pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Open Entry</span>`;
-        }} else if (pnl !== null) {{
-          const color = pnl > 0 ? 'text-emerald-400' : (pnl < 0 ? 'text-rose-400' : 'text-slate-300');
-          const sign = pnl > 0 ? '+' : (pnl < 0 ? '-' : '');
-          const pctStr = pnlPct !== null
-            ? ` (${{pnlPct > 0 ? '+' : ''}}${{pnlPct.toFixed(2)}}%)`
-            : '';
-          pnlDisplay = `<span class="${{color}} font-bold text-[11px]">${{sign}}${{pnlPrefix}}${{Math.abs(pnl).toFixed(2)}}${{pnlSuffix}}${{pctStr}}</span>`;
-        }} else if (ev === 'SL' || ev === 'SELL' || ev === 'TSL') {{
-          pnlDisplay = `<span class="text-slate-400 text-[10px] font-sans">Closed</span>`;
-        }} else {{
-          pnlDisplay = `<span class="text-slate-500 text-[10px] font-sans">Order Placed</span>`;
-        }}
-
-        const pnlText = `
-          <div class="flex flex-col gap-0.5">
-            <span class="text-slate-200 font-semibold">${{qtyDisplay}}</span>
-            ${{pnlDisplay}}
-          </div>
-        `;
-
-        const price = (n.price !== undefined && n.price !== null) ? `${{nPrefix}}${{Number(n.price).toFixed(2)}}${{nSuffix}}` : '—';
-        const underlyingText = n.underlying ? `(${{n.underlying}})` : '';
-        const dir = (n.direction || 'LONG').toUpperCase();
-        const dirBadge = dir === 'SHORT'
-          ? '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black border bg-rose-500/10 text-rose-300 border-rose-500/30 ml-1">SHORT</span>'
-          : '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black border bg-emerald-500/10 text-emerald-300 border-emerald-500/30 ml-1">LONG</span>';
-
-        row.innerHTML = `
-          <td class="py-2.5 px-4">
-            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-black border ${{badgeColor}}">
-              ${{badgeIcon}}
-            </span>
-          </td>
-          <td class="py-2.5 px-4 font-bold text-white">
-            <div class="flex items-center gap-1.5 flex-wrap">
-              <span>${{n.ticker || '—'}}</span>
-              ${{dirBadge}}
-              <span class="text-[11px] font-normal text-slate-400 font-sans">${{underlyingText}}</span>
-            </div>
-          </td>
-          <td class="py-2.5 px-4 font-mono text-slate-200">${{price}}</td>
-          <td class="py-2.5 px-4 font-mono">${{pnlText}}</td>
-          <td class="py-2.5 px-4 font-sans text-slate-300 text-xs max-w-md truncate" title="${{n.rationale || ''}}">
-            ${{n.rationale || '—'}}
-          </td>
-          <td class="py-2.5 px-4 text-slate-400 text-[11px] font-mono whitespace-nowrap">${{n.timestamp || '—'}}</td>
-        `;
-        tbody.appendChild(row);
-      }});
-    }}
-
-    function renderEquityChart(history, currentEquity) {{
-      const g = document.getElementById('equity-chart-group');
-      if (!g) return;
-      const points = (history && history.length > 0)
-        ? history
-        : [{{time: 'Start', equity: 4923.05}}, {{time: 'Now', equity: Number(currentEquity || 4923.05)}}];
-
-      const equities = points.map(p => Number(p.equity || 4923.05));
-      const startEq = equities[0] || 4923.05;
-      const currEq = (currentEquity !== undefined && currentEquity !== null) ? Number(currentEquity) : (equities[equities.length - 1] || startEq);
-      const minEq = Math.min(...equities, currEq);
-      const maxEq = Math.max(...equities, currEq);
-      const delta = currEq - startEq;
-      const deltaPct = startEq > 0 ? (delta / startEq) * 100 : 0.0;
-      const isPositive = delta >= 0;
-
-      const curEl = document.getElementById('equity-val-current');
-      if (curEl) curEl.innerText = '€' + currEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
-      const deltaEl = document.getElementById('equity-val-delta');
-      if (deltaEl) {{
-        deltaEl.innerText = (isPositive ? '+' : '') + '€' + Math.abs(delta).toFixed(2) + ' (' + (isPositive ? '+' : '') + deltaPct.toFixed(2) + '%)';
-        deltaEl.className = 'text-sm font-bold font-mono ' + (isPositive ? 'text-emerald-400' : 'text-rose-400');
-      }}
-      const startEl = document.getElementById('equity-val-start');
-      if (startEl) startEl.innerText = '€' + startEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
-      const highEl = document.getElementById('equity-val-high');
-      if (highEl) highEl.innerText = '€' + maxEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
-      const lowEl = document.getElementById('equity-val-low');
-      if (lowEl) lowEl.innerText = '€' + minEq.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
-
-      const W = 800;
-      const H = 100;
-      const padY = 12;
-      const range = (maxEq - minEq) || 1.0;
-
-      const coords = points.map((p, idx) => {{
-        const x = points.length === 1 ? W / 2 : (idx / (points.length - 1)) * W;
-        const norm = (Number(p.equity || startEq) - minEq) / range;
-        const y = H - padY - (norm * (H - 2 * padY));
-        return {{x: Number(x.toFixed(1)), y: Number(y.toFixed(1)), equity: p.equity, time: p.time}};
-      }});
-
-      const lineD = coords.reduce((acc, pt, i) => acc + (i === 0 ? `M ${{pt.x}} ${{pt.y}}` : ` L ${{pt.x}} ${{pt.y}}`), '');
-      const areaD = lineD + ` L ${{W}} ${{H}} L 0 ${{H}} Z`;
-      const strokeColor = isPositive ? '#10b981' : '#f43f5e';
-      const gradId = isPositive ? 'url(#equity-gradient-emerald)' : 'url(#equity-gradient-rose)';
-
-      let circles = '';
-      coords.forEach(pt => {{
-        circles += `<circle cx="${{pt.x}}" cy="${{pt.y}}" r="3.5" fill="${{strokeColor}}" stroke="#0f172a" stroke-width="1.5"><title>${{pt.time}}: €${{Number(pt.equity).toFixed(2)}}</title></circle>`;
-      }});
-
-      g.innerHTML = `
-        <line x1="0" y1="${{H}}" x2="${{W}}" y2="${{H}}" stroke="#334155" stroke-width="1" stroke-dasharray="4" />
-        <path d="${{areaD}}" fill="${{gradId}}" />
-        <path d="${{lineD}}" fill="none" stroke="${{strokeColor}}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
-        ${{circles}}
-      `;
-    }}
-
-    // Real-time zero-latency SSE telemetry stream (push updates)
-    function initSSE() {{
-      if (typeof EventSource !== "undefined") {{
-        try {{
-          const streamUrl = window.location.origin + "/stream";
-          const es = new EventSource(streamUrl);
-          es.addEventListener("snapshot", e => {{ try {{ updateUI(JSON.parse(e.data)); }} catch (err) {{}} }});
-          es.addEventListener("dashboard_update", e => {{ try {{ updateUI(JSON.parse(e.data)); }} catch (err) {{}} }});
-          es.onerror = () => {{ es.close(); setTimeout(initSSE, 5000); }};
-        }} catch (e) {{}}
-      }}
-    }}
-
-    // Auto-polling and initialization
-    setInterval(updateCountdown, 1000);
-    updateCountdown();
-    renderSignals('ALL');
-    renderPairsTable();
-    renderAlertsTable();
-    renderEquityChart(INITIAL_DATA.equity_history, INITIAL_DATA.current_equity);
-    initSSE();
-
-    // Instant zero-click sync on page load and every 3.5s
-    document.addEventListener('DOMContentLoaded', () => {{
-      fetchLiveData(false);
-    }});
-    setInterval(() => {{
-      fetchLiveData(false);
-    }}, 3500);
+    let INITIAL_DATA = {safe_json};
+    window.__INITIAL_DATA__ = INITIAL_DATA;
+  </script>
+  <script>
+{safe_js}
   </script>
 </body>
 </html>
 """
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
+
+def generate_html_dashboard(
+    output_path: str = "signals_dashboard.html",
+    orchestrator: Optional[Any] = None,
+    client: Optional[Any] = None,
+) -> str:
+    """Render self-hosted dashboard HTML atomically using packaged styles.css and workbench.js."""
+    data = build_dashboard_data(force=True, client=client, orchestrator=orchestrator)
+    html_content = _render_dashboard_html_string(data)
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(out.resolve().parent),
+            prefix=f".{out.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = tmp_file.name
+            tmp_file.write(html_content)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, out)
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
 
     try:
         SSEBroadcaster.get_instance().broadcast("dashboard_update", data)
     except Exception:
         pass
 
-    logger.info("Generated dashboard HTML at %s", output_path)
-    return output_path
+    logger.info("Generated self-hosted dashboard HTML at %s", output_path)
+    return str(output_path)
 
 
-def start_background_position_monitor(
-    html_file: str = "signals_dashboard.html",
-    interval_seconds: int = 15,
-    dry_run: Optional[bool] = None,
-) -> threading.Thread:
-    """Launch autonomous background monitor thread for continuous price checking and auto-sells."""
-    def _monitor_loop() -> None:
-        logger.info("⚡ Background Autonomous Position Monitor started (polling every %ds)", interval_seconds)
-        client = Trading212Client(
-            api_key=settings.TRADING212_API_KEY,
-            base_url=settings.api_base_url,
-            api_secret=settings.TRADING212_API_SECRET,
-        )
-        notifier = Notifier(
-            telegram_bot_token=settings.TELEGRAM_BOT_TOKEN,
-            telegram_chat_id=settings.TELEGRAM_CHAT_ID,
-            discord_webhook_url=settings.DISCORD_WEBHOOK_URL,
-            log_file=settings.NOTIFICATIONS_LOG_PATH,
-            enable_desktop=settings.ENABLE_DESKTOP_NOTIFICATIONS,
-        )
-        risk_manager = RiskManager(
-            max_risk_per_trade=settings.MAX_RISK_PER_TRADE,
-            max_position_pct=settings.MAX_POSITION_PCT,
-            atr_sl_multiplier=settings.ATR_SL_MULTIPLIER,
-            min_sl_pct=settings.MIN_SL_PCT,
-            tp1_r=settings.TP1_R_MULTIPLE,
-            tp2_r=settings.TP2_R_MULTIPLE,
-            tp3_r=settings.TP3_R_MULTIPLE,
-            tsl_atr_multiplier=settings.TSL_ATR_MULTIPLIER,
-            tsl_hysteresis_atr_mult=settings.TSL_HYSTERESIS_ATR_MULT,
-            tp1_trim_pct=settings.TP1_TRIM_PCT,
-            tp2_trim_pct=settings.TP2_TRIM_PCT,
-            tp3_trim_pct=settings.TP3_TRIM_PCT,
-        )
-        is_dry_run = dry_run if dry_run is not None else (not getattr(settings, "LIVE_TRADING_ENABLED", False))
-        monitor = PositionMonitor(
-            t212_client=client,
-            notifier=notifier,
-            risk_manager=risk_manager,
-            state_file=settings.ACTIVE_TRADES_PATH,
-            dry_run=is_dry_run,
-        )
-
-        last_dashboard_render = time.time()
-        last_stop_sync_time = 0.0
-
-        while True:
-            try:
-                # Reload active positions in case state changed
-                monitor.positions = monitor._load_state()
-
-                # Continuous Broker Portfolio Reconciliation (runs every 30s)
-                # Guarantees local dashboard & state stay 100% in lockstep with Trading 212
-                now = time.time()
-                if not is_dry_run and settings.TRADING212_API_KEY and now - getattr(_monitor_loop, "_last_recon_time", 0.0) >= 30.0:
-                    try:
-                        recon = monitor.reconcile_with_broker(adopt_untracked=True)
-                        _monitor_loop._last_recon_time = now
-                        if (
-                            recon.get("closed_externally")
-                            or recon.get("adopted_from_broker")
-                            or recon.get("quantity_synced")
-                            or recon.get("expired_stops_restored")
-                        ):
-                            logger.info("🔄 Background monitor synchronized with Trading 212: %s", recon)
-                            generate_html_dashboard(html_file)
-                            last_dashboard_render = now
-                    except Exception as recon_err:
-                        logger.debug("Background monitor reconciliation notice: %s", recon_err)
-
-                # Check market open status to prevent unnecessary API calls
-                now_utc = datetime.now(timezone.utc)
-                active_tickers = list(monitor.positions.keys()) if monitor.positions else ["QQQ3l_EQ", "SPY_US_EQ"]
-                market_is_open = client.is_any_market_open(active_tickers, current_time=now_utc)
-
-                if not market_is_open:
-                    now = time.time()
-                    if now - getattr(_monitor_loop, "_last_closed_notice_time", 0.0) >= 1800.0:
-                        logger.info(
-                            "🌙 Markets CLOSED (LSE 08:00-16:30 UTC, US 14:30-21:00 UTC). "
-                            "Entering adaptive low-frequency power-save mode to conserve API counts."
-                        )
-                        _monitor_loop._last_closed_notice_time = now
-
-                    # Still refresh static HTML dashboard every 5 minutes
-                    if now - last_dashboard_render >= 300.0:
-                        generate_html_dashboard(html_file)
-                        last_dashboard_render = now
-
-                    time.sleep(60.0)
-                    continue
-
-                if monitor.positions:
-                    now = time.time()
-                    # 1. Sync broker stop orders periodically (every 5 minutes / 300s, or on initial run), NOT every 15s
-                    if now - last_stop_sync_time >= 300.0:
-                        if Trading212Client.is_trade_active():
-                            logger.info("Active trade execution in progress; deferring routine broker stop sync.")
-                        else:
-                            try:
-                                active_orders = client.get_orders(force_refresh=True)
-                                active_order_ids = {str(o.get("id")) for o in active_orders if isinstance(o, dict) and o.get("id")}
-                                for ticker, pos in list(monitor.positions.items()):
-                                    if pos.broker_stop_order_id and str(pos.broker_stop_order_id) not in active_order_ids:
-                                        if not str(pos.broker_stop_order_id).startswith("DRY_"):
-                                            logger.info("Broker stop %s for %s no longer active on broker. Marking for re-sync.",
-                                                        pos.broker_stop_order_id, ticker)
-                                            pos.broker_stop_order_id = None
-                                monitor.sync_broker_stops()
-                                last_stop_sync_time = now
-                            except Exception as order_exc:
-                                logger.debug("Order sync check notice: %s", order_exc)
-
-                    # 2. Fetch current prices from broker portfolio
-                    current_prices = {}
-                    try:
-                        if Trading212Client.is_trade_active() and client._portfolio_cache is not None:
-                            portfolio = client._portfolio_cache
-                        else:
-                            portfolio = client.get_portfolio()
-                        for p in portfolio:
-                            if p.current_price > 0:
-                                current_prices[p.ticker] = p.current_price
-                    except Exception as port_exc:
-                        logger.debug("Portfolio fetch notice: %s", port_exc)
-
-                    # Fallback pricing if needed (preserve position current_price, never assign underlying price to ETP ticker)
-                    for ticker, pos in monitor.positions.items():
-                        if ticker not in current_prices:
-                            if getattr(pos, "current_price", 0.0) > 0:
-                                current_prices[ticker] = pos.current_price
-                            try:
-                                from trading_system.data.trading212_client import MarketDataProvider
-                                candles = MarketDataProvider.get_daily_candles(pos.underlying, period="5d")
-                                if hasattr(candles, "empty") and not candles.empty:
-                                    current_prices[pos.underlying] = float(candles["close"].iloc[-1])
-                                elif isinstance(candles, list) and candles:
-                                    current_prices[pos.underlying] = float(candles[-1]["close"])
-                            except Exception:
-                                pass
-
-                    # 3. Tick monitor (evaluates TP1, TP2, TP3, SL, TSL, 16:20 close)
-                    events = monitor.monitor_tick(current_prices)
-                    if events:
-                        logger.info("⚡ Position Monitor triggered %d automation event(s): %s", len(events), events)
-                        generate_html_dashboard(html_file)
-                        last_dashboard_render = time.time()
-
-                # Refresh dashboard every 60s to keep live P&L and timestamps fresh
-                now = time.time()
-                if now - last_dashboard_render >= 60.0:
-                    generate_html_dashboard(html_file)
-                    last_dashboard_render = now
-
-            except Exception as loop_exc:
-                logger.error("Error in background position monitor loop: %s", loop_exc, exc_info=True)
-
-            time.sleep(interval_seconds)
-
-    thread = threading.Thread(target=_monitor_loop, daemon=True, name="PositionMonitorDaemon")
-    thread.start()
-    return thread
+def _has_unsafe_path_syntax(raw_path: str) -> bool:
+    """Detect path traversal, dotfiles, backslashes, or null-byte attempts before routing."""
+    if "\x00" in raw_path or "\\" in raw_path:
+        return True
+    decoded = urllib.parse.unquote(raw_path)
+    if "\x00" in decoded or "\\" in decoded:
+        return True
+    for candidate in (raw_path, decoded):
+        for seg in candidate.split("/"):
+            if not seg:
+                continue
+            if seg in (".", ".."):
+                return True
+            if seg.startswith("."):
+                return True
+    return False
 
 
-def make_dashboard_handler(web_dir: Path, html_name: str):
-    """Create HTTP request handler supporting dashboard files and SSE event streaming."""
-    class CustomDashboardHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=str(web_dir), **kwargs)
+def _is_sensitive_path(clean_path: str) -> bool:
+    """Return True if path attempts to access sensitive workspace files or directories."""
+    if _has_unsafe_path_syntax(clean_path):
+        return True
+    decoded = urllib.parse.unquote(clean_path)
+    segments = [seg.lower() for seg in decoded.split("/") if seg]
+    if not segments:
+        return False
+    if segments[0] == "data":
+        return True
+    return any(seg in SENSITIVE_FILENAMES for seg in segments)
+
+
+def _snapshot_to_dict(value: Any) -> Dict[str, Any]:
+    """Serialize ConfigSnapshot or mapping objects into sanitized dictionaries."""
+    if isinstance(value, ConfigSnapshot):
+        return _sanitize_mapping(value.to_dict(include_specs=True))
+    if isinstance(value, Mapping):
+        return _sanitize_mapping(dict(value))
+    return {}
+
+
+def _reject_json_constant(token: str) -> Any:
+    """Reject non-standard NaN/Infinity JSON tokens."""
+    raise ValueError(f"Unsupported JSON constant: {token}")
+
+
+def make_dashboard_handler(
+    web_dir: Path,
+    html_name: str,
+    orchestrator: Optional[Any] = None,
+    auth_manager: Optional[DashboardAuthManager] = None,
+    *,
+    stream_heartbeat_seconds: float = DEFAULT_STREAM_HEARTBEAT_SECONDS,
+    max_sse_subscribers: int = MAX_SSE_SUBSCRIBERS,
+):
+    """Create fail-closed HTTP request handler for dashboard SPA, zero-quota telemetry, SSE, and controls."""
+    resolved_web_dir = Path(web_dir).resolve()
+    safe_html_name = Path(html_name).name
+    shared_auth_manager = auth_manager or DashboardAuthManager()
+    heartbeat_interval = max(0.05, float(stream_heartbeat_seconds))
+    sse_cap = max(1, int(max_sse_subscribers))
+
+    _re_param_delete = re.compile(r"^/api/params/([^/]+)/delete$")
+    _re_pos_re_epoch_preview = re.compile(r"^/api/positions/([^/]+)/re-epoch/preview$")
+    _re_pos_re_epoch = re.compile(r"^/api/positions/([^/]+)/re-epoch$")
+    _re_pos_retry_liq = re.compile(r"^/api/positions/([^/]+)/retry-liquidation$")
+
+    class ControlGatewayHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def setup(self) -> None:
+            conn = getattr(self, "connection", None)
+            if conn is not None and hasattr(conn, "settimeout"):
+                try:
+                    conn.settimeout(REQUEST_SOCKET_TIMEOUT_SECONDS)
+                except OSError:
+                    pass
+            super().setup()
 
         def log_message(self, format: str, *args: Any) -> None:
-            # Suppress normal GET 200 log spam for continuous SSE keepalive & polling
-            clean = format % args
-            if any(p in clean for p in ("/stream", "/api/stream", "/events", "/api/data", "/api/dashboard-data")):
+            try:
+                clean = format % args
+            except Exception:
+                clean = str(format)
+            if any(
+                p in clean
+                for p in ("/stream", "/api/stream", "/events", "/api/data", "/api/dashboard-data")
+            ):
                 return
-            super().log_message(format, *args)
+            logger.debug("%s - %s", self._client_ip(), clean)
 
-        def end_headers(self) -> None:
-            # Prevent browser caching of any files or responses served by dashboard
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            super().end_headers()
+        def _client_ip(self) -> str:
+            addr = getattr(self, "client_address", None)
+            if isinstance(addr, (tuple, list)) and addr:
+                return str(addr[0])
+            return "127.0.0.1"
 
-        def do_GET(self):
-            clean_path = self.path.split("?")[0]
-            if clean_path in ("/api/data", "/api/dashboard-data", "/data.json"):
-                data = build_dashboard_data()
-                body = json.dumps(data).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
+        def _scrub(self, exc_or_msg: Any) -> str:
+            if hasattr(shared_auth_manager, "scrub_error_message"):
+                return shared_auth_manager.scrub_error_message(exc_or_msg)
+            return scrub_error_message(exc_or_msg)
+
+        def _write_common_security_headers(self, no_store: bool = True) -> None:
+            self.send_header("Content-Security-Policy", DEFAULT_CSP_HEADER)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if no_store:
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+
+        def _send_bytes(
+            self,
+            status_code: int,
+            body: bytes,
+            content_type: str,
+            *,
+            no_store: bool = True,
+            extra_headers: Optional[Mapping[str, str]] = None,
+            send_body: bool = True,
+            close_conn: bool = False,
+        ) -> None:
+            if close_conn:
+                self.close_connection = True
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self._write_common_security_headers(no_store=no_store)
+            if close_conn:
+                self.send_header("Connection", "close")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
+            self.end_headers()
+            if send_body and body:
                 self.wfile.write(body)
+
+        def _send_json(
+            self,
+            status_code: int,
+            payload: Any,
+            *,
+            extra_headers: Optional[Mapping[str, str]] = None,
+            send_body: bool = True,
+            close_conn: bool = False,
+        ) -> None:
+            body = json.dumps(payload, default=str).encode("utf-8")
+            self._send_bytes(
+                status_code,
+                body,
+                "application/json; charset=utf-8",
+                no_store=True,
+                extra_headers=extra_headers,
+                send_body=send_body,
+                close_conn=close_conn,
+            )
+
+        def _send_error_json(
+            self,
+            status_code: int,
+            message: Any,
+            *,
+            extra_fields: Optional[Mapping[str, Any]] = None,
+            extra_headers: Optional[Mapping[str, str]] = None,
+            send_body: bool = True,
+            close_conn: bool = True,
+        ) -> None:
+            payload: Dict[str, Any] = {"error": self._scrub(message)}
+            if extra_fields:
+                payload.update(extra_fields)
+            self._send_json(
+                status_code,
+                payload,
+                extra_headers=extra_headers,
+                send_body=send_body,
+                close_conn=close_conn,
+            )
+
+        def _validate_host(self, *, send_body: bool = True) -> bool:
+            host_header = self.headers.get("Host")
+            if not is_valid_host_header(host_header):
+                self._send_error_json(
+                    403,
+                    "Forbidden: invalid or missing Host header.",
+                    send_body=send_body,
+                    close_conn=True,
+                )
+                return False
+            return True
+
+        def _validate_origin(self, *, send_body: bool = True) -> bool:
+            origin_header = self.headers.get("Origin")
+            host_header = self.headers.get("Host")
+            if not is_valid_origin_header(origin_header, host_header):
+                self._send_error_json(
+                    403,
+                    "Forbidden: Origin header mismatch.",
+                    send_body=send_body,
+                    close_conn=True,
+                )
+                return False
+            return True
+
+        def _authenticate_before_body_read(self) -> bool:
+            auth_res = shared_auth_manager.verify_request_auth(self.headers, self._client_ip())
+            if auth_res.ok:
+                return True
+            headers: Dict[str, str] = {}
+            extra: Dict[str, Any] = {}
+            if auth_res.status_code == 401:
+                headers["WWW-Authenticate"] = 'Bearer realm="dashboard"'
+            if auth_res.retry_after is not None:
+                headers["Retry-After"] = str(max(1, int(math.ceil(auth_res.retry_after))))
+                extra["retry_after"] = auth_res.retry_after
+            self._send_error_json(
+                auth_res.status_code,
+                auth_res.error or "Unauthorized.",
+                extra_fields=extra,
+                extra_headers=headers,
+                close_conn=True,
+            )
+            return False
+
+        def _parse_json_body(self, *, allow_empty_body: bool = False) -> Tuple[bool, Dict[str, Any]]:
+            transfer_encoding = str(self.headers.get("Transfer-Encoding") or "").strip().lower()
+            if transfer_encoding:
+                self._send_error_json(411, "Chunked Transfer-Encoding is not supported.")
+                return False, {}
+
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is None:
+                if allow_empty_body:
+                    ctype = str(self.headers.get("Content-Type") or "").strip()
+                    if ctype and ctype.split(";", 1)[0].strip().lower() != "application/json":
+                        self._send_error_json(415, "Unsupported Media Type: expected application/json.")
+                        return False, {}
+                    return True, {}
+                self._send_error_json(411, "Length Required: Content-Length header is required.")
+                return False, {}
+
+            try:
+                content_length = int(str(raw_len).strip())
+            except ValueError:
+                self._send_error_json(400, "Bad Request: invalid Content-Length header.")
+                return False, {}
+
+            if content_length < 0:
+                self._send_error_json(400, "Bad Request: negative Content-Length.")
+                return False, {}
+
+            if content_length > MAX_REQUEST_BODY_BYTES:
+                self._send_error_json(
+                    413,
+                    f"Payload Too Large: maximum request size is {MAX_REQUEST_BODY_BYTES} bytes.",
+                )
+                return False, {}
+
+            raw_ctype = self.headers.get("Content-Type")
+            media_type = (
+                str(raw_ctype).split(";", 1)[0].strip().lower() if raw_ctype is not None else ""
+            )
+            if content_length == 0:
+                if raw_ctype is not None and media_type != "application/json":
+                    self._send_error_json(415, "Unsupported Media Type: expected application/json.")
+                    return False, {}
+                if raw_ctype is None and not allow_empty_body:
+                    self._send_error_json(415, "Unsupported Media Type: Content-Type application/json required.")
+                    return False, {}
+                return True, {}
+
+            if media_type != "application/json":
+                self._send_error_json(415, "Unsupported Media Type: expected application/json.")
+                return False, {}
+
+            try:
+                chunks: List[bytes] = []
+                remaining = content_length
+                while remaining > 0:
+                    chunk = self.rfile.read(remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw_body = b"".join(chunks)
+            except (TimeoutError, socket.timeout):
+                self._send_error_json(408, "Request Timeout while reading JSON payload.")
+                return False, {}
+            except OSError:
+                self._send_error_json(400, "Bad Request: failed to read request body.")
+                return False, {}
+
+            if len(raw_body) != content_length:
+                self._send_error_json(400, "Bad Request: truncated request body.")
+                return False, {}
+
+            try:
+                decoded = raw_body.decode("utf-8")
+                parsed = json.loads(decoded, parse_constant=_reject_json_constant)
+            except Exception:
+                self._send_error_json(400, "Bad Request: malformed JSON body.")
+                return False, {}
+
+            if not isinstance(parsed, dict):
+                self._send_error_json(400, "Bad Request: JSON body must be an object.")
+                return False, {}
+            return True, parsed
+
+        def _get_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
+            return build_dashboard_data(force=force, orchestrator=orchestrator)
+
+        def _current_epoch_id(self) -> str:
+            if orchestrator is not None and getattr(orchestrator, "config_bus", None) is not None:
+                try:
+                    return str(orchestrator.config_bus.active_epoch_id)
+                except Exception:
+                    pass
+            try:
+                snap = self._get_snapshot(force=False)
+                return str(snap.get("config_epoch_id") or "epoch-0")
+            except Exception:
+                return "epoch-0"
+
+        def _handle_sse_stream(self, send_body: bool = True) -> None:
+            broadcaster = SSEBroadcaster.get_instance()
+            q = broadcaster.subscribe_stream(
+                max_subscribers=sse_cap, drop_oldest=True, maxsize=64
+            )
+            if q is None:
+                self._send_error_json(
+                    503,
+                    f"Service Unavailable: maximum concurrent SSE subscribers ({sse_cap}) reached.",
+                    send_body=send_body,
+                    close_conn=True,
+                )
+                return
+
+            self.close_connection = True
+            conn = getattr(self, "connection", None)
+            if conn is not None and hasattr(conn, "settimeout"):
+                try:
+                    conn.settimeout(None)
+                except OSError:
+                    pass
+
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self._write_common_security_headers(no_store=True)
+                self.end_headers()
+                if not send_body:
+                    return
+
+                initial_data = self._get_snapshot(force=False)
+                snapshot_str = json.dumps(initial_data, default=str)
+                self.wfile.write(f"event: snapshot\ndata: {snapshot_str}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+                while True:
+                    try:
+                        msg = q.get(timeout=heartbeat_interval)
+                        if msg is None:
+                            break
+                        if isinstance(msg, Mapping):
+                            event_name = _SAFE_SSE_EVENT_RE.sub(
+                                "_", str(msg.get("event") or "message")
+                            )
+                            data_str = json.dumps(msg.get("data", {}), default=str)
+                        else:
+                            event_name = "message"
+                            data_str = json.dumps(msg, default=str)
+                        self.wfile.write(
+                            f"event: {event_name}\ndata: {data_str}\n\n".encode("utf-8")
+                        )
+                        self.wfile.flush()
+                    except queue.Empty:
+                        hb = {
+                            "epoch": self._current_epoch_id(),
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                        }
+                        self.wfile.write(
+                            f"event: heartbeat\ndata: {json.dumps(hb)}\n\n".encode("utf-8")
+                        )
+                        self.wfile.flush()
+            except (
+                BrokenPipeError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                TimeoutError,
+                OSError,
+            ):
+                pass
+            finally:
+                broadcaster.unsubscribe_stream(q)
+
+        def _serve_packaged_asset(
+            self, asset_path: Path, content_type: str, *, send_body: bool
+        ) -> None:
+            resolved_asset = asset_path.resolve()
+            if not resolved_asset.is_relative_to(ASSETS_DIR.resolve()) or not resolved_asset.is_file():
+                self._send_error_json(404, "Asset not found.", send_body=send_body, close_conn=False)
+                return
+            try:
+                content = resolved_asset.read_bytes()
+            except OSError:
+                self._send_error_json(404, "Asset not found.", send_body=send_body, close_conn=False)
+                return
+            self._send_bytes(
+                200,
+                content,
+                content_type,
+                no_store=True,
+                send_body=send_body,
+                close_conn=False,
+            )
+
+        def _serve_dashboard_html(self, *, send_body: bool) -> None:
+            candidate = resolved_web_dir / safe_html_name
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                self._send_error_json(403, "Forbidden.", send_body=send_body, close_conn=True)
+                return
+
+            if not resolved.is_relative_to(resolved_web_dir):
+                self._send_error_json(403, "Forbidden.", send_body=send_body, close_conn=True)
+                return
+
+            if candidate.is_symlink():
+                # Reject symlinks pointing outside web_dir (already caught by resolve()) and unsafe links
+                self._send_error_json(403, "Forbidden: symlinked HTML rejected.", send_body=send_body, close_conn=True)
+                return
+
+            if resolved.is_file():
+                try:
+                    html_bytes = resolved.read_bytes()
+                except OSError:
+                    html_bytes = _render_dashboard_html_string(
+                        self._get_snapshot(force=False)
+                    ).encode("utf-8")
+            else:
+                html_bytes = _render_dashboard_html_string(
+                    self._get_snapshot(force=False)
+                ).encode("utf-8")
+
+            self._send_bytes(
+                200,
+                html_bytes,
+                "text/html; charset=utf-8",
+                no_store=True,
+                send_body=send_body,
+                close_conn=False,
+            )
+
+        def _handle_get_or_head(self, *, send_body: bool) -> None:
+            if not self._validate_host(send_body=send_body):
+                return
+
+            raw_path = urllib.parse.urlsplit(self.path).path or "/"
+            if _is_sensitive_path(raw_path):
+                self._send_error_json(403, "Forbidden.", send_body=send_body, close_conn=True)
+                return
+
+            clean_path = urllib.parse.unquote(raw_path)
+
+            if clean_path in ("/", f"/{safe_html_name}"):
+                self._serve_dashboard_html(send_body=send_body)
+                return
+
+            if clean_path == "/assets/styles.css":
+                self._serve_packaged_asset(
+                    STYLES_ASSET_PATH, "text/css; charset=utf-8", send_body=send_body
+                )
+                return
+
+            if clean_path == "/assets/workbench.js":
+                self._serve_packaged_asset(
+                    WORKBENCH_ASSET_PATH,
+                    "application/javascript; charset=utf-8",
+                    send_body=send_body,
+                )
+                return
+
+            if clean_path in ("/api/data", "/api/dashboard-data", "/data.json"):
+                data = self._get_snapshot(force=False)
+                self._send_json(200, data, send_body=send_body, close_conn=False)
+                return
+
+            if clean_path == "/api/schema/config":
+                snap = self._get_snapshot(force=False)
+                self._send_json(
+                    200,
+                    {
+                        "config_epoch_id": snap.get("config_epoch_id", "epoch-0"),
+                        "schema": snap.get("schema", {}),
+                        "presets": snap.get("presets", {}),
+                        "controller_attached": bool(snap.get("controller_attached", False)),
+                    },
+                    send_body=send_body,
+                    close_conn=False,
+                )
+                return
+
+            if clean_path == "/api/config":
+                snap = self._get_snapshot(force=False)
+                cfg = _sanitize_mapping(snap.get("config") or {})
+                self._send_json(
+                    200,
+                    {
+                        "config_epoch_id": snap.get("config_epoch_id", "epoch-0"),
+                        "config": cfg,
+                        "values": cfg,
+                        "pending_restart_keys": snap.get("pending_restart_keys", []),
+                        "config_quarantine_warnings": snap.get("config_quarantine_warnings", []),
+                        "epoch_history": snap.get("epoch_history", []),
+                        "controller_attached": bool(snap.get("controller_attached", False)),
+                    },
+                    send_body=send_body,
+                    close_conn=False,
+                )
                 return
 
             if clean_path in ("/stream", "/api/stream", "/events"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache, no-transform")
-                self.send_header("Connection", "keep-alive")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-
-                broadcaster = SSEBroadcaster.get_instance()
-                q = broadcaster.subscribe()
-                try:
-                    # Emit initial state snapshot immediately
-                    initial_data = build_dashboard_data()
-                    snapshot_str = json.dumps(initial_data)
-                    self.wfile.write(f"event: snapshot\ndata: {snapshot_str}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-
-                    while True:
-                        try:
-                            msg = q.get(timeout=2.0)
-                            event_name = msg.get("event", "message")
-                            data_str = json.dumps(msg.get("data", {}))
-                            self.wfile.write(f"event: {event_name}\ndata: {data_str}\n\n".encode("utf-8"))
-                            self.wfile.flush()
-                        except queue.Empty:
-                            self.wfile.write(b": keepalive\n\n")
-                            self.wfile.flush()
-                except (ConnectionResetError, BrokenPipeError, socket.error):
-                    pass
-                finally:
-                    broadcaster.unsubscribe(q)
+                self._handle_sse_stream(send_body=send_body)
                 return
 
-            if clean_path in ("/", ""):
-                self.path = f"/{html_name}"
-            return super().do_GET()
+            self._send_error_json(404, "Not Found.", send_body=send_body, close_conn=False)
 
-        def do_POST(self):
-            clean_path = self.path.split("?")[0]
-            if clean_path in ("/api/panic", "/panic"):
-                content_length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
-                try:
-                    payload = json.loads(body) if body else {}
-                except Exception:
-                    payload = {}
+        def do_GET(self) -> None:
+            self._handle_get_or_head(send_body=True)
 
-                expected_token = getattr(settings, "PANIC_FLATTEN_TOKEN", "")
-                if expected_token and payload.get("token") != expected_token:
-                    self.send_response(401)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "Unauthorized: Invalid panic token"}).encode("utf-8"))
+        def do_HEAD(self) -> None:
+            self._handle_get_or_head(send_body=False)
+
+        def do_OPTIONS(self) -> None:
+            if not self._validate_host(send_body=True):
+                return
+            if not self._validate_origin(send_body=True):
+                return
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self._write_common_security_headers(no_store=True)
+            self.end_headers()
+
+        def _handle_control_exception(self, exc: Exception) -> None:
+            exc_name = type(exc).__name__
+            if isinstance(exc, ConfigConflictError) or exc_name == "ConfigConflictError":
+                latest = getattr(exc, "latest_snapshot", None)
+                latest_dict = _snapshot_to_dict(latest)
+                if not latest_dict and orchestrator is not None:
+                    bus = getattr(orchestrator, "config_bus", None)
+                    if bus is not None:
+                        try:
+                            latest_dict = _snapshot_to_dict(bus.active_snapshot())
+                        except Exception:
+                            latest_dict = {}
+                actual_epoch = getattr(exc, "actual_epoch_id", None) or latest_dict.get(
+                    "config_epoch_id"
+                )
+                self._send_error_json(
+                    409,
+                    exc,
+                    extra_fields={
+                        "expected_epoch_id": getattr(exc, "expected_epoch_id", None),
+                        "actual_epoch_id": actual_epoch,
+                        "active_epoch_id": actual_epoch,
+                        "config_epoch_id": actual_epoch,
+                        "latest_snapshot": latest_dict,
+                        "config": latest_dict,
+                    },
+                    close_conn=False,
+                )
+                return
+
+            if (
+                isinstance(exc, PositionEpochConflictError)
+                or exc_name == "PositionEpochConflictError"
+            ):
+                snap = self._get_snapshot(force=True)
+                self._send_error_json(
+                    409,
+                    exc,
+                    extra_fields={
+                        "ticker": getattr(exc, "ticker", ""),
+                        "expected_epoch_id": getattr(exc, "expected_epoch_id", None),
+                        "actual_epoch_id": getattr(exc, "actual_epoch_id", None),
+                        "expected_position_epoch_id": getattr(
+                            exc, "expected_position_epoch_id", None
+                        ),
+                        "actual_position_epoch_id": getattr(
+                            exc, "actual_position_epoch_id", None
+                        ),
+                        "expected_target_epoch_id": getattr(
+                            exc, "expected_target_epoch_id", None
+                        ),
+                        "actual_target_epoch_id": getattr(exc, "actual_target_epoch_id", None),
+                        "dashboard": snap,
+                    },
+                    close_conn=False,
+                )
+                return
+
+            if isinstance(exc, ResumeBlockedError) or exc_name == "ResumeBlockedError":
+                snap = self._get_snapshot(force=True)
+                self._send_error_json(
+                    409,
+                    exc,
+                    extra_fields={
+                        "unprotected_positions": getattr(exc, "unprotected_positions", None)
+                        or [],
+                        "dashboard": snap,
+                    },
+                    close_conn=False,
+                )
+                return
+
+            if isinstance(exc, ConfigValidationError) or exc_name == "ConfigValidationError":
+                self._send_error_json(
+                    422,
+                    exc,
+                    extra_fields={"validation_errors": list(getattr(exc, "errors", []) or [])},
+                    close_conn=False,
+                )
+                return
+
+            if isinstance(exc, KeyError):
+                key_label = str(exc.args[0]) if exc.args else "resource"
+                self._send_error_json(
+                    404,
+                    f"Not found: {key_label}",
+                    close_conn=False,
+                )
+                return
+
+            if isinstance(exc, ValueError):
+                self._send_error_json(400, exc, close_conn=False)
+                return
+
+            self._send_error_json(500, exc, close_conn=False)
+
+        def _publish_mutation_snapshot(self, event_name: str, result: Any) -> Dict[str, Any]:
+            _invalidate_dashboard_cache()
+            snapshot = self._get_snapshot(force=True)
+            result_dict = _snapshot_to_dict(result)
+            try:
+                if event_name == "config_epoch_changed":
+                    SSEBroadcaster.get_instance().broadcast(
+                        "config_epoch_changed",
+                        {
+                            "config_epoch_id": snapshot.get("config_epoch_id"),
+                            "dashboard": snapshot,
+                        },
+                    )
+                else:
+                    SSEBroadcaster.get_instance().broadcast(event_name, snapshot)
+            except Exception as b_exc:
+                logger.debug("SSE broadcast failed after mutation: %s", b_exc)
+            response: Dict[str, Any] = dict(result_dict)
+            response["ok"] = True
+            response["dashboard"] = snapshot
+            response.setdefault("config_epoch_id", snapshot.get("config_epoch_id"))
+            response.setdefault("config", snapshot.get("config"))
+            return response
+
+        def do_POST(self) -> None:
+            if not self._validate_host():
+                return
+            if not self._validate_origin():
+                return
+
+            # Pre-auth body refusal: authenticate BEFORE reading a single byte of rfile.
+            if not self._authenticate_before_body_read():
+                return
+
+            raw_path = urllib.parse.urlsplit(self.path).path or "/"
+            if _is_sensitive_path(raw_path):
+                self._send_error_json(403, "Forbidden.", close_conn=True)
+                return
+
+            clean_path = urllib.parse.unquote(raw_path)
+            allow_empty = raw_path in ("/api/auth/verify", "/api/panic", "/panic")
+            ok_body, payload = self._parse_json_body(allow_empty_body=allow_empty)
+            if not ok_body:
+                return
+
+            if clean_path == "/api/auth/verify":
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "controller_attached": orchestrator is not None,
+                        "read_only_reason": ""
+                        if orchestrator is not None
+                        else READ_ONLY_REASON_DEFAULT,
+                    },
+                    close_conn=False,
+                )
+                return
+
+            param_delete_match = _re_param_delete.match(raw_path)
+            pos_preview_match = _re_pos_re_epoch_preview.match(raw_path)
+            pos_re_epoch_match = _re_pos_re_epoch.match(raw_path)
+            pos_retry_match = _re_pos_retry_liq.match(raw_path)
+
+            known_control_route = (
+                clean_path
+                in (
+                    "/api/config/preview",
+                    "/api/config",
+                    "/api/params",
+                    "/api/positions/re-epoch-all/preview",
+                    "/api/positions/re-epoch-all",
+                    "/api/panic",
+                    "/panic",
+                    "/api/resume",
+                )
+                or param_delete_match is not None
+                or pos_preview_match is not None
+                or pos_re_epoch_match is not None
+                or pos_retry_match is not None
+            )
+            if not known_control_route:
+                self._send_error_json(404, "Not Found.", close_conn=False)
+                return
+
+            if orchestrator is None:
+                self._send_error_json(
+                    503,
+                    READ_ONLY_REASON_DEFAULT,
+                    extra_fields={"controller_attached": False},
+                    close_conn=False,
+                )
+                return
+
+            try:
+                if clean_path == "/api/config/preview":
+                    profile_id = payload.get("profile_id")
+                    if profile_id:
+                        profiles = get_builtin_profiles()
+                        if str(profile_id) not in profiles:
+                            raise KeyError(f"Unknown config profile: {profile_id}")
+                        patch = dict(profiles[str(profile_id)].get("overrides", profiles[str(profile_id)]))
+                    else:
+                        patch = payload.get("patch")
+                        if not isinstance(patch, Mapping):
+                            raise ValueError("patch must be a JSON object.")
+                    expected_epoch_id = payload.get("expected_epoch_id")
+                    preview_res = orchestrator.preview_config_patch(
+                        dict(patch), expected_epoch_id=expected_epoch_id
+                    )
+                    self._send_json(200, _sanitize_mapping(preview_res), close_conn=False)
                     return
 
-                try:
-                    t212 = Trading212Client(
-                        api_key=settings.TRADING212_API_KEY,
-                        api_secret=settings.TRADING212_API_SECRET,
-                        base_url=settings.api_base_url,
+                if clean_path == "/api/config":
+                    expected_epoch_id = payload.get("expected_epoch_id")
+                    if expected_epoch_id is None:
+                        raise ValueError("expected_epoch_id is required.")
+                    author = str(payload.get("author") or "operator")
+                    reason = str(payload.get("reason") or "")
+                    profile_id = payload.get("profile_id")
+                    if profile_id:
+                        if hasattr(orchestrator, "apply_config_profile") and callable(
+                            orchestrator.apply_config_profile
+                        ):
+                            res = orchestrator.apply_config_profile(
+                                str(profile_id),
+                                str(expected_epoch_id),
+                                author=author,
+                                reason=reason,
+                            )
+                        else:
+                            profiles = get_builtin_profiles()
+                            if str(profile_id) not in profiles:
+                                raise KeyError(f"Unknown config profile: {profile_id}")
+                            profile_patch = dict(
+                                profiles[str(profile_id)].get("overrides", profiles[str(profile_id)])
+                            )
+                            res = orchestrator.commit_config_patch(
+                                profile_patch,
+                                str(expected_epoch_id),
+                                author=author,
+                                reason=reason,
+                            )
+                    else:
+                        patch = payload.get("patch")
+                        if not isinstance(patch, Mapping):
+                            raise ValueError("patch must be a JSON object.")
+                        res = orchestrator.commit_config_patch(
+                            dict(patch),
+                            str(expected_epoch_id),
+                            author=author,
+                            reason=reason,
+                        )
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("config_epoch_changed", res),
+                        close_conn=False,
                     )
-                    notifier = Notifier(
-                        telegram_bot_token=settings.TELEGRAM_BOT_TOKEN,
-                        telegram_chat_id=settings.TELEGRAM_CHAT_ID,
-                        discord_webhook_url=settings.DISCORD_WEBHOOK_URL,
-                    )
-                    risk_mgr = RiskManager()
-                    monitor = PositionMonitor(
-                        t212_client=t212,
-                        notifier=notifier,
-                        risk_manager=risk_mgr,
-                        state_file=settings.ACTIVE_TRADES_PATH,
-                        dry_run=not settings.USE_LIVE,
-                    )
-                    res = monitor.panic_flatten_all()
-                    SSEBroadcaster.get_instance().broadcast("panic_flatten", res)
+                    return
 
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "success", "result": res}).encode("utf-8"))
-                except Exception as exc:
-                    self.send_response(500)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                if clean_path == "/api/params":
+                    spec = payload.get("spec")
+                    if not isinstance(spec, Mapping):
+                        spec = {
+                            k: v
+                            for k, v in payload.items()
+                            if k not in ("expected_epoch_id", "author", "reason")
+                        }
+                    if not spec:
+                        raise ValueError("Dynamic parameter spec is required.")
+                    expected_epoch_id = payload.get("expected_epoch_id")
+                    res = orchestrator.add_custom_parameter(
+                        dict(spec), expected_epoch_id=expected_epoch_id
+                    )
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("config_epoch_changed", res),
+                        close_conn=False,
+                    )
+                    return
+
+                if param_delete_match is not None:
+                    param_key = urllib.parse.unquote(param_delete_match.group(1)).strip()
+                    if not param_key:
+                        raise ValueError("Parameter key is required.")
+                    expected_epoch_id = payload.get("expected_epoch_id")
+                    res = orchestrator.delete_custom_parameter(
+                        param_key, expected_epoch_id=expected_epoch_id
+                    )
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("config_epoch_changed", res),
+                        close_conn=False,
+                    )
+                    return
+
+                if pos_preview_match is not None:
+                    ticker = urllib.parse.unquote(pos_preview_match.group(1)).strip()
+                    if not ticker:
+                        raise ValueError("Ticker is required.")
+                    preview_res = orchestrator.preview_position_re_epoch(
+                        ticker,
+                        target_epoch_id=payload.get("target_epoch_id"),
+                        confirm_pure_tsl_mode_change=bool(
+                            payload.get("confirm_pure_tsl_mode_change", False)
+                        ),
+                    )
+                    self._send_json(200, _sanitize_mapping(preview_res), close_conn=False)
+                    return
+
+                if pos_re_epoch_match is not None:
+                    ticker = urllib.parse.unquote(pos_re_epoch_match.group(1)).strip()
+                    if not ticker:
+                        raise ValueError("Ticker is required.")
+                    res = orchestrator.re_epoch_position(
+                        ticker,
+                        expected_position_epoch_id=payload.get("expected_position_epoch_id"),
+                        target_epoch_id=payload.get("target_epoch_id"),
+                        confirm_pure_tsl_mode_change=bool(
+                            payload.get("confirm_pure_tsl_mode_change", False)
+                        ),
+                    )
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("dashboard_update", res),
+                        close_conn=False,
+                    )
+                    return
+
+                if clean_path == "/api/positions/re-epoch-all/preview":
+                    preview_res = orchestrator.preview_re_epoch_all(
+                        target_epoch_id=payload.get("target_epoch_id"),
+                        confirm_pure_tsl_mode_change=bool(
+                            payload.get("confirm_pure_tsl_mode_change", False)
+                        ),
+                    )
+                    self._send_json(200, _sanitize_mapping(preview_res), close_conn=False)
+                    return
+
+                if clean_path == "/api/positions/re-epoch-all":
+                    res = orchestrator.re_epoch_all_positions(
+                        expected_epoch_id=payload.get("expected_epoch_id"),
+                        target_epoch_id=payload.get("target_epoch_id"),
+                        confirm_pure_tsl_mode_change=bool(
+                            payload.get("confirm_pure_tsl_mode_change", False)
+                        ),
+                    )
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("dashboard_update", res),
+                        close_conn=False,
+                    )
+                    return
+
+                if clean_path in ("/api/panic", "/panic"):
+                    reason = str(payload.get("reason") or "Dashboard emergency panic flatten")
+                    res = orchestrator.trigger_panic_flatten(reason=reason)
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("panic_flatten", res),
+                        close_conn=False,
+                    )
+                    return
+
+                if clean_path == "/api/resume":
+                    confirm_unprotected = bool(payload.get("confirm_unprotected", False))
+                    res = orchestrator.resume_trading(confirm_unprotected=confirm_unprotected)
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("dashboard_update", res),
+                        close_conn=False,
+                    )
+                    return
+
+                if pos_retry_match is not None:
+                    ticker = urllib.parse.unquote(pos_retry_match.group(1)).strip()
+                    if not ticker:
+                        raise ValueError("Ticker is required.")
+                    res = orchestrator.retry_panic_liquidation(ticker)
+                    self._send_json(
+                        200,
+                        self._publish_mutation_snapshot("dashboard_update", res),
+                        close_conn=False,
+                    )
+                    return
+
+            except Exception as exc:
+                self._handle_control_exception(exc)
+
+        def _reject_unsupported_method(self) -> None:
+            if not self._validate_host():
                 return
+            if not self._validate_origin():
+                return
+            self._send_error_json(405, f"Method {self.command} is not allowed.", close_conn=True)
 
-            self.send_response(404)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"error": "Not Found"}')
+        do_PUT = _reject_unsupported_method
+        do_DELETE = _reject_unsupported_method
+        do_PATCH = _reject_unsupported_method
 
-    return CustomDashboardHandler
+    return ControlGatewayHandler
+
+
+def _ensure_loopback_port_free(port: int) -> None:
+    """Detect active listeners occupying ``port`` on either wildcard (0.0.0.0) or loopback."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("0.0.0.0", port))
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as conn_probe:
+            conn_probe.settimeout(0.05)
+            if conn_probe.connect_ex(("127.0.0.1", port)) == 0:
+                raise OSError(
+                    errno.EADDRINUSE,
+                    f"Port {port} is already accepting connections on localhost",
+                )
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise
+
+
+def _bind_loopback_dashboard_server(
+    port: int, handler_cls: Any
+) -> ThreadingDashboardServer:
+    """Bind ThreadingDashboardServer strictly to 127.0.0.1 after checking active listeners."""
+    _ensure_loopback_port_free(port)
+    return ThreadingDashboardServer(("127.0.0.1", port), handler_cls)
 
 
 def start_local_server_thread(
     html_file: str = "signals_dashboard.html",
     port: int = 8888,
     open_browser: bool = False,
+    orchestrator: Optional[Any] = None,
+    auth_manager: Optional[DashboardAuthManager] = None,
+    allow_port_fallback: bool = True,
 ) -> Tuple[Optional[threading.Thread], Optional[socketserver.TCPServer], str]:
-    """Start the dashboard HTTP server in a background daemon thread."""
-    generate_html_dashboard(html_file)
+    """Start the dashboard HTTP control gateway server in a background daemon thread."""
+    active_auth = auth_manager or DashboardAuthManager()
+    generate_html_dashboard(html_file, orchestrator=orchestrator)
     web_dir = Path(html_file).resolve().parent
     html_name = Path(html_file).name
-    HandlerClass = make_dashboard_handler(web_dir, html_name)
+    HandlerClass = make_dashboard_handler(
+        web_dir,
+        html_name,
+        orchestrator=orchestrator,
+        auth_manager=active_auth,
+    )
 
-    socketserver.TCPServer.allow_reuse_address = True
+    ThreadingDashboardServer.allow_reuse_address = True
+    httpd: Optional[ThreadingDashboardServer] = None
     bind_port = port
-    httpd = None
-    for attempt in range(5):
-        try:
-            httpd = ThreadingDashboardServer(("0.0.0.0", bind_port), HandlerClass)
-            break
-        except OSError:
-            bind_port = port + attempt + 1
 
-    if not httpd:
-        logger.warning("Could not bind dashboard server to any port in range %d-%d", port, port + 5)
-        return None, None, ""
+    if allow_port_fallback:
+        for attempt in range(5):
+            candidate = port + attempt
+            try:
+                httpd = _bind_loopback_dashboard_server(candidate, HandlerClass)
+                bind_port = candidate
+                break
+            except OSError:
+                continue
+        if httpd is None:
+            logger.warning(
+                "Could not bind dashboard server to any port in range %d-%d", port, port + 4
+            )
+            return None, None, ""
+    else:
+        last_exc: Optional[OSError] = None
+        for attempt in range(6):
+            try:
+                httpd = _bind_loopback_dashboard_server(port, HandlerClass)
+                bind_port = port
+                break
+            except OSError as exc:
+                last_exc = exc
+                if attempt < 5:
+                    time.sleep(0.1)
+        if httpd is None:
+            assert last_exc is not None
+            raise last_exc
 
     url = f"http://localhost:{bind_port}/{html_name}"
 
-    def _serve():
+    def _serve() -> None:
         try:
             httpd.serve_forever()
         except Exception:
@@ -1885,7 +2387,7 @@ def start_local_server_thread(
 
     thread = threading.Thread(target=_serve, daemon=True, name="DashboardServerThread")
     thread.start()
-    logger.info("🚀 Signals Dashboard running live at: %s", url)
+    logger.info("Signals Dashboard gateway listening at %s", url)
     if open_browser:
         try:
             webbrowser.open(url)
@@ -1894,20 +2396,31 @@ def start_local_server_thread(
     return thread, httpd, url
 
 
-def start_local_server(html_file: str, port: int = 8888, open_browser: bool = True) -> None:
-    """Serve the dashboard on a local HTTP server with autonomous background position monitoring."""
-    # Launch autonomous background position monitor for 100% automated Pure TSL execution
-    start_background_position_monitor(html_file=html_file, interval_seconds=15)
+def start_local_server(
+    html_file: str = "signals_dashboard.html",
+    port: int = 8888,
+    open_browser: bool = True,
+    auth_manager: Optional[DashboardAuthManager] = None,
+) -> None:
+    """Serve the standalone dashboard strictly read-only on localhost without sidecar monitors."""
+    active_auth = auth_manager or DashboardAuthManager()
+    active_auth.get_token()
+    generate_html_dashboard(html_file, orchestrator=None)
 
     web_dir = Path(html_file).resolve().parent
     html_name = Path(html_file).name
-    HandlerClass = make_dashboard_handler(web_dir, html_name)
+    HandlerClass = make_dashboard_handler(
+        web_dir,
+        html_name,
+        orchestrator=None,
+        auth_manager=active_auth,
+    )
 
-    socketserver.TCPServer.allow_reuse_address = True
-    with ThreadingDashboardServer(("0.0.0.0", port), HandlerClass) as httpd:
+    ThreadingDashboardServer.allow_reuse_address = True
+    with ThreadingDashboardServer(("127.0.0.1", port), HandlerClass) as httpd:
         url = f"http://localhost:{port}/{html_name}"
-        print(f"\n🚀 Signals Dashboard running live at: {url}")
-        print("⚡ COMPLETE AUTOMATION ACTIVE: Polling every 15s for dynamic TSL ratchets & GTC stop synchronization")
+        print(f"\nSignals Dashboard running (standalone read-only mode) at: {url}")
+        print(active_auth.setup_hint())
         print("Press Ctrl+C to stop the dashboard server.\n")
         if open_browser:
             webbrowser.open(url)
@@ -1920,17 +2433,51 @@ def start_local_server(html_file: str, port: int = 8888, open_browser: bool = Tr
 def main() -> None:
     """CLI entry point for Signals Dashboard."""
     parser = argparse.ArgumentParser(description="3x Quantitative Signals Dashboard")
-    parser.add_argument("--port", type=int, default=8888, help="Port to serve dashboard (default: 8888)")
-    parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
-    parser.add_argument("--generate-only", action="store_true", help="Generate HTML and JSON without running server")
-    parser.add_argument("--output", type=str, default="signals_dashboard.html", help="Path to write dashboard HTML")
+    parser.add_argument(
+        "--port", type=int, default=8888, help="Port to serve dashboard (default: 8888)"
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true", help="Do not open browser automatically"
+    )
+    parser.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="Generate HTML and exit without running server",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="signals_dashboard.html",
+        help="Path to write dashboard HTML",
+    )
+    parser.add_argument(
+        "--print-token",
+        action="store_true",
+        help="Print the active dashboard authentication token and exit",
+    )
+    parser.add_argument(
+        "--token-file",
+        type=str,
+        default=None,
+        help="Optional path to the persistent dashboard token file",
+    )
     args = parser.parse_args()
 
+    auth_mgr = DashboardAuthManager(token_file=args.token_file)
+    if args.print_token:
+        auth_mgr.print_token()
+        return
+
     html_path = generate_html_dashboard(args.output)
-    print(f"✅ Dashboard generated: {os.path.abspath(html_path)}")
+    print(f"Dashboard generated: {os.path.abspath(html_path)}")
 
     if not args.generate_only:
-        start_local_server(html_path, port=args.port, open_browser=not args.no_browser)
+        start_local_server(
+            html_path,
+            port=args.port,
+            open_browser=not args.no_browser,
+            auth_manager=auth_mgr,
+        )
 
 
 if __name__ == "__main__":
