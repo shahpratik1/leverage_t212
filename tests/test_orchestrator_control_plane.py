@@ -944,6 +944,55 @@ class TestOrchestratorControlPlane(unittest.TestCase):
                 finally:
                     orch.shutdown()
 
+    def test_magicmock_safe_active_position_and_snapshot_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bus = ConfigBus(data_dir=tmpdir)
+            client = _FakeT212Client()
+            orch = Orchestrator(
+                dry_run=True,
+                enable_dashboard=False,
+                t212_client=client,
+                config_bus=bus,
+                data_dir=tmpdir,
+            )
+            try:
+                orch.position_monitor.positions = {
+                    "MOCK_UNCONFIGURED": MagicMock(),
+                    "MOCK_CLOSED": MagicMock(is_closed=True, remaining_quantity=5.0),
+                    "MOCK_OPEN": MagicMock(
+                        is_closed=False,
+                        remaining_quantity=4.0,
+                        ticker="MOCK_OPEN",
+                        underlying="QQQ",
+                        direction="LONG",
+                        entry_price=100.0,
+                    ),
+                    "DICT_OPEN": {
+                        "ticker": "DICT_OPEN",
+                        "underlying": "NVDA",
+                        "direction": "LONG",
+                        "is_closed": False,
+                        "remaining_quantity": 2.0,
+                        "entry_price": 50.0,
+                    },
+                }
+
+                self.assertTrue(orch._has_active_position("MOCK_UNCONFIGURED"))
+                self.assertFalse(orch._has_active_position("MOCK_CLOSED"))
+                self.assertTrue(orch._has_active_position("MOCK_OPEN"))
+                self.assertTrue(orch._has_active_position("DICT_OPEN"))
+
+                halted, rows = orch._snapshot_positions_under_lock()
+                self.assertFalse(halted)
+                row_tickers = {t for t, _ in rows}
+                self.assertEqual(row_tickers, {"MOCK_OPEN", "DICT_OPEN"})
+                refreshed = orch._refresh_read_model_snapshot(persist_funnel=False, broadcast=False)
+                self.assertEqual(len(refreshed["active_signals"]), 2)
+                snap = orch.get_dashboard_snapshot()
+                self.assertEqual(len(snap["active_signals"]), 2)
+            finally:
+                orch.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

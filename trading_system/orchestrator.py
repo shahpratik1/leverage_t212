@@ -197,6 +197,24 @@ def _as_bool_strict(val: Any, default: bool = False) -> bool:
         return bool(val)
     return default
 
+
+def _pos_is_closed(pos: Any) -> bool:
+    """Return True only when a tracked position (or mapping) is explicitly marked closed."""
+    if pos is None:
+        return True
+    raw = pos.get("is_closed", False) if isinstance(pos, Mapping) else getattr(pos, "is_closed", False)
+    return _as_bool_strict(raw, False)
+
+
+def _pos_remaining_qty(pos: Any) -> float:
+    """Safely extract numeric remaining_quantity from a tracked position or mapping."""
+    if pos is None:
+        return 0.0
+    raw = pos.get("remaining_quantity", 0.0) if isinstance(pos, Mapping) else getattr(pos, "remaining_quantity", 0.0)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw)
+    return 0.0
+
 # Fallback watchlist of ordinary equities if 3x mode is disabled
 DEFAULT_UNIVERSE = [
     "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK-B",
@@ -638,12 +656,26 @@ class Orchestrator:
                 halted = _as_bool_strict(getattr(pm, "is_halted", False), False)
 
             for ticker, pos in list(raw_positions.items()):
-                if getattr(pos, "is_closed", False):
+                if _pos_is_closed(pos):
                     continue
-                rem_qty = float(getattr(pos, "remaining_quantity", 0.0) or 0.0)
-                if rem_qty <= 0.0 and not bool(getattr(pos, "panic_failed", False)):
+                rem_qty = _pos_remaining_qty(pos)
+                panic_failed_raw = (
+                    pos.get("panic_failed", False)
+                    if isinstance(pos, Mapping)
+                    else getattr(pos, "panic_failed", False)
+                )
+                if rem_qty <= 0.0 and not _as_bool_strict(panic_failed_raw, False):
                     continue
-                pos_dict = asdict(pos) if hasattr(pos, "__dataclass_fields__") else dict(vars(pos))
+                if isinstance(pos, Mapping):
+                    pos_dict = dict(pos)
+                elif hasattr(type(pos), "__dataclass_fields__"):
+                    pos_dict = asdict(pos)
+                else:
+                    pos_dict = {
+                        str(k): v
+                        for k, v in vars(pos).items()
+                        if not str(k).startswith("_") and not callable(v)
+                    }
                 rows.append((str(ticker), pos_dict))
         return halted, rows
 
@@ -1377,7 +1409,7 @@ class Orchestrator:
         with broker_lock:
             with state_lock:
                 pos = pm.positions.get(ticker)
-                if pos is None or getattr(pos, "is_closed", False) or float(getattr(pos, "remaining_quantity", 0.0) or 0.0) <= 0.0:
+                if _pos_is_closed(pos) or _pos_remaining_qty(pos) <= 0.0:
                     raise KeyError(f"Open position {ticker!r} not found for liquidation retry")
                 qty_to_sell = float(pos.remaining_quantity)
 
@@ -1445,7 +1477,7 @@ class Orchestrator:
 
         underlyings = list({
             pos.underlying for pos in self.position_monitor.positions.values()
-            if not pos.is_closed and pos.underlying
+            if not _pos_is_closed(pos) and isinstance(getattr(pos, "underlying", None), str) and pos.underlying
         })
         if not underlyings:
             return {}
@@ -2225,7 +2257,7 @@ class Orchestrator:
             pos = positions.get(trading212_ticker)
             if pos is None:
                 return False
-            return not bool(getattr(pos, "is_closed", False))
+            return not _pos_is_closed(pos)
 
     # ─────────────────────────────────────────────────────────────
     # Audit Log
@@ -2335,10 +2367,11 @@ class Orchestrator:
 
             held_tickers = {getattr(p, "ticker", "") for p in running_positions}
             for p in getattr(self.position_monitor, "positions", {}).values():
-                if not p.is_closed and p.remaining_quantity > 0 and p.ticker not in held_tickers:
+                rem_qty = _pos_remaining_qty(p)
+                if not _pos_is_closed(p) and rem_qty > 0 and getattr(p, "ticker", None) not in held_tickers:
                     running_positions.append(Position(
                         ticker=p.ticker,
-                        quantity=p.remaining_quantity,
+                        quantity=rem_qty,
                         average_price=p.entry_price,
                         current_price=getattr(p, "highest_price", p.entry_price),
                         ppl=0.0,
