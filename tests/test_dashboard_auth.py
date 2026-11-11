@@ -379,6 +379,8 @@ class TestHTTPSecurityValidators(unittest.TestCase):
             "172.31.255.254:8888",
             "192.168.1.1",
             "192.168.178.42:8080",
+            "trading212-pi",
+            "trading212-pi:8080",
             "trading212-pi.local",
             "trading212-pi.local:8080",
             "trading212-pi.fritz.box",
@@ -421,6 +423,30 @@ class TestHTTPSecurityValidators(unittest.TestCase):
         for host in invalid_hosts:
             with self.subTest(host=host):
                 self.assertFalse(is_valid_host_header(host))
+
+    def test_hostname_and_env_allowed_hosts(self) -> None:
+        with patch("trading_system.dashboard.auth.socket.gethostname", return_value="pi-desk-box"):
+            self.assertTrue(is_valid_host_header("pi-desk-box"))
+            self.assertTrue(is_valid_host_header("pi-desk-box:8080"))
+            self.assertFalse(is_valid_host_header("evil.com"))
+
+        with patch.dict(
+            os.environ,
+            {"DASHBOARD_ALLOWED_HOSTS": "custom-pi.lan, 100.64.0.10, *, 0.0.0.0"},
+        ):
+            self.assertTrue(is_valid_host_header("custom-pi.lan"))
+            self.assertTrue(is_valid_host_header("custom-pi.lan:8080"))
+            self.assertTrue(is_valid_host_header("100.64.0.10:8080"))
+            self.assertFalse(is_valid_host_header("evil.com"))
+            self.assertFalse(is_valid_host_header("custom-pi.lan.evil.com"))
+            self.assertFalse(is_valid_host_header("0.0.0.0:8080"))
+
+        self.assertTrue(
+            is_valid_origin_header("http://trading212-pi:8080", "trading212-pi:8080")
+        )
+        self.assertFalse(
+            is_valid_origin_header("http://evil.com:8080", "trading212-pi:8080")
+        )
 
     def test_origin_validation(self) -> None:
         # Absent Origin allowed for CLI/curl calls
@@ -539,6 +565,9 @@ class TestHTTPSecurityValidators(unittest.TestCase):
             "TRADES_LOG_PATH",
             "USE_LIVE",
             "custom_api_key",
+            "api_key",
+            "API_KEY",
+            "secret_key",
             "my_secret",
             "token_file",
         ):
@@ -546,6 +575,7 @@ class TestHTTPSecurityValidators(unittest.TestCase):
                 self.assertTrue(is_sensitive_key(key))
 
         for key in (
+            "key",
             "MIN_ADX_TREND",
             "MAX_RISK_PER_TRADE",
             "ATR_SL_MULTIPLIER",

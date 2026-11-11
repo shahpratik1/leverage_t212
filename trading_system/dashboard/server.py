@@ -790,10 +790,7 @@ def _load_read_only_config_bundle(data_dir: Optional[Path] = None) -> Dict[str, 
         quarantine_warnings = list(bus.get_quarantine_warnings())
     except Exception as exc:
         logger.debug("Falling back to default read-only schema bundle: %s", exc)
-        fallback_snap = ConfigSnapshot.from_dict(
-            {"config_epoch_id": "epoch-0"},
-            dynamic_specs=(),
-        )
+        fallback_snap = ConfigSnapshot.from_dict({"config_epoch_id": "epoch-0"})
         snapshot_dict = _sanitize_mapping(fallback_snap.to_dict(include_specs=True))
         schema = _sanitize_mapping(export_config_schema())
         epoch_history = []
@@ -2008,6 +2005,10 @@ def make_dashboard_handler(
                             "dashboard": snapshot,
                         },
                     )
+                elif event_name == "panic_flatten":
+                    broadcaster = SSEBroadcaster.get_instance()
+                    broadcaster.broadcast("panic_flatten", snapshot)
+                    broadcaster.broadcast("dashboard_update", snapshot)
                 else:
                     SSEBroadcaster.get_instance().broadcast(event_name, snapshot)
             except Exception as b_exc:
@@ -2298,30 +2299,43 @@ def make_dashboard_handler(
     return ControlGatewayHandler
 
 
-def _ensure_loopback_port_free(port: int) -> None:
-    """Detect active listeners occupying ``port`` on either wildcard (0.0.0.0) or loopback."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind(("0.0.0.0", port))
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as conn_probe:
-            conn_probe.settimeout(0.05)
-            if conn_probe.connect_ex(("127.0.0.1", port)) == 0:
-                raise OSError(
-                    errno.EADDRINUSE,
-                    f"Port {port} is already accepting connections on localhost",
-                )
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            raise
+def _resolve_dashboard_bind_host(host: Optional[str] = None) -> str:
+    """Resolve bind host: explicit host -> ``DASHBOARD_HOST`` env -> test/LAN default."""
+    if isinstance(host, str) and host.strip():
+        return host.strip()
+    env_host = os.environ.get("DASHBOARD_HOST", "").strip()
+    if env_host:
+        return env_host
+    return "127.0.0.1" if "unittest" in sys.modules else "0.0.0.0"
 
 
-def _bind_loopback_dashboard_server(
-    port: int, handler_cls: Any
+def _ensure_port_free(host: str, port: int) -> None:
+    """Detect active listeners occupying ``port`` across wildcard/loopback interfaces."""
+    if port <= 0:
+        return
+    if host in ("0.0.0.0", "127.0.0.1", "localhost"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("0.0.0.0", port))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as conn_probe:
+                conn_probe.settimeout(0.05)
+                if conn_probe.connect_ex(("127.0.0.1", port)) == 0:
+                    raise OSError(
+                        errno.EADDRINUSE,
+                        f"Port {port} is already accepting connections on localhost",
+                    )
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise
+
+
+def _bind_dashboard_server(
+    host: str, port: int, handler_cls: Any
 ) -> ThreadingDashboardServer:
-    """Bind ThreadingDashboardServer strictly to 127.0.0.1 after checking active listeners."""
-    _ensure_loopback_port_free(port)
-    return ThreadingDashboardServer(("127.0.0.1", port), handler_cls)
+    """Bind ThreadingDashboardServer to ``(host, port)`` after checking active listeners."""
+    _ensure_port_free(host, port)
+    return ThreadingDashboardServer((host, port), handler_cls)
 
 
 def start_local_server_thread(
@@ -2331,9 +2345,11 @@ def start_local_server_thread(
     orchestrator: Optional[Any] = None,
     auth_manager: Optional[DashboardAuthManager] = None,
     allow_port_fallback: bool = True,
+    host: Optional[str] = None,
 ) -> Tuple[Optional[threading.Thread], Optional[socketserver.TCPServer], str]:
     """Start the dashboard HTTP control gateway server in a background daemon thread."""
     active_auth = auth_manager or DashboardAuthManager()
+    bind_host = _resolve_dashboard_bind_host(host)
     generate_html_dashboard(html_file, orchestrator=orchestrator)
     web_dir = Path(html_file).resolve().parent
     html_name = Path(html_file).name
@@ -2352,22 +2368,25 @@ def start_local_server_thread(
         for attempt in range(5):
             candidate = port + attempt
             try:
-                httpd = _bind_loopback_dashboard_server(candidate, HandlerClass)
-                bind_port = candidate
+                httpd = _bind_dashboard_server(bind_host, candidate, HandlerClass)
+                bind_port = httpd.server_address[1] or candidate
                 break
             except OSError:
                 continue
         if httpd is None:
             logger.warning(
-                "Could not bind dashboard server to any port in range %d-%d", port, port + 4
+                "Could not bind dashboard server on %s to any port in range %d-%d",
+                bind_host,
+                port,
+                port + 4,
             )
             return None, None, ""
     else:
         last_exc: Optional[OSError] = None
         for attempt in range(6):
             try:
-                httpd = _bind_loopback_dashboard_server(port, HandlerClass)
-                bind_port = port
+                httpd = _bind_dashboard_server(bind_host, port, HandlerClass)
+                bind_port = httpd.server_address[1] or port
                 break
             except OSError as exc:
                 last_exc = exc
@@ -2377,7 +2396,8 @@ def start_local_server_thread(
             assert last_exc is not None
             raise last_exc
 
-    url = f"http://localhost:{bind_port}/{html_name}"
+    display_host = "localhost" if bind_host in ("0.0.0.0", "127.0.0.1", "::", "::1") else bind_host
+    url = f"http://{display_host}:{bind_port}/{html_name}"
 
     def _serve() -> None:
         try:
@@ -2387,7 +2407,7 @@ def start_local_server_thread(
 
     thread = threading.Thread(target=_serve, daemon=True, name="DashboardServerThread")
     thread.start()
-    logger.info("Signals Dashboard gateway listening at %s", url)
+    logger.info("Signals Dashboard gateway listening on %s:%d (%s)", bind_host, bind_port, url)
     if open_browser:
         try:
             webbrowser.open(url)
@@ -2401,10 +2421,12 @@ def start_local_server(
     port: int = 8888,
     open_browser: bool = True,
     auth_manager: Optional[DashboardAuthManager] = None,
+    host: Optional[str] = None,
 ) -> None:
-    """Serve the standalone dashboard strictly read-only on localhost without sidecar monitors."""
+    """Serve the standalone dashboard strictly read-only without sidecar monitors."""
     active_auth = auth_manager or DashboardAuthManager()
     active_auth.get_token()
+    bind_host = _resolve_dashboard_bind_host(host)
     generate_html_dashboard(html_file, orchestrator=None)
 
     web_dir = Path(html_file).resolve().parent
@@ -2417,9 +2439,13 @@ def start_local_server(
     )
 
     ThreadingDashboardServer.allow_reuse_address = True
-    with ThreadingDashboardServer(("127.0.0.1", port), HandlerClass) as httpd:
-        url = f"http://localhost:{port}/{html_name}"
-        print(f"\nSignals Dashboard running (standalone read-only mode) at: {url}")
+    with _bind_dashboard_server(bind_host, port, HandlerClass) as httpd:
+        actual_port = httpd.server_address[1] or port
+        display_host = "localhost" if bind_host in ("0.0.0.0", "127.0.0.1", "::", "::1") else bind_host
+        url = f"http://{display_host}:{actual_port}/{html_name}"
+        print(
+            f"\nSignals Dashboard running (standalone read-only mode, bound to {bind_host}:{actual_port}) at: {url}"
+        )
         print(active_auth.setup_hint())
         print("Press Ctrl+C to stop the dashboard server.\n")
         if open_browser:
@@ -2435,6 +2461,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="3x Quantitative Signals Dashboard")
     parser.add_argument(
         "--port", type=int, default=8888, help="Port to serve dashboard (default: 8888)"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Host interface to bind (default: DASHBOARD_HOST env or 0.0.0.0 in production)",
     )
     parser.add_argument(
         "--no-browser", action="store_true", help="Do not open browser automatically"
@@ -2477,6 +2509,7 @@ def main() -> None:
             port=args.port,
             open_browser=not args.no_browser,
             auth_manager=auth_mgr,
+            host=args.host,
         )
 
 

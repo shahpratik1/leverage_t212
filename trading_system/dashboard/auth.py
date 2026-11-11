@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import stat
 import sys
 import tempfile
@@ -259,6 +260,32 @@ def _parse_port(port_str: str) -> Optional[int]:
     return port if 1 <= port <= 65535 else None
 
 
+def _extra_allowed_hosts() -> frozenset[str]:
+    """Parse optional comma-separated extra allowed hosts from ``DASHBOARD_ALLOWED_HOSTS``."""
+    raw = os.environ.get("DASHBOARD_ALLOWED_HOSTS", "")
+    if not raw:
+        return frozenset()
+    allowed: set[str] = set()
+    for item in raw.split(","):
+        candidate = item.strip().lower().rstrip(".")
+        if not candidate or candidate in ("*", "0.0.0.0", "::"):
+            continue
+        allowed.add(candidate)
+    return frozenset(allowed)
+
+
+def _local_machine_hostname() -> str:
+    """Return the normalized local OS hostname when available."""
+    try:
+        raw = socket.gethostname() or ""
+    except OSError:
+        return ""
+    norm = raw.strip().lower().rstrip(".")
+    if not norm or norm in ("*", "0.0.0.0", "::"):
+        return ""
+    return norm
+
+
 def _parse_and_validate_host(host_header: Optional[str]) -> Optional[Tuple[str, Optional[int]]]:
     """Parse and validate a ``Host`` header against loopback/RFC1918/LAN allowlists.
 
@@ -326,7 +353,11 @@ def _parse_and_validate_host(host_header: Optional[str]) -> Optional[Tuple[str, 
     if ip_obj is not None:
         if not isinstance(ip_obj, ipaddress.IPv4Address):
             return None
-        if ip_obj in _LOOPBACK_IPV4_NET or any(ip_obj in net for net in _RFC1918_IPV4_NETS):
+        if not ip_obj.is_unspecified and (
+            ip_obj in _LOOPBACK_IPV4_NET
+            or any(ip_obj in net for net in _RFC1918_IPV4_NETS)
+            or str(ip_obj) in _extra_allowed_hosts()
+        ):
             return (str(ip_obj), port)
         return None
 
@@ -340,18 +371,23 @@ def _parse_and_validate_host(host_header: Optional[str]) -> Optional[Tuple[str, 
     if not all(_DNS_LABEL_RE.match(label) for label in labels):
         return None
 
-    if host_norm == "localhost":
+    if host_norm in ("localhost", "trading212-pi"):
         return (host_norm, port)
     if host_norm.endswith(".local") and len(labels) >= 2:
         return (host_norm, port)
     if host_norm.endswith(".fritz.box") and len(labels) >= 3:
+        return (host_norm, port)
+    local_hostname = _local_machine_hostname()
+    if local_hostname and host_norm == local_hostname:
+        return (host_norm, port)
+    if host_norm in _extra_allowed_hosts():
         return (host_norm, port)
 
     return None
 
 
 def is_valid_host_header(host_header: Optional[str]) -> bool:
-    """Return ``True`` if ``Host`` targets loopback, RFC1918 IPv4, ``*.local``, or ``*.fritz.box``."""
+    """Return ``True`` if ``Host`` targets loopback, RFC1918 IPv4, LAN names, or ``DASHBOARD_ALLOWED_HOSTS``."""
     return _parse_and_validate_host(host_header) is not None
 
 
@@ -441,7 +477,7 @@ def is_sensitive_key(key: str) -> bool:
         return False
     if norm in SENSITIVE_CONFIG_KEYS:
         return True
-    if norm in ("KEY", "API_KEY", "SECRET_KEY", "PRIVATE_KEY", "TOKEN_FILE", "STATE_FILE", "LOG_FILE", "ENV_FILE"):
+    if norm in ("API_KEY", "SECRET_KEY", "PRIVATE_KEY", "TOKEN_FILE", "STATE_FILE", "LOG_FILE", "ENV_FILE"):
         return True
     if norm.endswith(_SENSITIVE_KEY_SUFFIXES) or norm.startswith("AUTH_"):
         return True

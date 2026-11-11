@@ -29,6 +29,7 @@ from trading_system.dashboard.server import (
     MAX_REQUEST_BODY_BYTES,
     MAX_SSE_SUBSCRIBERS,
     SSEBroadcaster,
+    _resolve_dashboard_bind_host,
     build_dashboard_data,
     generate_html_dashboard,
     main as server_main,
@@ -1178,6 +1179,207 @@ class TestControlGatewayAPI(unittest.TestCase):
         ):
             server_main()
         self.assertEqual(buf.getvalue().strip(), self.token)
+
+    # ── 7. Regressions: Key Sanitization, Pi LAN Host, Fallback & Panic SSE ────────
+
+    def test_schema_dynamic_specs_and_preview_preserve_param_key_while_stripping_secrets(
+        self,
+    ) -> None:
+        orch = _FakeOrchestrator(self.root / "data")
+        gw = self._make_gateway(orch)
+
+        # Add a custom dynamic parameter first
+        add_body = json.dumps(
+            {
+                "spec": {
+                    "key": "CUSTOM_ADX_FLOOR",
+                    "label": "Custom ADX Floor",
+                    "type": "float",
+                    "default": 20.0,
+                    "min": 5.0,
+                    "max": 60.0,
+                    "step": 1.0,
+                    "group": "screener",
+                    "impact_hint": "ADX floor filter",
+                    "screener_metric_gate": {
+                        "metric": "adx",
+                        "op": ">=",
+                        "threshold": 20.0,
+                    },
+                },
+                "expected_epoch_id": "epoch-0",
+            }
+        ).encode()
+        s_add, _, b_add, _ = gw.request_raw(
+            "POST",
+            "/api/params",
+            headers=self._auth_headers(extra={"Content-Length": str(len(add_body))}),
+            body=add_body,
+        )
+        self.assertEqual(s_add, 200)
+
+        # Verify build_dashboard_data, GET /api/data, GET /api/schema/config, and GET /api/config preserve "key"
+        with patch("trading_system.config.settings.TRADING212_API_KEY", "secret_key_val"):
+            snap = build_dashboard_data(force=True, orchestrator=orch)
+            self.assertTrue(snap["schema"]["parameters"])
+            self.assertTrue(all(p.get("key") for p in snap["schema"]["parameters"]))
+            self.assertEqual(snap["config"]["dynamic_parameter_specs"][0]["key"], "CUSTOM_ADX_FLOOR")
+            self.assertNotIn("TRADING212_API_KEY", snap["config"])
+
+            s_data, _, b_data, _ = gw.request_raw("GET", "/api/data")
+            self.assertEqual(s_data, 200)
+            data_json = json.loads(b_data.decode("utf-8"))
+            self.assertTrue(all(p.get("key") for p in data_json["schema"]["parameters"]))
+            self.assertEqual(
+                data_json["config"]["dynamic_parameter_specs"][0]["key"],
+                "CUSTOM_ADX_FLOOR",
+            )
+
+            s_schema, _, b_schema, _ = gw.request_raw("GET", "/api/schema/config")
+            self.assertEqual(s_schema, 200)
+            schema_params = json.loads(b_schema.decode("utf-8"))["schema"]["parameters"]
+            self.assertTrue(all(p.get("key") for p in schema_params))
+
+            s_cfg, _, b_cfg, _ = gw.request_raw("GET", "/api/config")
+            self.assertEqual(s_cfg, 200)
+            cfg_payload = json.loads(b_cfg.decode("utf-8"))["config"]
+            self.assertEqual(cfg_payload["dynamic_parameter_specs"][0]["key"], "CUSTOM_ADX_FLOOR")
+            self.assertNotIn("TRADING212_API_KEY", cfg_payload)
+
+            # Verify preview diff entries retain "key"
+            prev_body = json.dumps(
+                {"patch": {"MIN_ADX_TREND": 22.0}, "expected_epoch_id": "epoch-1"}
+            ).encode()
+            s_prev, _, b_prev, _ = gw.request_raw(
+                "POST",
+                "/api/config/preview",
+                headers=self._auth_headers(extra={"Content-Length": str(len(prev_body))}),
+                body=prev_body,
+            )
+            self.assertEqual(s_prev, 200)
+            diff_items = json.loads(b_prev.decode("utf-8"))["diff"]
+            self.assertTrue(diff_items)
+            self.assertEqual(diff_items[0]["key"], "MIN_ADX_TREND")
+
+    def test_read_only_config_bundle_fallback_handles_config_bus_failure(self) -> None:
+        with patch(
+            "trading_system.dashboard.server.ConfigBus",
+            side_effect=RuntimeError("corrupt config store"),
+        ):
+            payload = build_dashboard_data(force=True, orchestrator=None)
+
+        self.assertFalse(payload["controller_attached"])
+        self.assertEqual(payload["config_epoch_id"], "epoch-0")
+        self.assertEqual(payload["config"]["config_epoch_id"], "epoch-0")
+        self.assertTrue(payload["schema"]["parameters"])
+        self.assertTrue(all(p.get("key") for p in payload["schema"]["parameters"]))
+
+    def test_bind_host_resolution_supports_lan_env_and_cli_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DASHBOARD_HOST", None)
+            self.assertEqual(_resolve_dashboard_bind_host(None), "127.0.0.1")
+            self.assertEqual(_resolve_dashboard_bind_host("0.0.0.0"), "0.0.0.0")
+
+            # Outside unittest (production Pi service), default bind host is 0.0.0.0 for LAN access
+            fake_mods = dict(sys.modules)
+            fake_mods.pop("unittest", None)
+            with patch.dict(sys.modules, fake_mods, clear=True):
+                self.assertEqual(_resolve_dashboard_bind_host(None), "0.0.0.0")
+                with patch.dict(os.environ, {"DASHBOARD_HOST": "192.168.1.50"}):
+                    self.assertEqual(_resolve_dashboard_bind_host(None), "192.168.1.50")
+                    self.assertEqual(_resolve_dashboard_bind_host("127.0.0.1"), "127.0.0.1")
+
+        # Verify explicit host="0.0.0.0" binds wildcard and accepts Host: trading212-pi:<port>
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("0.0.0.0", 0))
+            lan_port = probe.getsockname()[1]
+
+        t, httpd, url = start_local_server_thread(
+            html_file=str(self.html_path),
+            port=lan_port,
+            open_browser=False,
+            auth_manager=self.auth,
+            allow_port_fallback=False,
+            host="0.0.0.0",
+        )
+        try:
+            self.assertIsNotNone(httpd)
+            self.assertEqual(httpd.server_address[0], "0.0.0.0")
+            self.assertEqual(url, f"http://localhost:{lan_port}/{self.html_path.name}")
+            gw = self._make_gateway(orchestrator=None)
+            s_pi, _, _, _ = gw.request_raw(
+                "GET",
+                "/api/data",
+                headers={"Host": f"trading212-pi:{lan_port}"},
+            )
+            self.assertEqual(s_pi, 200)
+        finally:
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+
+        # Verify CLI --host forwards cleanly to start_local_server
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "server.py",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8999",
+                "--output",
+                str(self.html_path),
+                "--token-file",
+                str(self.token_file),
+                "--no-browser",
+            ],
+        ), patch("trading_system.dashboard.server.start_local_server") as mock_serve:
+            server_main()
+            mock_serve.assert_called_once()
+            self.assertEqual(mock_serve.call_args.kwargs.get("host"), "127.0.0.1")
+
+    def test_panic_emits_dashboard_update_sse_event(self) -> None:
+        orch = _FakeOrchestrator(self.root / "data")
+        gw = self._make_gateway(orch, heartbeat_s=0.5)
+
+        status, _, sock, fp, thread = gw.open_stream("/stream")
+        self.assertEqual(status, 200)
+        try:
+            init_ev, init_data = _read_sse_event(fp)
+            self.assertEqual(init_ev, "snapshot")
+            self.assertFalse(init_data["is_halted"])
+
+            s_panic, _, b_panic, _ = gw.request_raw(
+                "POST",
+                "/api/panic",
+                headers=self._auth_headers(extra={"Content-Length": "2"}),
+                body=b"{}",
+            )
+            self.assertEqual(s_panic, 200)
+            self.assertTrue(json.loads(b_panic.decode("utf-8"))["dashboard"]["is_halted"])
+
+            seen_events: Dict[str, Dict[str, Any]] = {}
+            for _ in range(4):
+                ev, payload = _read_sse_event(fp, timeout_s=1.5)
+                if ev and payload is not None:
+                    seen_events[ev] = payload
+                if "dashboard_update" in seen_events:
+                    break
+
+            self.assertIn("dashboard_update", seen_events)
+            self.assertTrue(seen_events["dashboard_update"]["is_halted"])
+        finally:
+            try:
+                fp.close()
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+            SSEBroadcaster.get_instance().close_all()
+            thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":
