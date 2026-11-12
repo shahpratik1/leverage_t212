@@ -7,6 +7,7 @@ and dispatches real-time alerts.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import logging
@@ -304,15 +305,17 @@ class PositionMonitor:
                         return bool(self._snap_val(snap, "PURE_TSL_MODE", self.pure_tsl_mode))
                 except Exception:
                     pass
-        if self._explicit_pure_tsl_mode is not None:
-            return bool(self.pure_tsl_mode)
         if self.config_bus is not None:
             try:
                 snap = self.config_bus.active_snapshot()
-                if snap is not None:
+                if snap is not None and (
+                    self._explicit_pure_tsl_mode is None or getattr(snap, "generation", 0) > 0
+                ):
                     return bool(self._snap_val(snap, "PURE_TSL_MODE", self.pure_tsl_mode))
             except Exception:
                 pass
+        if self._explicit_pure_tsl_mode is not None:
+            return bool(self.pure_tsl_mode)
         return bool(getattr(self, "pure_tsl_mode", getattr(settings, "PURE_TSL_MODE", True)))
 
     @staticmethod
@@ -409,8 +412,13 @@ class PositionMonitor:
             is_runner=is_runner,
             config_snapshot=config_snapshot,
         )
-        min_sl_pct = float(self._snap_val(config_snapshot, "ETP_MIN_SL_PCT", 0.02))
-        distance = max(effective_mult * pos.atr, peak_price * min(0.02, min_sl_pct if min_sl_pct > 0 else 0.02))
+        if config_snapshot is not None:
+            min_sl_pct = float(self._snap_val(config_snapshot, "ETP_MIN_SL_PCT", 0.025))
+            if min_sl_pct <= 0:
+                min_sl_pct = 0.025
+        else:
+            min_sl_pct = 0.02
+        distance = max(effective_mult * pos.atr, peak_price * min_sl_pct)
         is_cfd_short = self.is_true_short_contract(pos)
         if is_cfd_short:
             new_tsl = peak_price + distance
@@ -428,19 +436,25 @@ class PositionMonitor:
         if not isinstance(default_mult, (int, float)):
             default_mult = getattr(settings, "TSL_HYSTERESIS_ATR_MULT", 0.5)
         mult = float(self._snap_val(config_snapshot, "TSL_HYSTERESIS_ATR_MULT", default_mult)) if config_snapshot is not None else None
-        if mult is not None and self._callable_accepts_kwarg(self.risk_manager.calculate_escape_threshold, "multiplier"):
-            val = self.risk_manager.calculate_escape_threshold(
+        esc_fn = self.risk_manager.calculate_escape_threshold
+        extra_kwargs: Dict[str, Any] = {}
+        if self._callable_accepts_kwarg(esc_fn, "ticker"):
+            extra_kwargs["ticker"] = pos.ticker
+        if mult is not None and self._callable_accepts_kwarg(esc_fn, "multiplier"):
+            val = esc_fn(
                 tp1=pos.tp1,
                 atr=pos.atr,
                 direction=pos.direction,
                 multiplier=mult,
+                **extra_kwargs,
             )
             if isinstance(val, (int, float)):
                 return float(val)
-        return self.risk_manager.calculate_escape_threshold(
+        return esc_fn(
             tp1=pos.tp1,
             atr=pos.atr,
             direction=pos.direction,
+            **extra_kwargs,
         )
 
     def _check_market_open(self, ticker: str) -> bool:
@@ -529,7 +543,7 @@ class PositionMonitor:
 
                 if self.dry_run:
                     if not cur_stop_id or panic_failed:
-                        placed_id = self.place_broker_stop(pos, allow_day_fallback=False)
+                        placed_id = self.place_broker_stop(pos, allow_day_fallback=False, _allow_while_halted=True)
                         if placed_id:
                             with self._state_lock:
                                 pos.panic_failed = False
@@ -576,7 +590,7 @@ class PositionMonitor:
                         pos.broker_stop_order_id = None
                         state_dirty = True
 
-                placed_id = self.place_broker_stop(pos, allow_day_fallback=False)
+                placed_id = self.place_broker_stop(pos, allow_day_fallback=False, _allow_while_halted=True)
                 if placed_id:
                     with self._state_lock:
                         pos.panic_failed = False
@@ -885,6 +899,15 @@ class PositionMonitor:
         needed, uses strict GTC stops (no DAY fallback), and restores old_sl immediately on failure.
         """
         with self._broker_op_lock:
+            if self.is_system_halted():
+                return {
+                    "ticker": ticker,
+                    "action": "blocked",
+                    "status": "blocked",
+                    "applied": False,
+                    "broker_modified": False,
+                    "reason": "System is HALTED — resume trading before re-epoching positions.",
+                }
             target_snap, resolved_target_epoch_id = self._resolve_target_snapshot(target_epoch_id)
 
             # Target epoch CAS check against active ConfigBus epoch
@@ -971,6 +994,8 @@ class PositionMonitor:
                     stop_price=new_sl,
                     allow_day_fallback=False,
                     _allow_heal=False,
+                    _auto_restore_on_failure=False,
+                    _allow_while_halted=True,
                 )
                 if new_stop_id is None:
                     # Replacement failed after cancelling previous stop -> immediately restore old_sl
@@ -979,6 +1004,8 @@ class PositionMonitor:
                         stop_price=old_sl,
                         allow_day_fallback=False,
                         _allow_heal=False,
+                        _auto_restore_on_failure=False,
+                        _allow_while_halted=True,
                     )
                     with self._state_lock:
                         pos.stop_loss = old_stop_loss_field
@@ -986,6 +1013,12 @@ class PositionMonitor:
                         if restored_id is None and had_existing_stop:
                             pos.unprotected_reason = "Re-epoch GTC stop replacement and restoration failed"
                         self._save_state()
+                    if restored_id is None and had_existing_stop and hasattr(self.notifier, "notify_alert"):
+                        with contextlib.suppress(Exception):
+                            self.notifier.notify_alert(
+                                f"🚨 UNPROTECTED POSITION: {pos.ticker}",
+                                f"Re-epoch GTC stop replacement ({new_sl:.2f}) and old stop restore ({old_sl:.2f}) both failed.",
+                            )
                     return {
                         **plan,
                         "status": "replacement_failed",
@@ -1425,15 +1458,24 @@ class PositionMonitor:
         self,
         pos: TrackedPosition,
         stop_price: Optional[float] = None,
-        allow_day_fallback: bool = True,
+        allow_day_fallback: bool = False,
         _allow_heal: bool = True,
+        _auto_restore_on_failure: bool = True,
+        _allow_while_halted: bool = False,
     ) -> Optional[str]:
         """Place or replace a native GTC Stop Order on Trading 212 broker server."""
         with self._state_lock:
+            if (not _allow_while_halted and self.is_system_halted()) or pos.is_closed:
+                return None
             price = stop_price if stop_price is not None else pos.trailing_stop_loss
             rem_qty = pos.remaining_quantity
             cur_price = pos.current_price or pos.highest_price or pos.entry_price
             has_existing_stop = bool(pos.broker_stop_order_id)
+            old_stop_price = getattr(pos, "_last_broker_stop_price", None)
+            if not old_stop_price or old_stop_price <= 0:
+                old_stop_price = pos.stop_loss if (pos.stop_loss or 0.0) > 0 else pos.trailing_stop_loss
+            old_stop_field = pos.stop_loss
+            old_tsl_field = pos.trailing_stop_loss
         if rem_qty <= 0 or price <= 0:
             return None
 
@@ -1457,7 +1499,7 @@ class PositionMonitor:
                 )
                 if not _allow_heal:
                     return None
-                self._heal_stale_stop(pos)
+                self._heal_stale_stop(pos, rejected_price=price)
                 with self._state_lock:
                     price = pos.trailing_stop_loss
                 if price >= cur_price:
@@ -1467,14 +1509,27 @@ class PositionMonitor:
                     )
                     return None
 
+        with self._state_lock:
+            if (not _allow_while_halted and self.is_system_halted()) or pos.is_closed:
+                return None
+
         # Cancel previous broker stop order if one was already placed
+        cancelled_existing_stop = False
         if has_existing_stop:
-            self.cancel_broker_stop(pos)
+            cancelled_existing_stop = self.cancel_broker_stop(pos)
+
+        with self._state_lock:
+            if (not _allow_while_halted and self.is_system_halted()) or pos.is_closed:
+                return None
 
         if self.dry_run:
             fake_id = f"DRY_STOP_{pos.ticker}_{int(time.time())}"
             with self._state_lock:
+                if (not _allow_while_halted and self.is_system_halted()) or pos.is_closed:
+                    return None
                 pos.broker_stop_order_id = fake_id
+                pos.unprotected_reason = None
+                setattr(pos, "_last_broker_stop_price", round(price, 2))
                 self._save_state()
             logger.info("[DRY-RUN] Would place native broker Stop Order for %s: %.3f shares @ $%.2f",
                         pos.ticker, rem_qty, price)
@@ -1488,7 +1543,7 @@ class PositionMonitor:
                 "Placing native Stop Order on Trading 212 for %s: %.3f shares @ stopPrice $%.2f",
                 pos.ticker, order_qty, price
             )
-            # Try GOOD_TILL_CANCEL first (standard for persistent protective stops), fallback to DAY if allowed
+            # Try GOOD_TILL_CANCEL first (standard for persistent protective stops), fallback to DAY only when explicitly allowed
             try:
                 res = self.t212.place_stop_order(
                     ticker=pos.ticker,
@@ -1500,7 +1555,6 @@ class PositionMonitor:
                 if not allow_day_fallback:
                     raise
                 logger.debug("Stop order with validity GOOD_TILL_CANCEL failed (%s), attempting DAY...", first_exc)
-                # Respect rate limit spacing before fallback order submission
                 delay = self._rate_limit_delay
                 if delay > 0:
                     time.sleep(delay)
@@ -1511,10 +1565,22 @@ class PositionMonitor:
                     time_validity="DAY",
                 )
             order_id = str(res.id) if hasattr(res, "id") and res.id is not None else str(res)
+            orphan_abort = False
             with self._state_lock:
-                pos.broker_stop_order_id = order_id
-                setattr(pos, "_last_stop_fail_time", 0.0)
-                self._save_state()
+                if (not _allow_while_halted and self.is_system_halted()) or pos.is_closed:
+                    orphan_abort = True
+                else:
+                    pos.broker_stop_order_id = order_id
+                    pos.unprotected_reason = None
+                    setattr(pos, "_last_stop_fail_time", 0.0)
+                    setattr(pos, "_last_broker_stop_price", round(price, 2))
+                    self._save_state()
+            if orphan_abort:
+                with contextlib.suppress(Exception):
+                    if self.t212:
+                        self.t212.cancel_order(order_id)
+                logger.warning("Cancelled orphan stop order %s for %s after system halt/close", order_id, pos.ticker)
+                return None
             logger.info("Successfully placed broker Stop Order on Trading 212: %s (id=%s)", pos.ticker, order_id)
             return order_id
         except Exception as exc:
@@ -1540,10 +1606,21 @@ class PositionMonitor:
                             time_validity="GOOD_TILL_CANCEL",
                         )
                         order_id = str(res.id) if hasattr(res, "id") and res.id is not None else str(res)
+                        orphan_abort = False
                         with self._state_lock:
-                            pos.broker_stop_order_id = order_id
-                            setattr(pos, "_last_stop_fail_time", 0.0)
-                            self._save_state()
+                            if (not _allow_while_halted and self.is_system_halted()) or pos.is_closed:
+                                orphan_abort = True
+                            else:
+                                pos.broker_stop_order_id = order_id
+                                pos.unprotected_reason = None
+                                setattr(pos, "_last_stop_fail_time", 0.0)
+                                setattr(pos, "_last_broker_stop_price", round(price, 2))
+                                self._save_state()
+                        if orphan_abort:
+                            with contextlib.suppress(Exception):
+                                if self.t212:
+                                    self.t212.cancel_order(order_id)
+                            return None
                         logger.info(
                             "Successfully placed adjusted broker Stop Order on Trading 212: %s (id=%s, qty=%.3f)",
                             pos.ticker, order_id, available_qty
@@ -1552,18 +1629,72 @@ class PositionMonitor:
                 except Exception as retry_exc:
                     logger.warning("Retry with adjusted quantity failed for %s: %s", pos.ticker, retry_exc)
 
+            # If we cancelled an active GTC stop and replacement failed outside explicit Re-Epoch restore,
+            # immediately attempt bounded restore of old_stop_price so the position is not left naked.
+            if (
+                _auto_restore_on_failure
+                and cancelled_existing_stop
+                and old_stop_price
+                and old_stop_price > 0
+                and round(old_stop_price, 2) != round(price, 2)
+                and (is_cfd_short or cur_price <= 0 or old_stop_price < cur_price)
+                and (_allow_while_halted or not self.is_system_halted())
+            ):
+                restored_id: Optional[str] = None
+                for attempt in range(2):
+                    try:
+                        if attempt > 0 and self._rate_limit_delay > 0:
+                            time.sleep(min(1.5, self._rate_limit_delay))
+                        r_res = self.t212.place_stop_order(
+                            ticker=pos.ticker,
+                            quantity=order_qty,
+                            stop_price=round(old_stop_price, 2),
+                            time_validity="GOOD_TILL_CANCEL",
+                        )
+                        restored_id = str(r_res.id) if hasattr(r_res, "id") and r_res.id is not None else str(r_res)
+                        break
+                    except Exception as restore_exc:
+                        logger.error("Restore previous GTC stop attempt %d failed for %s: %s", attempt + 1, pos.ticker, restore_exc)
+                with self._state_lock:
+                    if restored_id:
+                        pos.broker_stop_order_id = restored_id
+                        pos.stop_loss = min(old_stop_field, old_stop_price) if old_stop_field else old_stop_price
+                        pos.trailing_stop_loss = old_stop_price if round(old_tsl_field or 0.0, 2) == round(price, 2) else old_tsl_field
+                        pos.unprotected_reason = None
+                        setattr(pos, "_last_broker_stop_price", round(old_stop_price, 2))
+                    else:
+                        pos.unprotected_reason = "GTC stop replacement and restoration failed"
+                    self._save_state()
+                if not restored_id and hasattr(self.notifier, "notify_alert"):
+                    with contextlib.suppress(Exception):
+                        self.notifier.notify_alert(
+                            f"🚨 UNPROTECTED POSITION: {pos.ticker}",
+                            f"Replacement stop ({price:.2f}) and previous stop restore ({old_stop_price:.2f}) failed.",
+                        )
+            elif cancelled_existing_stop and _auto_restore_on_failure:
+                with self._state_lock:
+                    pos.unprotected_reason = "GTC stop replacement failed after cancelling previous stop"
+                    self._save_state()
+                if hasattr(self.notifier, "notify_alert"):
+                    with contextlib.suppress(Exception):
+                        self.notifier.notify_alert(
+                            f"🚨 UNPROTECTED POSITION: {pos.ticker}",
+                            f"Previous GTC stop cancelled and replacement ({price:.2f}) failed.",
+                        )
+
             # Detect stale stop-price rejection (HTTP 400 / "price too far") and self-heal
             if _allow_heal and ("400" in err_str or "price" in err_str or "far" in err_str or "invalid" in err_str):
                 logger.warning(
                     "Detected possible stale stop price for %s — attempting self-heal", pos.ticker
                 )
-                self._heal_stale_stop(pos)
+                self._heal_stale_stop(pos, rejected_price=price)
             return None
 
-    def _heal_stale_stop(self, pos: TrackedPosition) -> None:
+    def _heal_stale_stop(self, pos: TrackedPosition, rejected_price: Optional[float] = None) -> None:
         """Re-fetch live market price from broker and recompute a fresh ATR-based stop loss.
 
-        Never loosens an already ratcheted valid stop (`max(old_sl, healed_sl)` for LONG).
+        Never loosens an already ratcheted valid stop (`max(old_sl, healed_sl)` for LONG),
+        while excluding any `rejected_price` so a broker-rejected stop cannot re-loop.
         Updates `pos.stop_loss` and `pos.trailing_stop_loss` in-place under `_state_lock` and persists state.
         """
         if self.dry_run:
@@ -1586,12 +1717,22 @@ class PositionMonitor:
                 is_short = self.is_true_short_contract(pos)
                 if is_short:
                     healed_sl = round(live_price * (1.0 + atr_pct * 2.5), 4)
-                    candidates = [s for s in (pos.stop_loss, pos.trailing_stop_loss) if (s or 0.0) > live_price]
+                    candidates = [
+                        s for s in (pos.stop_loss, pos.trailing_stop_loss)
+                        if (s or 0.0) > live_price
+                        and (rejected_price is None or abs(float(s) - float(rejected_price)) > 1e-4)
+                        and not (rejected_price is not None and rejected_price <= healed_sl and float(s) <= float(rejected_price) + 1e-4)
+                    ]
                     old_sl = min(candidates) if candidates else pos.stop_loss
                     new_sl = round(min(old_sl, healed_sl), 4) if candidates else healed_sl
                 else:
                     healed_sl = round(live_price * (1.0 - atr_pct * 2.5), 4)
-                    candidates = [s for s in (pos.stop_loss, pos.trailing_stop_loss) if 0.0 < (s or 0.0) < live_price]
+                    candidates = [
+                        s for s in (pos.stop_loss, pos.trailing_stop_loss)
+                        if 0.0 < (s or 0.0) < live_price
+                        and (rejected_price is None or abs(float(s) - float(rejected_price)) > 1e-4)
+                        and not (rejected_price is not None and rejected_price >= healed_sl and float(s) >= float(rejected_price) - 1e-4)
+                    ]
                     old_sl = max(candidates) if candidates else pos.stop_loss
                     new_sl = round(max(old_sl, healed_sl), 4) if candidates else healed_sl
 
@@ -2168,10 +2309,14 @@ class PositionMonitor:
 
                     if state_changed:
                         self._save_state()
-                    if need_stop_restore:
+                    if need_stop_restore and not self.is_system_halted():
                         self.place_broker_stop(pos)
                     if need_cancel_all:
                         self.cancel_all_broker_orders(pos)
+
+            if self.is_system_halted():
+                logger.info("Reconciliation skipped broker adoption/stop placement — system is HALTED")
+                return summary
 
             # 2. Check for untracked positions on broker and adopt them
             active_snap = None
@@ -2257,6 +2402,8 @@ class PositionMonitor:
                         setattr(adopted_pos, "_last_atr_pct", (levels["atr"] / avg_px) if avg_px > 0 else 0.04)
 
                         with self._state_lock:
+                            if self.is_system_halted():
+                                return summary
                             self.positions[b_ticker] = adopted_pos
                         summary["adopted_from_broker"].append(b_ticker)
                         logger.info(
@@ -2319,55 +2466,56 @@ class PositionMonitor:
             except Exception as exc:
                 logger.warning("Could not write persistent halt marker to %s: %s", self.halt_marker_file, exc)
 
-        # Step 2: Synchronize with any in-flight trade entry holding execution_gate_lock,
-        # then release locks before calling broker APIs.
+        # Step 2: Synchronize under strict lock hierarchy execution_gate_lock -> _broker_op_lock -> _state_lock
+        # (never hold _state_lock during broker HTTP calls) so reconcile/entry/re-epoch cannot race panic.
         with self.execution_gate_lock:
-            with self._state_lock:
-                snapshot_positions = [
-                    (t, p)
-                    for t, p in list(self.positions.items())
-                    if not getattr(p, "is_closed", False)
-                ]
+            with self._broker_op_lock:
+                with self._state_lock:
+                    snapshot_positions = [
+                        (t, p)
+                        for t, p in list(self.positions.items())
+                        if not getattr(p, "is_closed", False)
+                    ]
 
-        for ticker, pos in snapshot_positions:
-            with self._state_lock:
-                if pos.is_closed:
-                    continue
-                qty_to_sell = pos.remaining_quantity
+                for ticker, pos in snapshot_positions:
+                    with self._state_lock:
+                        if pos.is_closed:
+                            continue
+                        qty_to_sell = pos.remaining_quantity
 
-            # 1. Cancel all orders on broker outside _state_lock
-            try:
-                self.cancel_all_broker_orders(pos)
-                results["cancelled_stops"] += 1
-            except Exception as exc:
-                logger.error("Failed to cancel orders for %s during panic flatten: %s", ticker, exc)
+                    # 1. Cancel all orders on broker outside _state_lock
+                    try:
+                        self.cancel_all_broker_orders(pos)
+                        results["cancelled_stops"] += 1
+                    except Exception as exc:
+                        logger.error("Failed to cancel orders for %s during panic flatten: %s", ticker, exc)
 
-            # 2. Sell / liquidate remaining quantity outside _state_lock
-            sold = True
-            if qty_to_sell > 0 and not self.dry_run:
-                try:
-                    sold = bool(self._execute_sell(pos.ticker, qty_to_sell))
-                except Exception as exc:
-                    logger.error("Failed to liquidate %s during panic flatten: %s", ticker, exc)
-                    sold = False
+                    # 2. Sell / liquidate remaining quantity outside _state_lock
+                    sold = True
+                    if qty_to_sell > 0 and not self.dry_run:
+                        try:
+                            sold = bool(self._execute_sell(pos.ticker, qty_to_sell))
+                        except Exception as exc:
+                            logger.error("Failed to liquidate %s during panic flatten: %s", ticker, exc)
+                            sold = False
 
-            now_iso = datetime.now(timezone.utc).isoformat()
-            with self._state_lock:
-                if sold:
-                    results["liquidated_positions"].append((ticker, qty_to_sell))
-                    pos.is_closed = True
-                    pos.remaining_quantity = 0.0
-                    pos.panic_failed = False
-                    pos.unprotected_reason = None
-                    pos.last_update_time = now_iso
-                else:
-                    results["failed_liquidations"].append((ticker, qty_to_sell))
-                    pos.is_closed = False
-                    pos.panic_failed = True
-                    pos.unprotected_reason = "Panic liquidation failed"
-                    pos.last_update_time = now_iso
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    with self._state_lock:
+                        if sold:
+                            results["liquidated_positions"].append((ticker, qty_to_sell))
+                            pos.is_closed = True
+                            pos.remaining_quantity = 0.0
+                            pos.panic_failed = False
+                            pos.unprotected_reason = None
+                            pos.last_update_time = now_iso
+                        else:
+                            results["failed_liquidations"].append((ticker, qty_to_sell))
+                            pos.is_closed = False
+                            pos.panic_failed = True
+                            pos.unprotected_reason = "Panic liquidation failed"
+                            pos.last_update_time = now_iso
 
-        self._save_state()
+                self._save_state()
 
         # Notify via all channels outside _state_lock
         if hasattr(self.notifier, "notify_alert"):

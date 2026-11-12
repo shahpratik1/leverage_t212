@@ -108,6 +108,8 @@
     previewError: null,
     previewTimer: null,
     rebaseState: null, // { activeEpochId, remoteConfig, choices: { [key]: 'mine'|'remote' } }
+    isCommitting: false,
+    reEpochModalLoading: false,
     drawerCollapsedMobile: true,
     sse: {
       source: null,
@@ -119,6 +121,7 @@
       lastHeartbeatAt: Date.now(),
     },
     uiTimer: null,
+    hashChangeHandler: null,
     activeModal: null, // { close, onEscape }
     pendingRetryAction: null,
     paramDomCache: {}, // key -> { card, input, baseBadge, stagedBadge, restartBadge, resetBtn }
@@ -251,7 +254,9 @@
   function getPendingRestartKeys() {
     const d = state.data || {};
     const rawCfg = getRawConfigObject();
-    const raw = d.pending_restart_keys || rawCfg.pending_restart_keys || [];
+    const raw = Array.isArray(d.pending_restart_keys)
+      ? d.pending_restart_keys
+      : (Array.isArray(rawCfg.pending_restart_keys) ? rawCfg.pending_restart_keys : []);
     return Array.isArray(raw) ? raw.map(String) : [];
   }
 
@@ -588,7 +593,7 @@
       } catch (_) {
         payload = {};
       }
-      if (resp.status === 401 && !opts.skipAuthModal) {
+      if ((resp.status === 401 || resp.status === 403) && !opts.skipAuthModal) {
         if (token) {
           clearStoredToken();
           renderHeader();
@@ -749,9 +754,9 @@
   function parseHashRoute() {
     const win = getWin();
     const rawHash = (win && win.location && win.location.hash) ? win.location.hash : "#monitor";
-    const stripped = rawHash.replace(/^#/, "");
+    const stripped = rawHash.replace(/^#\/?/, "");
     const qIdx = stripped.indexOf("?");
-    const tabPart = (qIdx >= 0 ? stripped.slice(0, qIdx) : stripped).toLowerCase();
+    const tabPart = (qIdx >= 0 ? stripped.slice(0, qIdx) : stripped).replace(/^\/+/, "").toLowerCase();
     const queryPart = qIdx >= 0 ? stripped.slice(qIdx + 1) : "";
 
     const validTabs = ["monitor", "config", "audit"];
@@ -761,7 +766,7 @@
     if (queryPart) {
       try {
         const sp = new URLSearchParams(queryPart);
-        param = sp.get("param");
+        param = sp.get("param") || sp.get("key");
         gate = sp.get("gate");
       } catch (_) {
         // ignore malformed query
@@ -1161,56 +1166,66 @@
   }
 
   async function submitConfigCommit(reasonText) {
-    if (Object.keys(state.stagedChanges).length === 0) return;
-    const expectedEpoch = state.draftBaseEpochId || getActiveEpochId();
-    const body = {
-      patch: Object.assign({}, state.stagedChanges),
-      expected_epoch_id: expectedEpoch,
-      reason: reasonText || "",
-    };
-
-    const res = await apiRequest("/api/config", {
-      method: "POST",
-      body,
-      retryFactory: () => submitConfigCommit(reasonText),
-    });
-
-    if (res.ok) {
-      applyMutationSnapshotResponse(res.data);
-      const newEpoch = getActiveEpochId();
-      discardStagedDraft();
-      showToast(`Committed configuration epoch ${newEpoch}.`, "success");
-      return;
-    }
-
-    if (res.status === 409) {
-      const remoteEpoch = (res.data && (res.data.active_epoch_id || res.data.actual_epoch_id)) || getActiveEpochId();
-      const remoteConfig = (res.data && res.data.config) || getActiveConfigValues();
-      if (res.data && res.data.config) {
-        state.data.config = res.data.config;
-        state.data.config_epoch_id = remoteEpoch;
-      }
-      const choices = {};
-      Object.keys(state.stagedChanges).forEach((k) => {
-        choices[k] = "mine";
-      });
-      state.rebaseState = {
-        activeEpochId: remoteEpoch,
-        remoteConfig,
-        errorMessage: (res.data && res.data.error) || `Epoch conflict: remote is ${remoteEpoch}`,
-        choices,
+    if (state.isCommitting || Object.keys(state.stagedChanges).length === 0) return;
+    state.isCommitting = true;
+    renderDiffDrawer();
+    try {
+      const expectedEpoch = state.draftBaseEpochId || getActiveEpochId();
+      const body = {
+        patch: Object.assign({}, state.stagedChanges),
+        expected_epoch_id: expectedEpoch,
+        reason: reasonText || "",
       };
-      renderHeader();
-      renderDiffDrawer();
-      showToast(`Epoch conflict (${remoteEpoch}). Rebase your staged edits before committing.`, "error");
-      return;
-    }
 
-    if (res.status !== 401) {
-      const msg = (res.data && res.data.error) || `Commit failed (${res.status})`;
-      state.previewError = msg;
+      const res = await apiRequest("/api/config", {
+        method: "POST",
+        body,
+        retryFactory: () => submitConfigCommit(reasonText),
+      });
+
+      if (res.ok) {
+        applyMutationSnapshotResponse(res.data);
+        const newEpoch = getActiveEpochId();
+        discardStagedDraft();
+        showToast(`Committed configuration epoch ${newEpoch}.`, "success");
+        return;
+      }
+
+      if (res.status === 409) {
+        const remoteEpoch = (res.data && (res.data.active_epoch_id || res.data.actual_epoch_id)) || getActiveEpochId();
+        const remoteConfig = (res.data && res.data.config) || getActiveConfigValues();
+        if (res.data && res.data.config) {
+          state.data.config = res.data.config;
+          state.data.config_epoch_id = remoteEpoch;
+        }
+        if (res.data && Array.isArray(res.data.pending_restart_keys)) {
+          state.data.pending_restart_keys = res.data.pending_restart_keys;
+        }
+        const choices = {};
+        Object.keys(state.stagedChanges).forEach((k) => {
+          choices[k] = "mine";
+        });
+        state.rebaseState = {
+          activeEpochId: remoteEpoch,
+          remoteConfig,
+          errorMessage: (res.data && res.data.error) || `Epoch conflict: remote is ${remoteEpoch}`,
+          choices,
+        };
+        renderHeader();
+        renderDiffDrawer();
+        showToast(`Epoch conflict (${remoteEpoch}). Rebase your staged edits before committing.`, "error");
+        return;
+      }
+
+      if (res.status !== 401 && res.status !== 403) {
+        const msg = (res.data && res.data.error) || `Commit failed (${res.status})`;
+        state.previewError = msg;
+        renderDiffDrawer();
+        showToast(msg, "error");
+      }
+    } finally {
+      state.isCommitting = false;
       renderDiffDrawer();
-      showToast(msg, "error");
     }
   }
 
@@ -1220,7 +1235,11 @@
     if (overrideChoices && typeof overrideChoices === "object" && typeof overrideChoices.preventDefault !== "function") {
       Object.assign(choices, overrideChoices);
     }
-    const remoteValues = extractConfigValues(remoteConfig);
+    const currentLiveEpoch = getActiveEpochId();
+    const sseAdvanced = Boolean(currentLiveEpoch && activeEpochId && currentLiveEpoch !== activeEpochId);
+    const targetEpochId = sseAdvanced ? currentLiveEpoch : activeEpochId;
+    const targetRemoteConfig = sseAdvanced ? getRawConfigObject() : remoteConfig;
+    const remoteValues = extractConfigValues(targetRemoteConfig);
     const nextStaged = {};
     Object.keys(state.stagedChanges).forEach((key) => {
       if (choices[key] === "mine") {
@@ -1233,21 +1252,26 @@
         }
       }
     });
-    if (remoteConfig && typeof remoteConfig === "object") {
+    if (!sseAdvanced && remoteConfig && typeof remoteConfig === "object") {
       state.data.config = remoteConfig;
       state.data.config_epoch_id = activeEpochId;
     }
     state.stagedChanges = nextStaged;
-    state.draftBaseEpochId = Object.keys(nextStaged).length > 0 ? activeEpochId : null;
+    state.draftBaseEpochId = Object.keys(nextStaged).length > 0 ? targetEpochId : null;
     state.rebaseState = null;
     state.previewData = null;
     renderConfigWorkspace(true);
     renderDiffDrawer();
     if (Object.keys(nextStaged).length > 0) {
       scheduleServerPreview();
-      showToast(`Rebased draft onto ${activeEpochId}. Review diff and click Commit.`, "success");
+      showToast(
+        sseAdvanced
+          ? `Rebased draft onto newer ${targetEpochId} (superseded ${activeEpochId}). Review diff and click Commit.`
+          : `Rebased draft onto ${targetEpochId}. Review diff and click Commit.`,
+        "success"
+      );
     } else {
-      showToast(`Accepted remote ${activeEpochId} values.`, "success");
+      showToast(`Accepted remote ${targetEpochId} values.`, "success");
     }
   }
 
@@ -1745,9 +1769,73 @@
         applyMutationSnapshotResponse(res.data);
         await fetchCatchUpData();
         showToast("Automated trading resumed.", "success");
-      } else if (res.status !== 401) {
+      } else if (res.status === 409) {
+        if (res.data) {
+          applyMutationSnapshotResponse(res.data);
+        }
         closeModal();
-        showToast((res.data && res.data.error) || `Resume blocked (${res.status})`, "error");
+        showToast((res.data && res.data.error) || "Resume blocked: unprotected positions require confirmation.", "error");
+        openResumeModal();
+      } else if (res.status !== 401 && res.status !== 403) {
+        closeModal();
+        showToast((res.data && res.data.error) || `Resume failed (${res.status})`, "error");
+      }
+    }
+  }
+
+  function openRetryLiquidationModal(pos) {
+    if (!pos || !pos.ticker) return;
+    if (isReadOnlyMode()) {
+      showToast("Retry Liquidation is disabled in read-only mode.", "error");
+      return;
+    }
+    let confirmBtn = null;
+    openModal({
+      id: "retry-liquidation-modal",
+      title: `Retry Liquidation (${pos.ticker})`,
+      buildBody: (bodyEl) => {
+        bodyEl.appendChild(
+          el("div", {
+            className: "wb-banner wb-banner--danger",
+            text: `Submits a targeted emergency market sell for ${pos.ticker} via /api/positions/${pos.ticker}/retry-liquidation without affecting other open positions.`,
+          })
+        );
+      },
+      buildFooter: (footEl) => {
+        footEl.appendChild(
+          el("button", { type: "button", className: "wb-btn wb-btn--ghost", text: "Cancel", onClick: closeModal })
+        );
+        confirmBtn = el("button", {
+          type: "button",
+          id: "retry-liquidation-confirm-btn",
+          className: "wb-btn wb-btn--danger",
+          text: `Retry Liquidation (${pos.ticker})`,
+          onClick: executeRetry,
+        });
+        footEl.appendChild(confirmBtn);
+      },
+    });
+
+    async function executeRetry() {
+      if (confirmBtn) confirmBtn.disabled = true;
+      const res = await apiRequest(`/api/positions/${encodeURIComponent(pos.ticker)}/retry-liquidation`, {
+        method: "POST",
+        body: { confirm: true },
+        retryFactory: () => executeRetry(),
+      });
+      if (confirmBtn) confirmBtn.disabled = false;
+      if (res.ok && res.data && res.data.ok !== false && !res.data.panic_failed) {
+        closeModal();
+        applyMutationSnapshotResponse(res.data);
+        await fetchCatchUpData();
+        showToast(`Retry liquidation succeeded for ${pos.ticker}.`, "success");
+      } else if (res.status !== 401 && res.status !== 403) {
+        if (res.data) applyMutationSnapshotResponse(res.data);
+        closeModal();
+        showToast(
+          (res.data && (res.data.error || res.data.message)) || `Retry liquidation failed for ${pos.ticker} (${res.status})`,
+          "error"
+        );
       }
     }
   }
@@ -1757,24 +1845,31 @@
       showToast("Re-Epoch is disabled in read-only mode.", "error");
       return;
     }
+    if (state.reEpochModalLoading) return;
     const pos = typeof posOrTicker === "string"
       ? (state.data.active_signals || []).find((p) => p && p.ticker === posOrTicker) || { ticker: posOrTicker }
       : posOrTicker;
     if (!pos || !pos.ticker) return;
     const targetEpoch = getActiveEpochId();
     const expectedPosEpoch = pos.config_epoch_id || null;
-    const previewRes = await apiRequest(`/api/positions/${encodeURIComponent(pos.ticker)}/re-epoch/preview`, {
-      method: "POST",
-      body: {
-        expected_position_epoch_id: expectedPosEpoch,
-        target_epoch_id: targetEpoch,
-        confirm_pure_tsl_mode_change: false,
-      },
-      retryFactory: () => openReEpochModal(pos),
-    });
+    state.reEpochModalLoading = true;
+    let previewRes = null;
+    try {
+      previewRes = await apiRequest(`/api/positions/${encodeURIComponent(pos.ticker)}/re-epoch/preview`, {
+        method: "POST",
+        body: {
+          expected_position_epoch_id: expectedPosEpoch,
+          target_epoch_id: targetEpoch,
+          confirm_pure_tsl_mode_change: false,
+        },
+        retryFactory: () => openReEpochModal(pos),
+      });
+    } finally {
+      state.reEpochModalLoading = false;
+    }
 
-    if (!previewRes.ok) {
-      if (previewRes.status !== 401) {
+    if (!previewRes || !previewRes.ok) {
+      if (previewRes && previewRes.status !== 401 && previewRes.status !== 403) {
         showToast((previewRes.data && previewRes.data.error) || `Re-Epoch preview failed (${previewRes.status})`, "error");
       }
       return;
@@ -1880,14 +1975,21 @@
       showToast("Re-Epoch All is disabled in read-only mode.", "error");
       return;
     }
+    if (state.reEpochModalLoading) return;
+    state.reEpochModalLoading = true;
     const targetEpoch = getActiveEpochId();
-    const previewRes = await apiRequest("/api/positions/re-epoch-all/preview", {
-      method: "POST",
-      body: { target_epoch_id: targetEpoch, confirm_pure_tsl_mode_change: false },
-      retryFactory: () => openReEpochAllModal(),
-    });
-    if (!previewRes.ok) {
-      if (previewRes.status !== 401) {
+    let previewRes = null;
+    try {
+      previewRes = await apiRequest("/api/positions/re-epoch-all/preview", {
+        method: "POST",
+        body: { target_epoch_id: targetEpoch, confirm_pure_tsl_mode_change: false },
+        retryFactory: () => openReEpochAllModal(),
+      });
+    } finally {
+      state.reEpochModalLoading = false;
+    }
+    if (!previewRes || !previewRes.ok) {
+      if (previewRes && previewRes.status !== 401 && previewRes.status !== 403) {
         showToast((previewRes.data && previewRes.data.error) || `Batch preview failed (${previewRes.status})`, "error");
       }
       return;
@@ -2335,11 +2437,17 @@
   function updateSseHealthBadge() {
     const doc = getDoc();
     const badge = doc && doc.getElementById("header-sse-health");
-    if (!badge) return;
     const now = Date.now();
     const isStale = !isFileProtocol() && (now - state.sse.lastHeartbeatAt) > HEARTBEAT_STALE_MS;
-    badge.className = isStale ? "wb-badge wb-badge--rose wb-mono" : "wb-badge wb-mono";
-    badge.textContent = formatSseHealthText();
+    if (badge) {
+      badge.className = isStale ? "wb-badge wb-badge--rose wb-mono" : "wb-badge wb-mono";
+      badge.textContent = formatSseHealthText();
+    }
+    if (!isFileProtocol() && state.sse.status === "connected" && (now - state.sse.lastHeartbeatAt) > HEARTBEAT_STALE_MS * 2) {
+      state.sse.hasDisconnected = true;
+      state.sse.status = "reconnecting";
+      connectSSE();
+    }
   }
 
   /* ── Render: Equity Chart (Preserved Compatibility) ────────────────────── */
@@ -2378,8 +2486,8 @@
     const equities = points.map((p) => Number(p.equity || 0));
     const startEq = equities[0] || 0;
     const currEq = hasCurr ? Number(currentEquity) : (equities[equities.length - 1] || startEq);
-    const minEq = Math.min(...equities, currEq);
-    const maxEq = Math.max(...equities, currEq);
+    const minEq = equities.reduce((m, v) => (v < m ? v : m), currEq);
+    const maxEq = equities.reduce((m, v) => (v > m ? v : m), currEq);
     const delta = currEq - startEq;
     const deltaPct = startEq > 0 ? (delta / startEq) * 100 : 0;
     const isPos = delta >= 0;
@@ -2749,7 +2857,7 @@
           className: "wb-btn wb-btn--sm wb-btn--danger",
           disabled: readOnly,
           text: "Retry Liquidation",
-          onClick: () => openPanicModal(`Retry Liquidation (${s.ticker})`),
+          onClick: () => openRetryLiquidationModal(s),
         })
       );
     }
@@ -3497,6 +3605,11 @@
     const doc = getDoc();
     const drawer = doc && doc.getElementById("diff-drawer");
     if (!drawer) return;
+    const prevReasonEl = doc.getElementById("commit-reason-input");
+    const savedReasonVal = prevReasonEl ? prevReasonEl.value : "";
+    const reasonFocused = Boolean(prevReasonEl && getFocusedElement() === prevReasonEl);
+    const selStart = reasonFocused && typeof prevReasonEl.selectionStart === "number" ? prevReasonEl.selectionStart : null;
+    const selEnd = reasonFocused && typeof prevReasonEl.selectionEnd === "number" ? prevReasonEl.selectionEnd : null;
     clearNode(drawer);
 
     if (state.drawerCollapsedMobile) {
@@ -3744,16 +3857,19 @@
       id: "commit-reason-input",
       type: "text",
       className: "wb-input",
-      disabled: readOnly,
+      disabled: readOnly || state.isCommitting,
       placeholder: "Commit reason (optional)...",
     });
+    if (savedReasonVal) {
+      reasonInput.value = savedReasonVal;
+    }
 
     const commitBtn = el("button", {
       type: "button",
       id: "commit-config-btn",
       className: "wb-btn wb-btn--primary",
-      disabled: readOnly || localResult.errors.length > 0 || serverErrors.length > 0 || Boolean(state.rebaseState),
-      text: "Commit Epoch",
+      disabled: readOnly || state.isCommitting || localResult.errors.length > 0 || serverErrors.length > 0 || Boolean(state.rebaseState),
+      text: state.isCommitting ? "Committing..." : "Commit Epoch",
       onClick: () => submitConfigCommit(reasonInput.value.trim()),
     });
 
@@ -3776,6 +3892,16 @@
     body.appendChild(el("div", { className: "wb-action-row" }, commitBtn, discardBtn));
 
     drawer.appendChild(body);
+    if (reasonFocused && typeof reasonInput.focus === "function") {
+      try {
+        reasonInput.focus();
+        if (selStart !== null && selEnd !== null && typeof reasonInput.setSelectionRange === "function") {
+          reasonInput.setSelectionRange(selStart, selEnd);
+        }
+      } catch (_) {
+        // ignore focus restore failures
+      }
+    }
   }
 
   /* ── Render: #audit Workspace ──────────────────────────────────────────── */
@@ -3783,13 +3909,14 @@
   function extractParamLinksFromAudit(auditObj) {
     const links = [];
     const schemaKeys = new Set(getSchemaParameters().map((p) => p.key));
-    const explicit = auditObj.param_links || auditObj.deep_links || auditObj.recommended_params || [];
+    const explicit = auditObj.param_links || auditObj.deep_links || auditObj.recommended_params || auditObj.parameter_recommendations || [];
     if (Array.isArray(explicit)) {
       explicit.forEach((item) => {
         if (typeof item === "string" && schemaKeys.has(item)) {
           links.push({ param: item, label: item });
-        } else if (item && typeof item === "object" && (item.param_key || item.param)) {
-          links.push({ param: item.param_key || item.param, gate: item.gate_id || null, label: item.label || item.param_key || item.param });
+        } else if (item && typeof item === "object" && (item.param_key || item.param || item.key)) {
+          const k = item.param_key || item.param || item.key;
+          links.push({ param: k, gate: item.gate_id || null, label: item.label || k });
         }
       });
     }
@@ -4040,6 +4167,10 @@
   }
 
   function connectSSE() {
+    if (state.sse.reconnectTimer) {
+      clearTimeout(state.sse.reconnectTimer);
+      state.sse.reconnectTimer = null;
+    }
     if (isFileProtocol() || typeof EventSource === "undefined") {
       state.sse.status = "offline";
       updateSseHealthBadge();
@@ -4051,6 +4182,7 @@
       } catch (_) {
         // ignore
       }
+      state.sse.source = null;
     }
     state.sse.status = "connecting";
     updateSseHealthBadge();
@@ -4088,6 +4220,10 @@
         state.sse.lastHeartbeatAt = Date.now();
         try {
           const parsed = JSON.parse(ev.data);
+          if (parsed && typeof parsed === "object" && parsed.dashboard && typeof parsed.dashboard === "object") {
+            applySnapshotData(parsed.dashboard);
+            return;
+          }
           if (parsed && typeof parsed === "object" && parsed.config) {
             applySnapshotData(parsed);
             return;
@@ -4301,10 +4437,11 @@
     if (!state.initialized) {
       state.initialized = true;
       if (win && win.addEventListener) {
-        win.addEventListener("hashchange", () => {
+        state.hashChangeHandler = () => {
           state.route = parseHashRoute();
           applyRouteVisibility();
-        });
+        };
+        win.addEventListener("hashchange", state.hashChangeHandler);
       }
       // 1s UI timer for session-close countdown and >25s SSE heartbeat staleness badge (zero network polling)
       state.uiTimer = setInterval(() => {
@@ -4316,6 +4453,11 @@
   }
 
   function destroyWorkbench() {
+    const win = getWin();
+    if (state.hashChangeHandler && win && win.removeEventListener) {
+      win.removeEventListener("hashchange", state.hashChangeHandler);
+      state.hashChangeHandler = null;
+    }
     if (state.uiTimer) {
       clearInterval(state.uiTimer);
       state.uiTimer = null;

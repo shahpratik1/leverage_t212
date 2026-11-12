@@ -370,7 +370,7 @@ class Orchestrator:
                 risk_manager=self.risk_manager,
                 state_file=default_state_file,
                 dry_run=self.dry_run,
-                pure_tsl_mode=bool(snap.PURE_TSL_MODE),
+                pure_tsl_mode=None,
                 config_bus=self.config_bus,
                 execution_gate_lock=self._execution_gate_lock,
             )
@@ -482,6 +482,10 @@ class Orchestrator:
         if hasattr(self.t212, "rate_limit_delay"):
             with contextlib.suppress(Exception):
                 self.t212.rate_limit_delay = float(getattr(snap, "RATE_LIMIT_INTER_CALL_DELAY", 1.25))
+        if hasattr(self, "position_monitor") and self.position_monitor is not None:
+            with contextlib.suppress(Exception):
+                self.position_monitor.pure_tsl_mode = bool(getattr(snap, "PURE_TSL_MODE", True))
+        self._rebuild_universe(snap)
 
     def _dispatch_system_alert(self, title: str, message: str) -> None:
         """Emit an operational system alert (e.g. boot quarantine) through Notifier safely."""
@@ -2166,12 +2170,13 @@ class Orchestrator:
                 with contextlib.suppress(Exception):
                     pos.entry_config_snapshot = _scrub_mapping(active_snap.to_dict())
 
-        # ── Place Native Broker GTC Stop & Limit Orders (only if not halted while racing) ──
-        if not self._is_pm_halted() and pos is not None:
-            self.position_monitor.place_broker_stop(pos)
-            pos_pure_tsl = bool(getattr(active_snap, "PURE_TSL_MODE", getattr(self.position_monitor, "pure_tsl_mode", True)))
-            if not pos_pure_tsl:
-                self.position_monitor.place_broker_tp_limit(pos)
+            # Place native broker GTC Stop & Limit orders while holding _execution_gate_lock
+            # so concurrent panic_flatten_all cannot race ahead of stop registration.
+            if not self._is_pm_halted() and pos is not None:
+                self.position_monitor.place_broker_stop(pos)
+                pos_pure_tsl = bool(getattr(active_snap, "PURE_TSL_MODE", getattr(self.position_monitor, "pure_tsl_mode", True)))
+                if not pos_pure_tsl:
+                    self.position_monitor.place_broker_tp_limit(pos)
 
         # ── Dispatch Real-Time Notifications ─────────────────────
         notif_price = pos.entry_price if pos is not None else card.entry_price

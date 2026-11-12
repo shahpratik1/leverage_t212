@@ -360,9 +360,16 @@ class _GatewayTestClient:
         t.start()
 
         try:
-            client_sock.sendall(raw_head)
-            if body and not delay_body:
-                client_sock.sendall(body)
+            try:
+                if body and not delay_body:
+                    client_sock.sendall(raw_head + body)
+                else:
+                    client_sock.sendall(raw_head)
+                    if body:
+                        client_sock.sendall(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # Pre-auth rejections intentionally close the socket before body flush completes.
+                pass
             resp = http.client.HTTPResponse(client_sock, method=method)
             resp.begin()
             resp_body = b"" if method == "HEAD" else resp.read()

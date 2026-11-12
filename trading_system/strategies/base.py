@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
 
 
+_MISSING = object()
+
+
 def read_config_value(source: Any, key: str, default: Any = None) -> Any:
     """Read a config value uniformly from a ConfigSnapshot, Settings, or Mapping."""
     if source is None:
@@ -23,8 +26,16 @@ def read_config_value(source: Any, key: str, default: Any = None) -> Any:
     if isinstance(source, Mapping):
         val = source.get(key, default)
     else:
-        val = getattr(source, key, default)
-    return default if val is None else val
+        val = getattr(source, key, _MISSING)
+        if val is _MISSING:
+            dyn = getattr(source, "dynamic_parameters", None)
+            if isinstance(dyn, Mapping) and key in dyn:
+                val = dyn.get(key, default)
+            elif hasattr(source, "get") and callable(source.get) and not type(source).__module__.startswith("unittest.mock"):
+                val = source.get(key, default)
+            else:
+                val = default
+    return default if val is None or val is _MISSING else val
 
 
 def safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:

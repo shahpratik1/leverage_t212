@@ -488,7 +488,7 @@ class RiskManager:
             config_snapshot=config_snapshot,
         )
         min_floor_pct = (
-            float(_read_cfg(config_snapshot, "ETP_MIN_SL_PCT", 0.02))
+            float(_read_cfg(config_snapshot, "ETP_MIN_SL_PCT", 0.025))
             if config_snapshot is not None
             else 0.02
         )

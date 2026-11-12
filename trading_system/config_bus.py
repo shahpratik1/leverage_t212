@@ -642,11 +642,16 @@ class ConfigBus:
         self._process_boot_values = dict(effective_settings)
         self._generation = max_gen
 
+        recovery_epoch_created = False
         if (dyn_quarantined or ovr_quarantined) and max_gen > 0:
             epoch_id = f"epoch-{max_gen}-quarantine-recovery"
             committed_at = _utc_now_iso()
             committed_by = "system"
             commit_reason = "boot quarantine recovery"
+            recovery_epoch_created = (
+                last_epoch_meta is None
+                or str(last_epoch_meta.get("config_epoch_id", "")) != epoch_id
+            )
         elif max_gen > 0 and last_epoch_meta is not None:
             epoch_id = f"epoch-{max_gen}"
             committed_at = str(last_epoch_meta.get("committed_at", ""))
@@ -669,6 +674,17 @@ class ConfigBus:
             commit_reason=commit_reason,
         )
         self._epoch_cache[self._snapshot.config_epoch_id] = self._snapshot
+        if recovery_epoch_created:
+            self._persist_epoch_locked(
+                self._snapshot,
+                [
+                    {
+                        "key": "__quarantine_recovery__",
+                        "action": "quarantine_recovery",
+                        "warnings": list(warnings),
+                    }
+                ],
+            )
 
     def _load_dynamic_parameters_on_boot(
         self,

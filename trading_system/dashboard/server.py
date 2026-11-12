@@ -1674,11 +1674,18 @@ def make_dashboard_handler(
 
             self.close_connection = True
             conn = getattr(self, "connection", None)
-            if conn is not None and hasattr(conn, "settimeout"):
-                try:
-                    conn.settimeout(None)
-                except OSError:
-                    pass
+            if conn is not None:
+                if hasattr(conn, "setsockopt"):
+                    try:
+                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    except OSError:
+                        pass
+                if hasattr(conn, "settimeout"):
+                    try:
+                        # Bound SSE socket writes so silently disconnected clients release slots promptly.
+                        conn.settimeout(max(15.0, float(heartbeat_interval) * 3.0))
+                    except OSError:
+                        pass
 
             try:
                 self.send_response(200)
@@ -1860,6 +1867,8 @@ def make_dashboard_handler(
                 return
 
             if clean_path in ("/stream", "/api/stream", "/events"):
+                if not self._validate_origin(send_body=send_body):
+                    return
                 self._handle_sse_stream(send_body=send_body)
                 return
 
@@ -1906,6 +1915,7 @@ def make_dashboard_handler(
                         "config_epoch_id": actual_epoch,
                         "latest_snapshot": latest_dict,
                         "config": latest_dict,
+                        "pending_restart_keys": list(latest_dict.get("pending_restart_keys") or []),
                     },
                     close_conn=False,
                 )
@@ -1999,7 +2009,7 @@ def make_dashboard_handler(
             except Exception as b_exc:
                 logger.debug("SSE broadcast failed after mutation: %s", b_exc)
             response: Dict[str, Any] = dict(result_dict)
-            response["ok"] = True
+            response["ok"] = bool(result_dict.get("ok", True))
             response["dashboard"] = snapshot
             response.setdefault("config_epoch_id", snapshot.get("config_epoch_id"))
             response.setdefault("config", snapshot.get("config"))
@@ -2082,7 +2092,8 @@ def make_dashboard_handler(
                         profiles = get_builtin_profiles()
                         if str(profile_id) not in profiles:
                             raise KeyError(f"Unknown config profile: {profile_id}")
-                        patch = dict(profiles[str(profile_id)].get("overrides", profiles[str(profile_id)]))
+                        raw_profile = profiles[str(profile_id)]
+                        patch = dict(raw_profile.get("values", raw_profile.get("overrides", {})))
                     else:
                         patch = payload.get("patch")
                         if not isinstance(patch, Mapping):
@@ -2115,8 +2126,9 @@ def make_dashboard_handler(
                             profiles = get_builtin_profiles()
                             if str(profile_id) not in profiles:
                                 raise KeyError(f"Unknown config profile: {profile_id}")
+                            raw_profile = profiles[str(profile_id)]
                             profile_patch = dict(
-                                profiles[str(profile_id)].get("overrides", profiles[str(profile_id)])
+                                raw_profile.get("values", raw_profile.get("overrides", {}))
                             )
                             res = orchestrator.commit_config_patch(
                                 profile_patch,
