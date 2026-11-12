@@ -33,24 +33,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from trading_system.config import settings
-from trading_system.config_bus import (
-    ConfigBus,
-    ConfigConflictError,
-    ConfigSnapshot,
-    ConfigValidationError,
-)
+from trading_system.config import atomic_write_text, settings
+from trading_system.config_bus import ConfigBus, ConfigSnapshot
 from trading_system.config_schema import (
     SCHEMA_BY_KEY,
-    SIMULATABLE_GROUPS,
     export_config_schema,
     get_builtin_profiles,
 )
-from trading_system.dashboard.auth import is_sensitive_key
+from trading_system.dashboard.auth import sanitize_mapping
 from trading_system.data.leveraged_universe import (
-    CURATED_3X_PAIRS,
     LeveragedUniverse,
-    format_price,
     get_ticker_currency,
     normalize_quote_to_eur,
 )
@@ -64,7 +56,6 @@ from trading_system.data.trading212_client import (
 from trading_system.execution.position_monitor import (
     PositionEpochConflictError,
     PositionMonitor,
-    ResumeBlockedError,
 )
 from trading_system.notifications.notifier import Notifier, TradeNotification
 from trading_system.screener.laya_screener import (
@@ -95,39 +86,10 @@ def _is_unittest_process() -> bool:
 
 def _atomic_write_json(target_path: Path, payload: Any) -> None:
     """Atomically write JSON to target_path via a same-directory temporary file."""
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target_path.name}.",
-        suffix=".tmp",
-        dir=str(target_path.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, default=str)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, target_path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    atomic_write_text(target_path, json.dumps(payload, indent=2, default=str))
 
 
-def _scrub_mapping(obj: Any) -> Any:
-    """Recursively strip sensitive credential/path keys from serialized config dicts."""
-    if isinstance(obj, Mapping):
-        cleaned: Dict[str, Any] = {}
-        for k, v in obj.items():
-            key_str = str(k)
-            if key_str.lower() != "key" and is_sensitive_key(key_str):
-                continue
-            cleaned[key_str] = _scrub_mapping(v)
-        return cleaned
-    if isinstance(obj, list):
-        return [_scrub_mapping(item) for item in obj]
-    if isinstance(obj, tuple):
-        return [_scrub_mapping(item) for item in obj]
-    return obj
+_scrub_mapping = sanitize_mapping
 
 
 def _snap_val(snap: Any, key: str, default: Any = None) -> Any:

@@ -33,7 +33,7 @@ import hmac
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Deque, Iterable, Mapping, Optional, Sequence, TextIO, Tuple, Union
+from typing import Any, Callable, Deque, Dict, Iterable, Mapping, Optional, Sequence, TextIO, Tuple, Union
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -487,6 +487,26 @@ def is_sensitive_key(key: str) -> bool:
     if "API" in tokens and ("KEY" in tokens or "KEYS" in tokens):
         return True
     return False
+
+
+def sanitize_mapping(value: Any) -> Any:
+    """Recursively strip sensitive config keys from JSON payloads and ConfigSnapshots."""
+    if hasattr(value, "to_dict") and not isinstance(value, Mapping):
+        try:
+            value = value.to_dict(include_specs=True)
+        except TypeError:
+            value = value.to_dict()
+    if isinstance(value, Mapping):
+        cleaned: Dict[str, Any] = {}
+        for k, v in value.items():
+            key_str = str(k)
+            if is_sensitive_key(key_str):
+                continue
+            cleaned[key_str] = sanitize_mapping(v)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [sanitize_mapping(item) for item in value]
+    return value
 
 
 def scrub_error_message(

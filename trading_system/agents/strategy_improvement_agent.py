@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import sys
 import tempfile
@@ -18,26 +17,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
 
-from trading_system.config import settings
-from trading_system.strategies.base import read_config_value
+from trading_system.config import atomic_write_text, settings
+from trading_system.strategies.base import read_config_value, safe_float as _safe_float
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    """Parse finite numeric values safely without propagating bools, strings, or NaN."""
-    if value is None or isinstance(value, bool):
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(parsed):
-        return default
-    return parsed
 
 
 class _SnapshotProxy:
@@ -168,35 +154,13 @@ class StrategyImprovementAgent:
             self.consecutive_zero_cycles = int(self.last_audit.consecutive_zero_cycles or 0)
 
     def _persist_audit_history(self) -> None:
-        """Atomically persist bounded audit history to JSONL via NamedTemporaryFile + os.replace."""
+        """Atomically persist bounded audit history to JSONL via atomic_write_text."""
         bounded = self.audit_history[-self._max_persisted_audits :]
-        parent = self.audit_history_path.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        tmp_path: Optional[str] = None
+        lines = "".join(json.dumps(item.to_dict(), sort_keys=True) + "\n" for item in bounded)
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(parent),
-                prefix=".audit_history_",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                tmp_path = tmp.name
-                for item in bounded:
-                    tmp.write(json.dumps(item.to_dict(), sort_keys=True) + "\n")
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            os.replace(tmp_path, self.audit_history_path)
-            tmp_path = None
+            atomic_write_text(self.audit_history_path, lines)
         except Exception as exc:
             logger.warning("Failed to persist audit history atomically: %s", exc)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     def record_cycle_yield(
         self,

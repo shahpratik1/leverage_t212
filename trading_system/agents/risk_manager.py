@@ -11,7 +11,9 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+
+from trading_system.strategies.base import read_config_value as _read_cfg, safe_float as _safe_float
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -19,30 +21,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TradeDecision = Literal["BUY_ENTRY", "SELL_ENTRY", "DO_NOT_TRADE", "EXIT"]
-
-
-def _read_cfg(source: Any, key: str, default: Any = None) -> Any:
-    """Read configuration value uniformly from a ConfigSnapshot, Settings, or Mapping."""
-    if source is None:
-        return default
-    if isinstance(source, Mapping):
-        val = source.get(key, default)
-    else:
-        val = getattr(source, key, default)
-    return default if val is None else val
-
-
-def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    """Safely convert values to finite float, rejecting bools, strings, and NaN."""
-    if value is None or isinstance(value, bool):
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(parsed):
-        return default
-    return parsed
 
 
 def _append_card_rejection(

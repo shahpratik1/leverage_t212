@@ -11,9 +11,11 @@ import math
 import os
 import re
 import sys
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 
 logger = logging.getLogger(__name__)
@@ -695,6 +697,35 @@ class Settings:
             logger.warning(
                 "OPENAI_API_KEY is not set. System 2 LLM debate will fall back to rule-based analysis."
             )
+
+
+def atomic_write_text(target_path: Union[str, Path], content: str) -> None:
+    """Write text atomically using a thread-unique temp file, flush, fsync, and os.replace."""
+    resolved = os.path.abspath(os.fspath(target_path))
+    parent = os.path.dirname(resolved) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent,
+            prefix=f".{os.path.basename(resolved)}.",
+            suffix=f".{os.getpid()}.{threading.get_ident()}.tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, resolved)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # Module-level singleton instance

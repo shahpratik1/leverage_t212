@@ -9,12 +9,11 @@ on broad market indices during verified bear impulses.
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from trading_system.config import settings
 from trading_system.config_schema import evaluate_screener_metric_gate
-from trading_system.strategies.base import BaseStrategy, StrategySignal, read_config_value
+from trading_system.strategies.base import BaseStrategy, StrategySignal, read_config_value, safe_float as _safe_float
 from trading_system.strategies.registry import StrategyRegistry
 
 if TYPE_CHECKING:
@@ -33,19 +32,6 @@ DEFAULT_BROAD_INDICES: Set[str] = {
     "3USL",
     "QQQ3",
 }
-
-
-def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
-    """Convert numeric metrics safely without propagating bools, NaN, or strings."""
-    if value is None or isinstance(value, bool):
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(parsed):
-        return default
-    return parsed
 
 
 @StrategyRegistry.register("directional_trend")

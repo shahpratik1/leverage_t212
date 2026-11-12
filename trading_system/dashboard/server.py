@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import asdict
 from datetime import datetime, timezone
 import errno
 import http.server
@@ -26,7 +25,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import urllib.parse
 import webbrowser
 
@@ -41,10 +40,10 @@ from trading_system.config_bus import (
 from trading_system.config_schema import export_config_schema, get_builtin_profiles
 from trading_system.dashboard.auth import (
     DashboardAuthManager,
-    is_sensitive_key,
     is_valid_host_header,
     is_valid_origin_header,
     json_safe_for_inline_script,
+    sanitize_mapping,
     scrub_error_message,
 )
 from trading_system.data.leveraged_universe import (
@@ -629,21 +628,7 @@ def _invalidate_dashboard_cache() -> None:
         _DASHBOARD_DATA_CACHE_STAMP = None
 
 
-def _sanitize_mapping(value: Any) -> Any:
-    """Recursively strip sensitive config keys from JSON payloads."""
-    if isinstance(value, ConfigSnapshot):
-        value = value.to_dict(include_specs=True)
-    if isinstance(value, Mapping):
-        cleaned: Dict[str, Any] = {}
-        for k, v in value.items():
-            key_str = str(k)
-            if is_sensitive_key(key_str):
-                continue
-            cleaned[key_str] = _sanitize_mapping(v)
-        return cleaned
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_mapping(item) for item in value]
-    return value
+_sanitize_mapping = sanitize_mapping
 
 
 def _read_json_file(path: Path, default: Any = None) -> Any:

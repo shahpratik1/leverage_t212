@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import json
 
 from trading_system.config import settings
-from trading_system.strategies.base import read_config_value
+from trading_system.strategies.base import read_config_value, safe_float as _safe_float
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -19,19 +18,6 @@ except ImportError:
     TRADING_AGENTS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
-    """Safely convert numeric metrics to finite float without crashing on strings or bools."""
-    if value is None or isinstance(value, bool):
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(parsed):
-        return default
-    return parsed
 
 
 @dataclass

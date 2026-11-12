@@ -21,7 +21,7 @@ from trading_system.config_schema import (
     ALLOWLISTED_SCREENER_METRICS,
     evaluate_screener_metric_gate,
 )
-from trading_system.strategies.base import BaseStrategy, StrategySignal, read_config_value
+from trading_system.strategies.base import BaseStrategy, StrategySignal, read_config_value, safe_float as _safe_float
 
 if TYPE_CHECKING:
     from trading_system.config_bus import ConfigSnapshot
@@ -58,19 +58,6 @@ GATE_ID_METADATA: Dict[str, Tuple[List[str], str]] = {
     "correlation_gate": (["ENFORCE_CORRELATION_LIMITS", "MAX_SECTOR_POSITIONS", "MAX_PORTFOLIO_BETA_HEAT"], "Correlation & Beta Heat"),
     "stale_epoch_superseded": ([], "Stale Epoch Superseded"),
 }
-
-
-def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
-    """Parse finite numeric metrics safely without crashing on bool, NaN, or strings."""
-    if value is None or isinstance(value, bool):
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(parsed):
-        return default
-    return parsed
 
 
 def _call_strategy_evaluate(

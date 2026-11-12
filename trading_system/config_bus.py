@@ -9,12 +9,12 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Union
 
 from trading_system.config import (
     Settings,
+    atomic_write_text,
     collect_settings_invariant_errors,
     parse_env_file,
 )
@@ -22,7 +22,6 @@ from trading_system.config_schema import (
     BUILTIN_PROFILES,
     MAX_DYNAMIC_PARAMETERS,
     SCHEMA_BY_KEY,
-    SETTINGS_FIELD_NAMES,
     SIMULATABLE_GROUPS,
     SNAPSHOT_METADATA_KEYS,
     ConfigParamSchema,
@@ -162,29 +161,7 @@ def _json_dumps_strict(obj: Any, *, indent: Optional[int] = 2) -> str:
 
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write text atomically using thread-unique temp file, flush, fsync, and os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Optional[str] = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=f".{threading.get_ident()}.tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = handle.name
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, str(path))
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    atomic_write_text(path, content)
 
 
 def _quarantine_file(path: Path, reason: str) -> Optional[str]:

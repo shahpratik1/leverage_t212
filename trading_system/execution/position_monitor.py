@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -20,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
-from trading_system.config import settings
+from trading_system.config import atomic_write_text, settings
 from trading_system.data.leveraged_universe import get_etp_direction, get_ticker_currency
 from trading_system.data.trading212_client import Trading212Client, Trading212Error
 from trading_system.notifications.notifier import Notifier
@@ -221,30 +220,7 @@ class PositionMonitor:
         """Write text atomically via thread-unique NamedTemporaryFile + flush + fsync + os.replace."""
         if not target_path or target_path.startswith(":memory:"):
             return
-        resolved_dir = os.path.dirname(os.path.abspath(target_path)) or "."
-        os.makedirs(resolved_dir, exist_ok=True)
-        tmp_path: Optional[str] = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=resolved_dir,
-                prefix=f".{os.path.basename(target_path)}.",
-                suffix=f".{os.getpid()}.{threading.get_ident()}.tmp",
-                delete=False,
-            ) as tmp:
-                tmp_path = tmp.name
-                tmp.write(content)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            os.replace(tmp_path, target_path)
-        except Exception:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            raise
+        atomic_write_text(target_path, content)
 
     def acquire_position_lease(self, ticker: str, ttl_seconds: float = 30.0) -> bool:
         """Acquire a short-lived in-flight operation lease for ticker under _state_lock."""

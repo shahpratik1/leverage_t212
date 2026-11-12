@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import math
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 if TYPE_CHECKING:
@@ -24,6 +25,19 @@ def read_config_value(source: Any, key: str, default: Any = None) -> Any:
     else:
         val = getattr(source, key, default)
     return default if val is None else val
+
+
+def safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    """Convert numeric values to finite float safely, rejecting bools, NaN, and strings."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
 
 
 @dataclass(frozen=True)
