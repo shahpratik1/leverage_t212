@@ -156,6 +156,9 @@ class TestWorkbenchAssetsStatic(unittest.TestCase):
         for m in markers:
             self.assertIn(m, self.js_text, f"Missing Mission Control marker {m!r} in workbench.js")
 
+        self.assertIn('"vwap"', self.js_text, "Missing 'vwap' strategy option in workbench.js")
+        self.assertIn("VWAP Session Trend", self.js_text, "Missing 'VWAP Session Trend' label in workbench.js")
+
         css_markers = [
             ".wb-mc-card",
             ".wb-stepper",
@@ -1259,6 +1262,13 @@ async function runAll() {
     const state = env.api.getState();
     assert.strictEqual(state.stagedChanges["MAX_RISK_PER_TRADE"], 0.0075);
     assert.strictEqual(state.stagedChanges["ATR_SL_MULTIPLIER"], 2.5);
+
+    // Select VWAP Strategy in Quick Controls
+    const stratSelect = env.doc.getElementById("quick-strat-select");
+    assert.ok(stratSelect, "Quick strategy select exists");
+    stratSelect.value = "vwap";
+    stratSelect.dispatchEvent({ type: "change", target: stratSelect });
+    assert.strictEqual(state.stagedChanges["ACTIVE_STRATEGY"], "vwap");
 
     // Switch to Advanced Mode via toggle button
     const toggleAdvBtn = env.doc.getElementById("toggle-advanced-from-quick-btn");

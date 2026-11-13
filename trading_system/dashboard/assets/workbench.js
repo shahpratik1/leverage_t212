@@ -97,6 +97,11 @@
     system_halted: "Trading halted by emergency panic switch",
     insufficient_data: "Insufficient historical price candles for calculation",
     no_etp_mapping: "No eligible leveraged ETP pair found",
+    vwap_gate: "Price trading below session VWAP benchmark",
+    vwap_overextended: "Price overextended too far above session VWAP (> 3.5%)",
+    vwap_dead_zone: "Price within VWAP dead-zone buffer (insufficient breakout distance)",
+    counter_trend_filter: "Macro trend alignment check failed (below 200 SMA)",
+    single_equity_cash_defense: "Single equity below VWAP: 100% Cash Defense enforced",
   };
 
   function translateGateRejection(gateId, label) {
@@ -3763,7 +3768,8 @@
         },
       },
       el("option", { value: "directional_trend", selected: activeStrat === "directional_trend", text: "Directional Trend (Momentum Breakout)" }),
-      el("option", { value: "supertrend", selected: activeStrat === "supertrend", text: "Supertrend (Area 2 - Next in Line)" })
+      el("option", { value: "vwap", selected: activeStrat === "vwap", text: "VWAP Session Trend (Breakout & Volume)" }),
+      el("option", { value: "supertrend", selected: activeStrat === "supertrend", text: "Supertrend (Experimental)" })
     );
     grid.appendChild(
       el(

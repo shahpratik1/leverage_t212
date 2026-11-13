@@ -75,5 +75,6 @@ class StrategyRegistry:
         """Lazy-import built-in strategies to avoid circular imports during startup."""
         try:
             import trading_system.strategies.directional_trend  # noqa: F401
+            import trading_system.strategies.vwap  # noqa: F401
         except ImportError:
             pass

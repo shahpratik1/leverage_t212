@@ -2501,6 +2501,32 @@ class MarketDataProvider:
             if not (realized_vol > 0):
                 realized_vol = 0.25
 
+            # Session VWAP & Standard Deviation Bands
+            src_data = hourly_data if (hasattr(hourly_data, "empty") and not hourly_data.empty) else daily_data
+            h_vals = src_data["high"].values
+            l_vals = src_data["low"].values
+            c_vals = src_data["close"].values
+            v_vals = src_data["volume"].values if "volume" in src_data else np.ones_like(c_vals)
+
+            window_vwap = min(24, len(c_vals))
+            h_win = h_vals[-window_vwap:]
+            l_win = l_vals[-window_vwap:]
+            c_win = c_vals[-window_vwap:]
+            v_win = v_vals[-window_vwap:]
+
+            sum_v = float(np.sum(v_win))
+            typ_px = (h_win + l_win + c_win) / 3.0
+            if sum_v > 0:
+                vwap_val = float(np.sum(typ_px * v_win) / sum_v)
+                vwap_std = float(np.sqrt(np.sum(((typ_px - vwap_val) ** 2) * v_win) / sum_v))
+            else:
+                vwap_val = float(np.mean(typ_px))
+                vwap_std = float(np.std(typ_px))
+
+            vwap_dist_pct = float(((current_close - vwap_val) / vwap_val) * 100.0) if vwap_val > 0 else 0.0
+            vwap_upper_1std = vwap_val + vwap_std
+            vwap_lower_1std = max(0.01, vwap_val - vwap_std)
+
             return {
                 "close": current_close,
                 "sma200": round(sma200, 2),
@@ -2541,6 +2567,10 @@ class MarketDataProvider:
                 "realized_vol": round(realized_vol, 4),
                 "high_20d": round(high_20d, 2),
                 "earnings_in_days": earnings_days,
+                "vwap": round(vwap_val, 2),
+                "vwap_dist_pct": round(vwap_dist_pct, 2),
+                "vwap_upper_1std": round(vwap_upper_1std, 2),
+                "vwap_lower_1std": round(vwap_lower_1std, 2),
             }
 
         # 2. Pure Python list-of-dicts calculation fallback
@@ -2648,6 +2678,27 @@ class MarketDataProvider:
         else:
             realized_vol = 0.25
 
+        # Session VWAP pure-Python fallback
+        c_win = closes[-min(24, len(closes)):]
+        h_win = highs[-min(24, len(highs)):]
+        l_win = lows[-min(24, len(lows)):]
+        v_win = [float(c.get("volume", 0) or 0) for c in candles[-min(24, len(candles)):]]
+        sum_v = sum(v_win)
+        typ_px = [(h_win[i] + l_win[i] + c_win[i]) / 3.0 for i in range(len(c_win))]
+
+        if sum_v > 0:
+            vwap_val = sum(typ_px[i] * v_win[i] for i in range(len(c_win))) / sum_v
+            variance_vwap = sum(((typ_px[i] - vwap_val) ** 2) * v_win[i] for i in range(len(c_win))) / sum_v
+            vwap_std = math.sqrt(variance_vwap)
+        else:
+            vwap_val = sum(typ_px) / len(typ_px)
+            variance_vwap = sum((p - vwap_val) ** 2 for p in typ_px) / max(1, len(typ_px) - 1)
+            vwap_std = math.sqrt(variance_vwap)
+
+        vwap_dist_pct = ((current_close - vwap_val) / vwap_val) * 100.0 if vwap_val > 0 else 0.0
+        vwap_upper_1std = vwap_val + vwap_std
+        vwap_lower_1std = max(0.01, vwap_val - vwap_std)
+
         return {
             "close": current_close,
             "sma200": round(sma200, 2),
@@ -2688,4 +2739,8 @@ class MarketDataProvider:
             "realized_vol": round(realized_vol, 4),
             "high_20d": round(high_20d, 2),
             "earnings_in_days": earnings_days,
+            "vwap": round(vwap_val, 2),
+            "vwap_dist_pct": round(vwap_dist_pct, 2),
+            "vwap_upper_1std": round(vwap_upper_1std, 2),
+            "vwap_lower_1std": round(vwap_lower_1std, 2),
         }

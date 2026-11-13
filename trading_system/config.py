@@ -408,6 +408,8 @@ class Settings:
     STRATEGY_SHORT_BASE_CONVICTION: float = 0.75
     STRATEGY_MACRO_TAILWIND_BONUS: float = 0.10
     DIRECTIONAL_MAX_CONVICTION: float = 0.95
+    MIN_VWAP_DIST_PCT: float = 0.1
+    MAX_VWAP_DIST_PCT: float = 3.5
     MAX_SWING_HOLD_DAYS: int = 10
     MR_MAX_HOLD_DAYS: int = 10  # Backward compatibility alias
 
@@ -547,6 +549,8 @@ class Settings:
             "STRATEGY_SHORT_BASE_CONVICTION",
             "STRATEGY_MACRO_TAILWIND_BONUS",
             "DIRECTIONAL_MAX_CONVICTION",
+            "MIN_VWAP_DIST_PCT",
+            "MAX_VWAP_DIST_PCT",
             "REGIME_BREAKOUT_ADX_MIN",
             "HIGH_VOL_MAX_REALIZED_VOL",
             "HIGH_VOL_MAX_ATR_SPIKE_RATIO",

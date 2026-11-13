@@ -20,7 +20,7 @@ data/*.db*
 .agents/
 
 # Control-plane runtime persistence, halt markers, and auth tokens
-data/
+/data/
 *.halted
 .dashboard_token
 config_overrides.json

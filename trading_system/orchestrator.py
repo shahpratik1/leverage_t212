@@ -2660,8 +2660,9 @@ class Orchestrator:
 
         # Step 3: Trend Filter (Screening under cycle_snapshot)
         active_strat = getattr(cycle_snapshot, "ACTIVE_STRATEGY", "directional_trend")
+        strat_desc = "VWAP session trend rules" if active_strat == "vwap" else f"{active_strat} momentum rules"
         self._broadcast_pipeline_progress(
-            3, "Trend Filter", f"Screening universe indicators against {active_strat} momentum rules.",
+            3, "Trend Filter", f"Screening universe indicators against {strat_desc}.",
             cycle_id=self._current_cycle_id
         )
         candidates, all_screener_results = self.screen_candidates_with_funnel(
