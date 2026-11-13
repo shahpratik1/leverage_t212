@@ -1193,13 +1193,13 @@ async function runAll() {
     env.api.destroyWorkbench();
   }
 
-  // 11. Mission Control: Live 7-step stepper and SSE progress updates
+  // 11. Mission Control: Live 5-step stepper and SSE progress updates
   {
     const env = createMockEnv({ hash: "#monitor" });
     const stepper = env.doc.getElementById("workflow-stepper");
     assert.ok(stepper, "Workflow stepper must be rendered on #monitor");
     assert.ok(env.doc.getElementById("step-1"), "Step 1 Market Check rendered");
-    assert.ok(env.doc.getElementById("step-7"), "Step 7 Standby rendered");
+    assert.ok(env.doc.getElementById("step-5"), "Step 5 Order Route rendered");
 
     // Emit intermediate pipeline_progress SSE event (Step 3: Trend Filter)
     env.sseInstances[0].emit("pipeline_progress", {

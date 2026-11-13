@@ -641,13 +641,13 @@ class RiskManager:
         trading212_ticker: str,
         direction: str,
         metrics: Dict[str, Any],
-        debate_outcome: Any,
-        account_equity: float,
+        debate_outcome: Optional[Any] = None,
+        account_equity: float = 0.0,
         strategy_type: str = "directional_trend",
         leverage: Optional[int] = None,
         config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> DecisionCard:
-        """Generate a complete DecisionCard from technical metrics and debate consensus."""
+        """Generate a complete DecisionCard from technical metrics and quantitative signal sizing."""
         params = self._resolve_params(config_snapshot)
         epoch_id: Optional[str] = params["config_epoch_id"]
 
@@ -663,7 +663,10 @@ class RiskManager:
         use_3x = params["use_leveraged_3x"]
         max_lev = params["max_leverage"]
 
-        conviction_score = _safe_float(getattr(debate_outcome, "conviction_score", 0.0), 0.0) or 0.0
+        if debate_outcome is not None:
+            conviction_score = _safe_float(getattr(debate_outcome, "conviction_score", 0.0), 0.0) or 0.0
+        else:
+            conviction_score = _safe_float(metrics.get("confidence") or metrics.get("overall_confidence"), 0.85) or 0.85
         rvol_raw = metrics.get("realized_vol") if metrics.get("realized_vol") is not None else metrics.get("historical_vol")
         realized_vol = _safe_float(rvol_raw, 0.25) or 0.25
 
@@ -774,17 +777,23 @@ class RiskManager:
             config_snapshot=config_snapshot,
         )
 
-        consensus = getattr(debate_outcome, "consensus_decision", "DO_NOT_TRADE")
-        conviction_score = _safe_float(getattr(debate_outcome, "conviction_score", 0.0), 0.0) or 0.0
-        synthesis = getattr(debate_outcome, "synthesis", "No synthesis provided.")
+        if debate_outcome is None:
+            consensus = "BUY_ENTRY" if direction.upper() in ("LONG", "BUY", "BULLISH") else "SELL_ENTRY"
+            conviction_score = _safe_float(metrics.get("confidence") or metrics.get("overall_confidence"), 0.85) or 0.85
+            synthesis = f"Quantitative {strategy_type.upper()} signal verified for {ticker}."
+            winning_side = "bull" if direction.upper() in ("LONG", "BUY", "BULLISH") else "bear"
+        else:
+            consensus = getattr(debate_outcome, "consensus_decision", "DO_NOT_TRADE")
+            conviction_score = _safe_float(getattr(debate_outcome, "conviction_score", 0.0), 0.0) or 0.0
+            synthesis = getattr(debate_outcome, "synthesis", "No synthesis provided.")
+            winning_side = str(getattr(debate_outcome, "winning_side", "") or "").lower()
 
         dir_upper = direction.upper()
         is_long = dir_upper in ("LONG", "BUY", "BULLISH")
         is_short = dir_upper in ("SHORT", "SELL", "BEARISH")
 
         # Directional alignment gate: If debate specifically concluded the opposite direction won, veto entry!
-        winning_side = str(getattr(debate_outcome, "winning_side", "") or "").lower()
-        if isinstance(winning_side, str):
+        if isinstance(winning_side, str) and winning_side:
             direction_mismatch = (is_short and winning_side == "bull") or (is_long and winning_side == "bear")
         else:
             direction_mismatch = False

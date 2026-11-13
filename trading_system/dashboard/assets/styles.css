@@ -3,40 +3,40 @@
  */
 
 :root {
-  --bg-canvas: #020617;
-  --bg-surface: #0f172a;
-  --bg-surface-2: #1e293b;
-  --bg-inset: #090f1e;
-  --border-subtle: #1e293b;
-  --border-strong: #334155;
-  --text-primary: #f8fafc;
-  --text-secondary: #cbd5e1;
-  --text-muted: #94a3b8;
-  --emerald: #34d399;
+  --bg-canvas: #0B0F17;
+  --bg-surface: #111827;
+  --bg-surface-2: #1F2937;
+  --bg-inset: #0d1424;
+  --border-subtle: #1F2937;
+  --border-strong: #374151;
+  --text-primary: #F9FAFB;
+  --text-secondary: #D1D5DB;
+  --text-muted: #9CA3AF;
+  --emerald: #10B981;
   --emerald-bg: rgba(16, 185, 129, 0.12);
   --emerald-border: rgba(16, 185, 129, 0.35);
-  --rose: #fb7185;
+  --rose: #F43F5E;
   --rose-bg: rgba(244, 63, 94, 0.14);
   --rose-border: rgba(244, 63, 94, 0.4);
-  --amber: #fbbf24;
+  --amber: #F59E0B;
   --amber-bg: rgba(245, 158, 11, 0.14);
   --amber-border: rgba(245, 158, 11, 0.38);
-  --sky: #38bdf8;
+  --sky: #38BDF8;
   --sky-bg: rgba(56, 189, 248, 0.12);
   --sky-border: rgba(56, 189, 248, 0.36);
-  --indigo: #818cf8;
-  --indigo-solid: #4f46e5;
-  --indigo-solid-hover: #6366f1;
+  --indigo: #818CF8;
+  --indigo-solid: #4F46E5;
+  --indigo-solid-hover: #6366F1;
   --indigo-bg: rgba(99, 102, 241, 0.14);
   --indigo-border: rgba(129, 140, 248, 0.35);
-  --purple: #c084fc;
+  --purple: #C084FC;
   --purple-bg: rgba(168, 85, 247, 0.14);
   --purple-border: rgba(192, 132, 252, 0.35);
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;
   --radius-lg: 1rem;
-  --shadow-card: 0 10px 25px -10px rgba(2, 6, 23, 0.85);
-  --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.72);
+  --shadow-card: 0 10px 25px -10px rgba(0, 0, 0, 0.85);
+  --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.75);
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
@@ -1161,7 +1161,7 @@ summary:focus-visible,
 
 @media (min-width: 1024px) {
   .wb-stepper {
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 }
 
@@ -1469,4 +1469,65 @@ summary:focus-visible,
   background: var(--bg-surface);
   color: var(--text-primary);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+/* ── Modern Obsidian Slide-Over Quick Settings Drawer ────────────────────── */
+.wb-modal--drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  max-width: 480px;
+  height: 100vh;
+  max-height: 100vh;
+  border-radius: 0;
+  border-left: 1px solid var(--border-strong);
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
+  margin: 0 0 0 auto;
+  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.85);
+  display: flex;
+  flex-direction: column;
+  animation: wb-drawer-slide-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--bg-surface);
+}
+
+@keyframes wb-drawer-slide-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.wb-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem;
+}
+
+.wb-quick-ctrl-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 1.15rem;
+}
+
+.wb-quick-ctrl-card {
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 0.9rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.wb-quick-ctrl-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 0.01em;
 }

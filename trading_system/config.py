@@ -368,13 +368,6 @@ class Settings:
     OLOSTEP_API_KEY: str = ""
     NIXTLA_API_KEY: str = ""
 
-    # External Data Provider Flags
-    ENABLE_FINNHUB_FUNDAMENTALS: bool = True
-    ENABLE_FINNHUB_NEWS: bool = True
-    ENABLE_OLOSTEP_SENTIMENT: bool = True
-    ENABLE_NIXTLA_FORECAST: bool = True
-    NIXTLA_FORECAST_HORIZON: int = 5
-
     # Risk parameters
     MAX_RISK_PER_TRADE: float = 0.015  # 1.5% of equity per trade (increased from 0.5% for fuller sizing)
     MAX_POSITION_PCT: float = 0.20  # 20% of equity max per position (increased from 5% for meaningful portfolio size)
@@ -608,10 +601,6 @@ class Settings:
 
         bool_fields = (
             "ENABLE_SPECULATIVE_ROUTING",
-            "ENABLE_FINNHUB_FUNDAMENTALS",
-            "ENABLE_FINNHUB_NEWS",
-            "ENABLE_OLOSTEP_SENTIMENT",
-            "ENABLE_NIXTLA_FORECAST",
             "PURE_TSL_MODE",
             "ENFORCE_INVERSE_INTRADAY_ONLY",
             "ENFORCE_LONG_BREAKEVEN_OVERNIGHT",

@@ -57,8 +57,8 @@ class TestOrchestratorPipelineProgress(unittest.TestCase):
         self.assertEqual(step_events[0]["step"], 1)
         self.assertEqual(step_events[0]["name"], "Market Check")
         self.assertEqual(step_events[1]["step"], 2)
-        self.assertEqual(step_events[1]["name"], "Fetch Data")
-        self.assertEqual(step_events[-1]["step"], 7)
+        self.assertEqual(step_events[1]["name"], "Ingest Candles")
+        self.assertEqual(step_events[-1]["step"], 5)
         self.assertEqual(step_events[-1]["name"], "Standby")
 
     def test_scan_cycle_halted_state_transitions_to_standby(self):
@@ -71,7 +71,7 @@ class TestOrchestratorPipelineProgress(unittest.TestCase):
         step_events = [data for ev, data in events if ev == "pipeline_progress"]
         self.assertEqual(len(step_events), 2)
         self.assertEqual(step_events[0]["step"], 1)
-        self.assertEqual(step_events[1]["step"], 7)
+        self.assertEqual(step_events[1]["step"], 5)
         self.assertEqual(step_events[1]["status"], "halted")
 
 

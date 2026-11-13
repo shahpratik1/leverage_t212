@@ -1,5 +1,4 @@
-"""System 2 deliberative multi-agent analysis layer."""
-from .technical_agent import TechnicalAnalyst
-from .fundamental_agent import FundamentalAnalyst
-from .debate_engine import DebateEngine
+"""System 2 Quantitative Risk & Sizing Layer."""
 from .risk_manager import RiskManager
+
+__all__ = ["RiskManager"]

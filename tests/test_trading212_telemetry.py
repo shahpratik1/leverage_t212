@@ -232,7 +232,8 @@ class TestTrading212RateLimitTelemetry(unittest.TestCase):
         client.client = mock_httpx
 
         sleep_calls = []
-        with patch("trading_system.data.trading212_client.time.sleep", side_effect=sleep_calls.append):
+        with patch("trading_system.data.trading212_client.HAS_HTTPX", True), \
+             patch("trading_system.data.trading212_client.time.sleep", side_effect=sleep_calls.append):
             with self.assertRaises(Trading212Error):
                 client._request("GET", "/equity/account/cash")
 

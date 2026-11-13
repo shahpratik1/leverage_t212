@@ -359,14 +359,9 @@ class ConfigSnapshot:
     PREFER_5X_LEVERAGE: bool = False
     MAX_LEVERAGE: int = 3
 
-    # --- providers (7) ---
+    # --- providers (2) ---
     ENABLE_SPECULATIVE_ROUTING: bool = False
     SPECULATIVE_CONFIDENCE_THRESHOLD: float = 0.70
-    ENABLE_FINNHUB_FUNDAMENTALS: bool = True
-    ENABLE_FINNHUB_NEWS: bool = True
-    ENABLE_OLOSTEP_SENTIMENT: bool = True
-    ENABLE_NIXTLA_FORECAST: bool = True
-    NIXTLA_FORECAST_HORIZON: int = 5
 
     # --- runtime (11) ---
     LLM_DEEP_MODEL: str = "gpt-4o"

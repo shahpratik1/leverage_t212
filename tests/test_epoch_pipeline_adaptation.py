@@ -6,7 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from trading_system.agents.debate_engine import DebateEngine, DebateOutcome
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.agents.strategy_improvement_agent import (
     ImprovementAudit,
@@ -432,57 +431,25 @@ class TestScreenerAndFunnelReport(unittest.TestCase):
         self.assertEqual(sig_report.metric_percentiles["adx"]["count"], 2)
 
 
-class TestDebateEngineEpochAdaptation(unittest.TestCase):
-    def test_reused_debate_engine_uses_snapshot_thresholds_and_models(self):
+class TestRiskManagerDirectEpochAdaptation(unittest.TestCase):
+    def test_risk_manager_direct_sizing_uses_snapshot(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             bus = _make_bus(tmpdir)
-            engine = DebateEngine(openai_api_key="")
+            rm = RiskManager()
             snap1 = bus.active_snapshot()
-
             metrics = _bullish_metrics(adx=21.0)
-            out1 = engine.run_debate(
-                "NVDA",
-                metrics,
-                "Technical bullish",
-                "Fundamental clean",
-                config_snapshot=snap1,
-            )
-            self.assertIsInstance(out1, DebateOutcome)
-            self.assertEqual(out1.config_epoch_id, snap1.config_epoch_id)
-            self.assertEqual(out1.consensus_decision, "BUY_ENTRY")
-
-            snap2 = bus.commit_patch(
-                {
-                    "MIN_ADX_TREND": 26.0,
-                    "ENABLE_SPECULATIVE_ROUTING": True,
-                    "SPECULATIVE_CONFIDENCE_THRESHOLD": 0.90,
-                    "LLM_DEEP_MODEL": "gpt-4o-custom",
-                    "LLM_QUICK_MODEL": "gpt-4o-mini-custom",
-                },
-                expected_epoch_id=snap1.config_epoch_id,
-            )
-            out2 = engine.run_debate(
-                "NVDA",
-                metrics,
-                "Technical bullish",
-                "Fundamental clean",
-                config_snapshot=snap2,
-            )
-            self.assertEqual(out2.config_epoch_id, snap2.config_epoch_id)
-            self.assertIn(
-                "ADX at 21.0 confirms strong bullish trend velocity.",
-                out1.bull_position.key_evidence,
-            )
-            self.assertIn(
-                "ADX at 21.0 indicates low directional momentum.",
-                out2.bear_position.key_evidence,
-            )
-            resolved = engine._resolve_params(snap2)
-            self.assertEqual(resolved["adx_trend_min"], 26.0)
-            self.assertTrue(resolved["speculative_routing"])
-            self.assertAlmostEqual(resolved["speculative_threshold"], 0.90)
-            self.assertEqual(resolved["model"], "gpt-4o-custom")
-            self.assertEqual(resolved["quick_model"], "gpt-4o-mini-custom")
+            with patch("trading_system.data.trading212_client.MarketDataProvider.get_quote", return_value={"price": 25.0, "currency": "EUR"}):
+                card1 = rm.generate_decision_card(
+                    "NVDA",
+                    "NVD3l_EQ",
+                    "LONG",
+                    metrics,
+                    debate_outcome=None,
+                    account_equity=10000.0,
+                    config_snapshot=snap1,
+                )
+                self.assertEqual(card1.config_epoch_id, snap1.config_epoch_id)
+                self.assertEqual(card1.decision, "BUY_ENTRY")
 
 
 class TestRiskManagerEpochAndStatePreservation(unittest.TestCase):

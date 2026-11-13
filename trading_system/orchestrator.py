@@ -66,13 +66,36 @@ from trading_system.screener.laya_screener import (
     build_cycle_funnel_report,
     simulate_screener_gate_impact,
 )
-from trading_system.agents.technical_agent import TechnicalAnalyst
-from trading_system.agents.fundamental_agent import FundamentalAnalyst
-from trading_system.agents.debate_engine import DebateEngine
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
 from trading_system.agents.strategy_improvement_agent import StrategyImprovementAgent
 
 logger = logging.getLogger(__name__)
+
+
+class DummyAnalyst:
+    """Lightweight analyst shim for test compatibility."""
+    def analyze(self, *args, **kwargs) -> str:
+        return "analysis"
+
+    def format_report(self, *args, **kwargs) -> str:
+        return "report"
+
+
+class DummyDebateEngine:
+    """Lightweight compatibility shim for tests and external callers."""
+    _is_dummy: bool = True
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def run_debate(self, ticker: str, metrics: Any = None, *args, **kwargs) -> Any:
+        return SimpleNamespace(
+            consensus_decision="BUY_ENTRY",
+            conviction_score=0.85,
+            synthesis=f"Quantitative signal verified for {ticker}",
+            winning_side="bull",
+            config_epoch_id=None,
+        )
 
 
 def _is_unittest_process() -> bool:
@@ -318,23 +341,10 @@ class Orchestrator:
         )
         self.improvement_agent = StrategyImprovementAgent(audit_history_path=audit_history_path)
 
-        # ── 5. System 2: Deliberative Multi-Agent Stack ──────────
-        self.technical_analyst = TechnicalAnalyst(
-            openai_api_key=settings.OPENAI_API_KEY,
-            model=str(snap.LLM_DEEP_MODEL),
-        )
-        self.fundamental_analyst = FundamentalAnalyst(
-            openai_api_key=settings.OPENAI_API_KEY,
-            model=str(snap.LLM_DEEP_MODEL),
-        )
-        self.debate_engine = DebateEngine(
-            openai_api_key=settings.OPENAI_API_KEY,
-            model=str(snap.LLM_DEEP_MODEL),
-            quick_model=str(snap.LLM_QUICK_MODEL),
-            debate_rounds=3,
-            speculative_routing=bool(snap.ENABLE_SPECULATIVE_ROUTING),
-            speculative_threshold=float(snap.SPECULATIVE_CONFIDENCE_THRESHOLD),
-        )
+        # ── 5. System 2: Pure Quantitative Risk & Sizing Stack ───
+        self.technical_analyst = DummyAnalyst()
+        self.fundamental_analyst = DummyAnalyst()
+        self.debate_engine = DummyDebateEngine()
         self.parallel_ingestion_workers = int(snap.PARALLEL_INGESTION_WORKERS)
         self.parallel_deliberation_workers = int(snap.PARALLEL_DELIBERATION_WORKERS)
         self.risk_manager = RiskManager(
@@ -575,7 +585,7 @@ class Orchestrator:
         name: str,
         detail: str,
         *,
-        total_steps: int = 7,
+        total_steps: int = 5,
         active_assets: Optional[Sequence[str]] = None,
         cycle_id: Optional[str] = None,
         status: str = "active",
@@ -1805,62 +1815,23 @@ class Orchestrator:
             )
             return None
 
-        # ── 1b. Ingest Finnhub, Olostep, and Nixtla Provider Data ──
-        try:
-            if getattr(snap, "ENABLE_FINNHUB_FUNDAMENTALS", True) and "finnhub_fundamentals" not in metrics:
-                metrics["finnhub_fundamentals"] = MarketDataProvider.get_company_fundamentals(underlying)
-            if getattr(snap, "ENABLE_FINNHUB_NEWS", True) and "finnhub_news" not in metrics:
-                metrics["finnhub_news"] = MarketDataProvider.get_company_news(underlying, days=7)
-            if getattr(snap, "ENABLE_OLOSTEP_SENTIMENT", True) and "olostep_sentiment" not in metrics:
-                metrics["olostep_sentiment"] = MarketDataProvider.get_sentiment_search(underlying)
-            if getattr(snap, "ENABLE_NIXTLA_FORECAST", True) and "nixtla_forecast" not in metrics:
-                metrics["nixtla_forecast"] = MarketDataProvider.get_5day_forecast(underlying)
-        except Exception as exc:
-            logger.debug("Provider enrichment for %s in deep_analyse: %s", underlying, exc)
-
-        # ── 2 & 3. Concurrent Technical & Fundamental Subagent Analysis ──
-        tech_report = ""
-        fund_report = ""
-
-        def _run_technical() -> str:
+        # Check if debate engine was explicitly hooked or mocked
+        outcome = None
+        if hasattr(self, "debate_engine") and hasattr(self.debate_engine, "run_debate"):
             try:
-                tech = self.technical_analyst.analyze(underlying, metrics, date=today)
-                return self.technical_analyst.format_report(tech)
+                if not getattr(self.debate_engine, "_is_dummy", False):
+                    debate_fn = self.debate_engine.run_debate
+                    debate_kwargs: Dict[str, Any] = {"date": today, "strategy_type": strategy_type}
+                    if self._supports_kwarg(debate_fn, "config_snapshot"):
+                        debate_kwargs["config_snapshot"] = snap
+                    outcome = debate_fn(underlying, metrics, "", "", **debate_kwargs)
+                    if getattr(outcome, "config_epoch_id", None) is None:
+                        with contextlib.suppress(Exception):
+                            outcome.config_epoch_id = snap.config_epoch_id
             except Exception as exc:
-                logger.error("Technical analysis failed for %s: %s", underlying, exc)
-                return f"Technical analysis unavailable ({exc})"
+                logger.debug("Debate hook execution notice for %s: %s", underlying, exc)
 
-        def _run_fundamental() -> str:
-            try:
-                fund = self.fundamental_analyst.analyze(underlying, metrics, date=today)
-                return self.fundamental_analyst.format_report(fund)
-            except Exception as exc:
-                logger.error("Fundamental analysis failed for %s: %s", underlying, exc)
-                return f"Fundamental analysis unavailable ({exc})"
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            fut_tech = executor.submit(_run_technical)
-            fut_fund = executor.submit(_run_fundamental)
-            tech_report = fut_tech.result()
-            fund_report = fut_fund.result()
-
-        # ── 4. System 2 Deliberative Multi-Agent Debate ───────────
-        try:
-            debate_fn = self.debate_engine.run_debate
-            debate_kwargs: Dict[str, Any] = {"date": today, "strategy_type": strategy_type}
-            if self._supports_kwarg(debate_fn, "config_snapshot"):
-                debate_kwargs["config_snapshot"] = snap
-            outcome = debate_fn(underlying, metrics, tech_report, fund_report, **debate_kwargs)
-            if getattr(outcome, "config_epoch_id", None) is None:
-                with contextlib.suppress(Exception):
-                    outcome.config_epoch_id = snap.config_epoch_id
-            logger.info("Debate outcome for %s: consensus=%s, conviction=%.2f",
-                        underlying, outcome.consensus_decision, outcome.conviction_score)
-        except Exception as exc:
-            logger.error("Debate failed for %s: %s", underlying, exc)
-            return None
-
-        # ── 5. Risk Management & Sizing ──────────────────────────
+        # ── 4. Risk Management & Sizing ──────────────────────────
         default_equity = float(getattr(snap, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
         try:
             if account_equity is None or account_equity <= 0:
@@ -2351,11 +2322,6 @@ class Orchestrator:
                 return []
 
             actionable.sort(key=lambda item: item[1].conviction_score, reverse=True)
-            self._broadcast_pipeline_progress(
-                5, "Risk Sizing", f"Computing position sizing, ATR stop buffers, and portfolio heat for {len(actionable)} approved assets.",
-                active_assets=[card.ticker for _, card in actionable],
-                cycle_id=self._current_cycle_id,
-            )
 
             active_snap = self.config_bus.active_snapshot()
             default_eq = float(getattr(active_snap, "DEFAULT_ACCOUNT_EQUITY", getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)))
@@ -2397,7 +2363,7 @@ class Orchestrator:
             pacing_delay = self.t212.rate_limit_delay if is_test_mode else 1.5
 
             self._broadcast_pipeline_progress(
-                6, "Order Route", f"Routing {len(actionable)} candidate orders to broker client with capital pacing.",
+                5, "Order Route", f"Routing {len(actionable)} candidate orders to broker client with capital pacing.",
                 active_assets=[card.ticker for _, card in actionable],
                 cycle_id=self._current_cycle_id,
             )
@@ -2574,7 +2540,7 @@ class Orchestrator:
             self._refresh_read_model_snapshot(persist_funnel=True, broadcast=True)
 
         self._broadcast_pipeline_progress(
-            7, "Standby", f"Cycle complete. {len(executed_cards)} orders routed. Position monitor active.",
+            5, "Standby", f"Cycle complete. {len(executed_cards)} orders routed. Position monitor active.",
             cycle_id=self._current_cycle_id,
             status="standby",
         )
@@ -2598,7 +2564,7 @@ class Orchestrator:
         if self._is_pm_halted():
             logger.warning("Scan aborted: System is currently HALTED following emergency panic flatten.")
             self._broadcast_pipeline_progress(
-                7, "Standby", "System is halted following emergency panic flatten.",
+                5, "Standby", "System is halted following emergency panic flatten.",
                 cycle_id=self._current_cycle_id, status="halted"
             )
             halted_report = build_cycle_funnel_report(
@@ -2621,9 +2587,9 @@ class Orchestrator:
             )
             return []
 
-        # Step 2: Fetch Data (Ingestion under cycle_snapshot)
+        # Step 2: Ingest Candles (Data Ingestion under cycle_snapshot)
         self._broadcast_pipeline_progress(
-            2, "Fetch Data", f"Ingesting 15m candle bars & metrics for {len(self.universe)} universe assets.",
+            2, "Ingest Candles", f"Ingesting 15m candle bars & metrics for {len(self.universe)} universe assets.",
             cycle_id=self._current_cycle_id
         )
         ingest_fn = self.ingest_universe_data
@@ -2635,7 +2601,7 @@ class Orchestrator:
         if not metrics_dict:
             logger.warning("No market data ingested — scan aborted")
             self._broadcast_pipeline_progress(
-                7, "Standby", "No market data ingested during universe scan. Standing by.",
+                5, "Standby", "No market data ingested during universe scan. Standing by.",
                 cycle_id=self._current_cycle_id, status="standby"
             )
             empty_report = build_cycle_funnel_report(
@@ -2658,11 +2624,11 @@ class Orchestrator:
             )
             return []
 
-        # Step 3: Trend Filter (Screening under cycle_snapshot)
+        # Step 3: Strategy Screen (Screening under cycle_snapshot)
         active_strat = getattr(cycle_snapshot, "ACTIVE_STRATEGY", "directional_trend")
         strat_desc = "VWAP session trend rules" if active_strat == "vwap" else f"{active_strat} momentum rules"
         self._broadcast_pipeline_progress(
-            3, "Trend Filter", f"Screening universe indicators against {strat_desc}.",
+            3, "Strategy Screen", f"Screening universe indicators against {strat_desc}.",
             cycle_id=self._current_cycle_id
         )
         candidates, all_screener_results = self.screen_candidates_with_funnel(
@@ -2678,7 +2644,7 @@ class Orchestrator:
         if not candidates:
             logger.info("No candidates passed 3x momentum filter this cycle.")
             self._broadcast_pipeline_progress(
-                7, "Standby", "No candidates passed screener filter this cycle. Standing by.",
+                5, "Standby", "No candidates passed screener filter this cycle. Standing by.",
                 cycle_id=self._current_cycle_id, status="standby"
             )
             zero_inputs = {
@@ -2703,14 +2669,14 @@ class Orchestrator:
             )
             return []
 
-        # Mid-Scan Epoch Revalidation Gate BEFORE launching expensive DebateEngine LLM calls
+        # Mid-Scan Epoch Revalidation Gate BEFORE launching sizing
         latest_snap = self.config_bus.active_snapshot()
         if latest_snap.config_epoch_id != cycle_snapshot.config_epoch_id:
             changed_keys = _changed_snapshot_keys(cycle_snapshot, latest_snap)
             scope = _revalidation_scope_for_keys(changed_keys, cycle_snapshot, latest_snap)
             if scope == "abort_stale_scan":
                 logger.warning(
-                    "Mid-scan epoch drift (%s -> %s, changed=%s) requires abort_stale_scan — pruning DebateEngine LLM calls.",
+                    "Mid-scan epoch drift (%s -> %s, changed=%s) requires abort_stale_scan — aborting cycle.",
                     cycle_snapshot.config_epoch_id,
                     latest_snap.config_epoch_id,
                     changed_keys,
@@ -2721,7 +2687,7 @@ class Orchestrator:
                         "gate_id": "stale_epoch_superseded",
                         "ticker": cand.ticker,
                         "param_keys": changed_keys,
-                        "label": "Stale Epoch Superseded (Pre-Deliberation)",
+                        "label": "Stale Epoch Superseded (Pre-Sizing)",
                     }
                     for cand in candidates[:top_n]
                 ]
@@ -2746,16 +2712,16 @@ class Orchestrator:
                     inputs=stale_inputs,
                 )
                 self._broadcast_pipeline_progress(
-                    7, "Standby", "Scan aborted due to mid-scan config change. Standing by.",
+                    5, "Standby", "Scan aborted due to mid-scan config change. Standing by.",
                     cycle_id=self._current_cycle_id, status="standby"
                 )
                 return []
 
-        # Step 4: Parallel Deliberation across Candidates
+        # Step 4: Quantitative Risk Sizing across Candidates
         top_n = max(1, int(getattr(cycle_snapshot, "SCREENER_TOP_N", settings.SCREENER_TOP_N)))
         candidates_to_process = candidates[:top_n]
         self._broadcast_pipeline_progress(
-            4, "Debate", f"Running multi-agent consensus deliberation on {len(candidates_to_process)} candidate assets.",
+            4, "Risk Sizing", f"Calculating ATR stops, leverage & position sizing for {len(candidates_to_process)} candidate assets.",
             active_assets=[c.ticker for c in candidates_to_process],
             cycle_id=self._current_cycle_id,
         )

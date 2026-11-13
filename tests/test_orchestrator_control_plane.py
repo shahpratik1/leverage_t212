@@ -12,11 +12,31 @@ import time
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
-from trading_system.agents.debate_engine import DebateOutcome, DebatePosition
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
+
+
+@dataclass
+class DebatePosition:
+    side: str = "BULL"
+    thesis: str = ""
+    confidence: float = 0.8
+
+
+@dataclass
+class DebateOutcome:
+    ticker: str = "QQQ"
+    winning_side: str = "BULL"
+    consensus_decision: str = "BUY_ENTRY"
+    bull_position: Any = None
+    bear_position: Any = None
+    synthesis: str = ""
+    conviction_score: float = 0.85
+    debate_rounds: int = 3
+    config_epoch_id: Optional[str] = None
 from trading_system.config import settings
 from trading_system.config_bus import ConfigBus, ConfigConflictError, ConfigSnapshot
 from trading_system.data.leveraged_universe import LeveragedUniverse

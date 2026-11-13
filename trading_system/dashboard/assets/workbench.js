@@ -507,7 +507,7 @@
     }
   }
 
-  function openModal({ id, title, wide, buildBody, buildFooter, onCancel }) {
+  function openModal({ id, title, wide, drawer, buildBody, buildFooter, onCancel }) {
     const doc = getDoc();
     const root = doc && doc.getElementById("modal-root");
     if (!root) return null;
@@ -522,7 +522,7 @@
       "div",
       {
         id: id || "wb-modal",
-        className: wide ? "wb-modal wb-modal--wide" : "wb-modal",
+        className: drawer ? "wb-modal wb-modal--drawer" : (wide ? "wb-modal wb-modal--wide" : "wb-modal"),
         role: "dialog",
         "aria-modal": "true",
         "aria-labelledby": titleId,
@@ -805,6 +805,194 @@
           errorBox.textContent = (res.data && res.data.error ? res.data.error : `Verification failed (${res.status})`) + retryHint;
         }
       }
+    }
+  }
+
+  function openQuickSettingsDrawer() {
+    if (isFileProtocol()) {
+      showToast("Offline file:// viewer cannot modify settings.", "warn");
+      return;
+    }
+    const currentValues = getActiveConfigValues();
+    const staged = state.stagedChanges || {};
+    const riskButtons = [];
+
+    openModal({
+      id: "quick-settings-drawer",
+      title: "⚙️ Quick Strategy Settings",
+      drawer: true,
+      buildBody: (bodyEl) => {
+        bodyEl.classList.add("wb-drawer-body");
+
+        bodyEl.appendChild(
+          el(
+            "p",
+            { className: "wb-param-hint", style: "margin-bottom:1.25rem; font-size:0.82rem;" },
+            "Configure core quantitative parameters below. Changes hot-reload dynamically via ConfigBus without restarting the trading engine."
+          )
+        );
+
+        const coreGrid = el("div", { className: "wb-quick-ctrl-grid" });
+
+        // 1. Active Strategy
+        const stratVal = staged.ACTIVE_STRATEGY !== undefined ? staged.ACTIVE_STRATEGY : (currentValues.ACTIVE_STRATEGY || "vwap");
+        const stratSelect = el(
+          "select",
+          {
+            id: "qs-strategy-select",
+            className: "wb-select wb-mono",
+            onChange: (e) => stageParameterValue("ACTIVE_STRATEGY", e.target.value),
+          },
+          el("option", { value: "vwap", selected: stratVal === "vwap", text: "VWAP Session Trend Engine (Intraday Breakout)" }),
+          el("option", { value: "directional_trend", selected: stratVal === "directional_trend", text: "Directional Trend Engine (EMA / ADX / RSI)" })
+        );
+        coreGrid.appendChild(
+          el(
+            "div",
+            { className: "wb-quick-ctrl-card" },
+            el("label", { htmlFor: "qs-strategy-select", className: "wb-quick-ctrl-label", text: "1. Active Strategy" }),
+            stratSelect,
+            el("span", { className: "wb-param-hint", text: "Governs universe candidate screening math and entry/exit gates." })
+          )
+        );
+
+        // 2. Risk Profile
+        const curRisk = Number(staged.MAX_RISK_PER_TRADE !== undefined ? staged.MAX_RISK_PER_TRADE : (currentValues.MAX_RISK_PER_TRADE || 0.015));
+        const riskBtnRow = el("div", { className: "wb-pill-row", style: "margin-top:0.4rem; gap:0.4rem;" });
+        const profiles = [
+          [0.01, "Conservative 1.0%"],
+          [0.015, "Balanced 1.5%"],
+          [0.02, "Aggressive 2.0%"],
+        ];
+        profiles.forEach(([pct, label]) => {
+          const btn = el("button", {
+            type: "button",
+            className: Math.abs(curRisk - pct) < 0.001 ? "wb-btn wb-btn--sm wb-btn--primary" : "wb-btn wb-btn--sm",
+            text: label,
+            onClick: () => {
+              stageParameterValue("MAX_RISK_PER_TRADE", pct);
+              profiles.forEach((p, idx) => {
+                if (riskButtons[idx]) {
+                  riskButtons[idx].className = (Math.abs(p[0] - pct) < 0.001) ? "wb-btn wb-btn--sm wb-btn--primary" : "wb-btn wb-btn--sm";
+                }
+              });
+            },
+          });
+          riskButtons.push(btn);
+          riskBtnRow.appendChild(btn);
+        });
+        coreGrid.appendChild(
+          el(
+            "div",
+            { className: "wb-quick-ctrl-card" },
+            el("div", { className: "wb-quick-ctrl-label", text: "2. Risk Profile (Per Trade)" }),
+            riskBtnRow,
+            el("span", { className: "wb-param-hint", text: "Controls capital allocation per trade based on account equity." })
+          )
+        );
+
+        // 3. Stop Loss ATR Buffer
+        const curSl = Number(staged.ATR_SL_MULTIPLIER !== undefined ? staged.ATR_SL_MULTIPLIER : (currentValues.ATR_SL_MULTIPLIER || 2.2));
+        const slInput = el("input", {
+          id: "qs-sl-input",
+          type: "number",
+          step: "0.1",
+          min: "1.0",
+          max: "5.0",
+          className: "wb-input wb-mono",
+          value: String(curSl),
+          onChange: (e) => stageParameterValue("ATR_SL_MULTIPLIER", parseFloat(e.target.value)),
+        });
+        coreGrid.appendChild(
+          el(
+            "div",
+            { className: "wb-quick-ctrl-card" },
+            el("label", { htmlFor: "qs-sl-input", className: "wb-quick-ctrl-label", text: "3. Trailing Stop Loss Buffer (x ATR)" }),
+            slInput,
+            el("span", { className: "wb-param-hint", text: "ATR distance below entry for initial stop and dynamic trailing ratchets." })
+          )
+        );
+
+        // 4. Session Close Cutoff Time
+        const curCutoff = String(staged.SESSION_CLOSE_CUTOFF_UTC !== undefined ? staged.SESSION_CLOSE_CUTOFF_UTC : (currentValues.SESSION_CLOSE_CUTOFF_UTC || "16:20"));
+        const cutoffInput = el("input", {
+          id: "qs-cutoff-input",
+          type: "text",
+          className: "wb-input wb-mono",
+          value: curCutoff,
+          placeholder: "16:20",
+          onChange: (e) => stageParameterValue("SESSION_CLOSE_CUTOFF_UTC", e.target.value.trim()),
+        });
+        coreGrid.appendChild(
+          el(
+            "div",
+            { className: "wb-quick-ctrl-card" },
+            el("label", { htmlFor: "qs-cutoff-input", className: "wb-quick-ctrl-label", text: "4. Session Close Evacuation (UTC)" }),
+            cutoffInput,
+            el("span", { className: "wb-param-hint", text: "Cutoff time to flatten unhedged leverage and prevent overnight gap risk." })
+          )
+        );
+
+        bodyEl.appendChild(coreGrid);
+
+        // Full parameters navigation link
+        bodyEl.appendChild(
+          el(
+            "div",
+            { style: "margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--border-subtle);" },
+            el(
+              "p",
+              { className: "wb-param-hint", style: "font-size:0.8rem;" },
+              "Need deeper configuration? Access all quantitative parameters in the ",
+              el("a", {
+                href: "#config",
+                onClick: (e) => {
+                  e.preventDefault();
+                  closeModal();
+                  navigateTo("config");
+                },
+                text: "Full Config & Diff Workspace →",
+                style: "color:var(--sky); font-weight:600; text-decoration:none;",
+              })
+            )
+          )
+        );
+      },
+      buildFooter: (footEl) => {
+        footEl.appendChild(
+          el("button", {
+            type: "button",
+            className: "wb-btn wb-btn--ghost",
+            text: "Cancel",
+            onClick: () => closeModal(),
+          })
+        );
+        footEl.appendChild(
+          el("button", {
+            type: "button",
+            id: "qs-apply-btn",
+            className: "wb-btn wb-btn--primary",
+            text: "Apply & Hot-Reload",
+            onClick: async () => {
+              if (Object.keys(state.stagedChanges).length === 0) {
+                showToast("No settings changes were made.", "info");
+                closeModal();
+                return;
+              }
+              closeModal();
+              await submitConfigCommit("Quick Settings Update");
+            },
+          })
+        );
+      },
+    });
+  }
+
+  function toggleQuickSettingsDrawer(open) {
+    if (open === false) {
+      closeModal();
+    } else {
+      openQuickSettingsDrawer();
     }
   }
 
@@ -2755,25 +2943,20 @@
     const progress = state.pipelineProgress || (state.data && state.data.pipeline_progress) || null;
     const isHalted = isSystemHalted();
 
-    // Determine active 7-step index (1..7)
-    let currentStep = 7;
+    // Determine active 5-step index (1..5)
+    let currentStep = 5;
     let stepStatus = "standby";
     if (progress && Number.isInteger(progress.step)) {
-      currentStep = progress.step;
-      stepStatus = progress.status || (currentStep === 7 ? "standby" : "active");
+      currentStep = Math.min(5, Math.max(1, progress.step));
+      stepStatus = progress.status || (currentStep === 5 ? "standby" : "active");
     } else if (funnel && funnel.counts) {
       if (funnel.status === "off_hours" || isHalted) {
-        currentStep = 7;
+        currentStep = 5;
         stepStatus = isHalted ? "halted" : "standby";
       } else if (funnel.counts.executed > 0) {
-        currentStep = 7;
-      } else if (funnel.counts.gates > 0) {
-        currentStep = 6;
-        stepStatus = "active";
-      } else if (funnel.counts.debate > 0) {
         currentStep = 5;
-        stepStatus = "active";
-      } else if (funnel.counts.strategy > 0) {
+        stepStatus = "standby";
+      } else if (funnel.counts.gates > 0 || funnel.counts.strategy > 0) {
         currentStep = 4;
         stepStatus = "active";
       } else if (funnel.counts.screened > 0) {
@@ -2787,12 +2970,10 @@
 
     const stepDefs = [
       [1, "Market Check"],
-      [2, "Fetch Data"],
-      [3, "Trend Filter"],
-      [4, "Debate"],
-      [5, "Risk Sizing"],
-      [6, "Order Route"],
-      [7, "Standby"],
+      [2, "Ingest Candles"],
+      [3, "Strategy Screen"],
+      [4, "Risk Sizing"],
+      [5, "Order Route"],
     ];
 
     // Header
@@ -2821,6 +3002,17 @@
           "button",
           {
             type: "button",
+            id: "quick-settings-toggle-btn",
+            className: "wb-btn wb-btn--sm wb-btn--primary",
+            style: "font-size: 0.75rem; padding: 0.25rem 0.65rem; display: inline-flex; align-items: center; gap: 0.35rem;",
+            onClick: () => toggleQuickSettingsDrawer(true),
+          },
+          "⚙️ Quick Settings"
+        ),
+        el(
+          "button",
+          {
+            type: "button",
             id: "mc-mode-toggle-btn",
             className: "wb-btn wb-btn--sm wb-btn--ghost",
             style: "font-size: 0.72rem; padding: 0.2rem 0.5rem;",
@@ -2839,18 +3031,18 @@
     );
     container.appendChild(header);
 
-    // 7-Step Stepper
-    const stepperEl = el("div", { id: "workflow-stepper", className: "wb-stepper", role: "progressbar", "aria-valuenow": String(currentStep), "aria-valuemin": "1", "aria-valuemax": "7" });
+    // 5-Step Stepper
+    const stepperEl = el("div", { id: "workflow-stepper", className: "wb-stepper", role: "progressbar", "aria-valuenow": String(currentStep), "aria-valuemin": "1", "aria-valuemax": "5" });
     stepDefs.forEach(([num, label]) => {
       let stateClass = "wb-step--pending";
       let iconText = String(num);
 
-      if (num < currentStep || (currentStep === 7 && num !== 7 && funnel && funnel.counts && funnel.counts.universe > 0)) {
+      if (num < currentStep || (currentStep === 5 && stepStatus === "standby" && funnel && funnel.counts && funnel.counts.universe > 0)) {
         stateClass = "wb-step--completed";
         iconText = "✓";
       } else if (num === currentStep) {
-        stateClass = "wb-step--active";
-        iconText = String(num);
+        stateClass = (stepStatus === "standby" ? "wb-step--completed" : "wb-step--active");
+        iconText = (stepStatus === "standby" ? "✓" : String(num));
       }
 
       stepperEl.appendChild(
@@ -2873,7 +3065,7 @@
       ? progress.detail
       : (isHalted
         ? "Trading engine is currently HALTED following emergency panic flatten."
-        : (currentStep === 7
+        : (currentStep === 5 || stepStatus === "standby"
           ? "Cycle complete. Position monitor actively watching stops and ratchets."
           : `Running step ${currentStep}: ${stepDefs[currentStep - 1] ? stepDefs[currentStep - 1][1] : ""}`));
 
@@ -2881,9 +3073,9 @@
       ? `${funnel.counts.executed || 0} executed • ${funnel.counts.screened || 0} screened of ${funnel.counts.universe} total`
       : `${(state.data && state.data.pairs_watchlist ? state.data.pairs_watchlist.length : 24)} universe pairs monitored`;
 
-    const nextDetail = (currentStep === 7)
+    const nextDetail = (currentStep === 5 || stepStatus === "standby")
       ? "Next 5-minute automated universe scan cycle"
-      : `Step ${(currentStep % 7) + 1}: ${stepDefs[currentStep % 7][1]}`;
+      : `Step ${(currentStep % 5) + 1}: ${stepDefs[currentStep % 5][1]}`;
 
     const nowBox = el(
       "div",
@@ -2936,14 +3128,22 @@
 
     // Decision Funnel Stages (preserving stage-count metrics compatibility)
     if (funnel && funnel.counts && funnel.counts.universe > 0 && funnel.status !== "pre_scan" && funnel.status !== "off_hours") {
-      const stageDefsList = [
-        ["universe", "Universe"],
-        ["screened", "Screened"],
-        ["strategy", "Strategy"],
-        ["debate", "Debate"],
-        ["gates", "Gates"],
-        ["executed", "Executed"],
-      ];
+      const stageDefsList = (state.viewMode === "advanced")
+        ? [
+            ["universe", "Universe"],
+            ["screened", "Screened"],
+            ["strategy", "Strategy"],
+            ["debate", "Debate"],
+            ["gates", "Risk Gates"],
+            ["executed", "Executed"],
+          ]
+        : [
+            ["universe", "Universe Assets"],
+            ["screened", "Data Ingested"],
+            ["strategy", "Strategy Screened"],
+            ["gates", "Risk Sized"],
+            ["executed", "Orders Routed"],
+          ];
       const total = Math.max(1, funnel.counts.universe);
       const stagesEl = el("div", { className: "wb-funnel-stages", style: "margin-bottom:1rem;" });
       stageDefsList.forEach(([key, label]) => {
@@ -3218,12 +3418,16 @@
         text: `${isLong ? "LONG" : "SHORT"} ${lev}x`,
       }),
     ];
-    if (isLegacy) {
-      badges.push(el("span", { className: "wb-badge wb-badge--amber", text: "Legacy (Unstamped)" }));
-    } else if (isBehind) {
-      badges.push(el("span", { className: "wb-badge wb-badge--amber wb-mono", text: `Behind ${posEpoch} -> ${activeEpoch}` }));
+    if (state.viewMode === "advanced") {
+      if (isLegacy) {
+        badges.push(el("span", { className: "wb-badge wb-badge--amber", text: "Legacy (Unstamped)" }));
+      } else if (isBehind) {
+        badges.push(el("span", { className: "wb-badge wb-badge--amber wb-mono", text: `Behind ${posEpoch} -> ${activeEpoch}` }));
+      } else {
+        badges.push(el("span", { className: "wb-badge wb-badge--emerald wb-mono", text: posEpoch }));
+      }
     } else {
-      badges.push(el("span", { className: "wb-badge wb-badge--emerald wb-mono", text: posEpoch }));
+      badges.push(el("span", { className: "wb-badge wb-badge--emerald wb-mono", text: "● Stop Armed" }));
     }
     if (isPanicFailed) {
       badges.push(el("span", { className: "wb-badge wb-badge--rose", text: "UNPROTECTED / PANIC FAILED" }));
@@ -5159,6 +5363,8 @@
     navigateTo,
     parseHashRoute,
     openAuthModal,
+    openQuickSettingsDrawer,
+    toggleQuickSettingsDrawer,
     openPanicModal,
     openResumeModal,
     openAddParameterModal,
