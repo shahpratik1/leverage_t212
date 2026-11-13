@@ -70,6 +70,49 @@
     "circuit_breaker",
   ]);
 
+  const PLAIN_ENGLISH_GATE_TRANSLATIONS = {
+    adx_trend_gate: "Trend strength ADX below momentum floor (< 18.0)",
+    min_adx_trend: "Trend strength ADX below minimum threshold (< 18.0)",
+    dmi_trend_gate: "DMI directional indicator below breakout threshold",
+    setup_quality_tier: "Setup quality score below favorable threshold",
+    setup_score_gate: "Technical setup score below required threshold",
+    ema_slope_gate: "20-day EMA trend slope insufficient (flat or downtrend)",
+    min_ema20_slope_pct: "20-day EMA slope below required angle",
+    earnings_blackout_gate: "Earnings release scheduled within 48h blackout window",
+    earnings_blackout: "Earnings release scheduled within 48h blackout window",
+    entry_earnings_blackout_days: "Earnings report too close to entry window",
+    catalyst_risk_gate: "High catalyst risk from upcoming corporate action",
+    high_vol_erratic_gate: "Realized volatility too erratic for entry",
+    high_vol_max_realized_vol: "Realized volatility exceeds ceiling (> 65% annualized)",
+    regime_classifier: "Market regime in low-volatility chop",
+    macro_regime_chop: "Market regime in low-volatility chop",
+    fallback_screener_adx_gate: "Fallback screener trend strength insufficient",
+    spread_gate: "Broker bid-ask spread wider than limit (> 1.5%)",
+    max_bid_ask_spread_pct: "Bid-ask spread too wide (> 1.5%)",
+    correlation_limit: "Sector or portfolio correlation heat limit reached",
+    max_sector_positions: "Sector position limit reached",
+    circuit_breaker: "Daily circuit breaker active (drawdown limit reached)",
+    stale_epoch_superseded: "Configuration updated mid-scan (cycle superseded)",
+    market_closed: "Exchange session currently closed",
+    system_halted: "Trading halted by emergency panic switch",
+    insufficient_data: "Insufficient historical price candles for calculation",
+    no_etp_mapping: "No eligible leveraged ETP pair found",
+  };
+
+  function translateGateRejection(gateId, label) {
+    if (gateId && PLAIN_ENGLISH_GATE_TRANSLATIONS[gateId]) {
+      return PLAIN_ENGLISH_GATE_TRANSLATIONS[gateId];
+    }
+    const cleanId = String(gateId || "").toLowerCase();
+    for (const [key, text] of Object.entries(PLAIN_ENGLISH_GATE_TRANSLATIONS)) {
+      if (cleanId.includes(key)) return text;
+    }
+    if (label && typeof label === "string" && label.length > 0) {
+      return label;
+    }
+    return `Asset filtered out by ${gateId || "risk rule"}`;
+  }
+
   function getDoc() {
     return typeof document !== "undefined" ? document : null;
   }
@@ -98,6 +141,17 @@
     root: null,
     data: {},
     route: { tab: "monitor", param: null, gate: null },
+    viewMode: (function () {
+      try {
+        const win = getWin();
+        const stored = win && win.sessionStorage && win.sessionStorage.getItem("quant_workbench_view_mode");
+        return stored === "advanced" ? "advanced" : "simple";
+      } catch (_) {
+        return "simple";
+      }
+    })(),
+    trackerExpanded: false,
+    pipelineProgress: null,
     directionFilter: "ALL",
     configSearch: "",
     configGroup: "all",
@@ -2298,8 +2352,33 @@
       ),
       el(
         "span",
-        { id: "header-epoch-pill", className: "wb-pill wb-pill--sky wb-mono" },
+        {
+          id: "header-epoch-pill",
+          className: "wb-pill wb-pill--sky wb-mono",
+          hidden: state.viewMode === "simple",
+        },
         `Epoch: ${epochId}`
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          id: "header-view-mode-btn",
+          className: state.viewMode === "simple" ? "wb-pill wb-pill--emerald" : "wb-pill wb-pill--sky",
+          style: "cursor: pointer; border: none;",
+          title: "Toggle Simple / Advanced Control Mode",
+          onClick: () => {
+            state.viewMode = state.viewMode === "simple" ? "advanced" : "simple";
+            try {
+              const win = getWin();
+              if (win && win.sessionStorage) {
+                win.sessionStorage.setItem("quant_workbench_view_mode", state.viewMode);
+              }
+            } catch (_) {}
+            renderAllVisible();
+          },
+        },
+        state.viewMode === "simple" ? "Simple Mode" : "Advanced Mode"
       ),
       el(
         "span",
@@ -2664,74 +2743,268 @@
     };
   }
 
-  function renderFunnelCard(container) {
+  function renderMissionControlCard(container) {
     clearNode(container);
+    container.classList.add("wb-mc-card");
     const funnel = normalizeFunnelData();
+    const progress = state.pipelineProgress || (state.data && state.data.pipeline_progress) || null;
+    const isHalted = isSystemHalted();
+
+    // Determine active 7-step index (1..7)
+    let currentStep = 7;
+    let stepStatus = "standby";
+    if (progress && Number.isInteger(progress.step)) {
+      currentStep = progress.step;
+      stepStatus = progress.status || (currentStep === 7 ? "standby" : "active");
+    } else if (funnel && funnel.counts) {
+      if (funnel.status === "off_hours" || isHalted) {
+        currentStep = 7;
+        stepStatus = isHalted ? "halted" : "standby";
+      } else if (funnel.counts.executed > 0) {
+        currentStep = 7;
+      } else if (funnel.counts.gates > 0) {
+        currentStep = 6;
+        stepStatus = "active";
+      } else if (funnel.counts.debate > 0) {
+        currentStep = 5;
+        stepStatus = "active";
+      } else if (funnel.counts.strategy > 0) {
+        currentStep = 4;
+        stepStatus = "active";
+      } else if (funnel.counts.screened > 0) {
+        currentStep = 3;
+        stepStatus = "active";
+      } else if (funnel.counts.universe > 0) {
+        currentStep = 2;
+        stepStatus = "active";
+      }
+    }
+
+    const stepDefs = [
+      [1, "Market Check"],
+      [2, "Fetch Data"],
+      [3, "Trend Filter"],
+      [4, "Debate"],
+      [5, "Risk Sizing"],
+      [6, "Order Route"],
+      [7, "Standby"],
+    ];
+
+    // Header
+    const statusBadge = isHalted
+      ? el("span", { className: "wb-badge wb-badge--rose wb-mono", text: "SYSTEM HALTED" })
+      : (stepStatus === "active"
+        ? el("span", { className: "wb-badge wb-badge--emerald wb-mono", text: "● SCANNING" })
+        : el("span", { className: "wb-badge wb-badge--sky wb-mono", text: "● STANDBY / MONITORING" }));
+
     const header = el(
       "div",
-      { className: "wb-card-header" },
-      el("h2", { className: "wb-card-title", text: "Decision Funnel & Gate Attribution" }),
-      funnel && funnel.epochId
-        ? el("span", { className: "wb-badge wb-badge--sky wb-mono", text: `Cycle Epoch: ${funnel.epochId}` })
-        : null
+      { className: "wb-mc-header" },
+      el(
+        "div",
+        { className: "wb-mc-title-group" },
+        el("h2", { className: "wb-card-title", text: "Mission Control — Live Pipeline Workflow" }),
+        statusBadge
+      ),
+      el(
+        "div",
+        { className: "wb-pill-row" },
+        funnel && funnel.epochId && state.viewMode === "advanced"
+          ? el("span", { className: "wb-badge wb-badge--sky wb-mono", text: `Cycle Epoch: ${funnel.epochId}` })
+          : null,
+        el(
+          "button",
+          {
+            type: "button",
+            id: "mc-mode-toggle-btn",
+            className: "wb-btn wb-btn--sm wb-btn--ghost",
+            style: "font-size: 0.72rem; padding: 0.2rem 0.5rem;",
+            onClick: () => {
+              state.viewMode = state.viewMode === "simple" ? "advanced" : "simple";
+              try {
+                const win = getWin();
+                if (win && win.sessionStorage) win.sessionStorage.setItem("quant_workbench_view_mode", state.viewMode);
+              } catch (_) {}
+              renderAllVisible();
+            },
+          },
+          state.viewMode === "simple" ? "Switch to Advanced" : "Switch to Simple"
+        )
+      )
     );
     container.appendChild(header);
 
-    if (!funnel || funnel.counts.universe === 0 || funnel.status === "pre_scan" || funnel.status === "off_hours") {
+    // 7-Step Stepper
+    const stepperEl = el("div", { id: "workflow-stepper", className: "wb-stepper", role: "progressbar", "aria-valuenow": String(currentStep), "aria-valuemin": "1", "aria-valuemax": "7" });
+    stepDefs.forEach(([num, label]) => {
+      let stateClass = "wb-step--pending";
+      let iconText = String(num);
+
+      if (num < currentStep || (currentStep === 7 && num !== 7 && funnel && funnel.counts && funnel.counts.universe > 0)) {
+        stateClass = "wb-step--completed";
+        iconText = "✓";
+      } else if (num === currentStep) {
+        stateClass = "wb-step--active";
+        iconText = String(num);
+      }
+
+      stepperEl.appendChild(
+        el(
+          "div",
+          { id: `step-${num}`, className: `wb-step ${stateClass}`, dataset: { step: String(num) } },
+          el("div", { className: "wb-step-num", text: iconText }),
+          el(
+            "div",
+            { className: "wb-step-info" },
+            el("span", { className: "wb-step-name", text: label })
+          )
+        )
+      );
+    });
+    container.appendChild(stepperEl);
+
+    // Dynamic "Now / Where / What's Next" Box
+    const nowDetail = (progress && progress.detail)
+      ? progress.detail
+      : (isHalted
+        ? "Trading engine is currently HALTED following emergency panic flatten."
+        : (currentStep === 7
+          ? "Cycle complete. Position monitor actively watching stops and ratchets."
+          : `Running step ${currentStep}: ${stepDefs[currentStep - 1] ? stepDefs[currentStep - 1][1] : ""}`));
+
+    const whereDetail = (funnel && funnel.counts && funnel.counts.universe > 0)
+      ? `${funnel.counts.executed || 0} executed • ${funnel.counts.screened || 0} screened of ${funnel.counts.universe} total`
+      : `${(state.data && state.data.pairs_watchlist ? state.data.pairs_watchlist.length : 24)} universe pairs monitored`;
+
+    const nextDetail = (currentStep === 7)
+      ? "Next 5-minute automated universe scan cycle"
+      : `Step ${(currentStep % 7) + 1}: ${stepDefs[currentStep % 7][1]}`;
+
+    const nowBox = el(
+      "div",
+      { className: "wb-mc-now-box" },
+      el(
+        "div",
+        { className: "wb-mc-col" },
+        el("span", { className: "wb-mc-col-label", text: "NOW" }),
+        el("span", { id: "workflow-now-val", className: "wb-mc-col-val", text: nowDetail })
+      ),
+      el(
+        "div",
+        { className: "wb-mc-col" },
+        el("span", { className: "wb-mc-col-label", text: "WHERE" }),
+        el("span", { id: "workflow-where-val", className: "wb-mc-col-val", text: whereDetail })
+      ),
+      el(
+        "div",
+        { className: "wb-mc-col" },
+        el("span", { className: "wb-mc-col-label", text: "WHAT'S NEXT" }),
+        el("span", { id: "workflow-next-val", className: "wb-mc-col-val", text: nextDetail })
+      )
+    );
+    container.appendChild(nowBox);
+
+    // Live Countdowns Tray
+    const countdownsEl = el(
+      "div",
+      { className: "wb-mc-countdowns" },
+      el(
+        "div",
+        { className: "wb-countdown-chip" },
+        el("span", { className: "wb-muted", text: "Next Scan:" }),
+        el("span", { id: "next-scan-countdown", className: "wb-countdown-val", text: "--:--" })
+      ),
+      el(
+        "div",
+        { className: "wb-countdown-chip" },
+        el("span", { className: "wb-muted", text: "Stop Monitor:" }),
+        el("span", { id: "next-monitor-countdown", className: "wb-countdown-val", text: "--s" })
+      ),
+      el(
+        "div",
+        { className: "wb-countdown-chip" },
+        el("span", { className: "wb-muted", text: "LSE Close Cutoff:" }),
+        el("span", { id: "cutoff-countdown-mc", className: "wb-countdown-val", text: "--:--:--" })
+      )
+    );
+    container.appendChild(countdownsEl);
+
+    // Decision Funnel Stages (preserving stage-count metrics compatibility)
+    if (funnel && funnel.counts && funnel.counts.universe > 0 && funnel.status !== "pre_scan" && funnel.status !== "off_hours") {
+      const stageDefsList = [
+        ["universe", "Universe"],
+        ["screened", "Screened"],
+        ["strategy", "Strategy"],
+        ["debate", "Debate"],
+        ["gates", "Gates"],
+        ["executed", "Executed"],
+      ];
+      const total = Math.max(1, funnel.counts.universe);
+      const stagesEl = el("div", { className: "wb-funnel-stages", style: "margin-bottom:1rem;" });
+      stageDefsList.forEach(([key, label]) => {
+        const val = funnel.counts[key] || 0;
+        const pct = Math.round((val / total) * 100);
+        stagesEl.appendChild(
+          el(
+            "div",
+            { className: "wb-funnel-stage", dataset: { stage: key } },
+            el("span", { className: "wb-funnel-stage-name", text: label }),
+            el("span", { className: "wb-funnel-stage-count", text: String(val) }),
+            el("span", { className: "wb-funnel-stage-pct", text: `${pct}% of universe` })
+          )
+        );
+      });
+      container.appendChild(stagesEl);
+    } else if (!funnel || funnel.counts.universe === 0 || funnel.status === "pre_scan" || funnel.status === "off_hours") {
       const msg = funnel && funnel.reason
         ? funnel.reason
         : (funnel && funnel.status === "off_hours"
           ? "Off-Hours / Market Closed: Next funnel scan runs when exchange sessions open."
           : "Pre-Scan State: No completed universe scan cycle recorded yet.");
-      container.appendChild(el("div", { id: "funnel-empty-state", className: "wb-empty", text: msg }));
-      return;
+      container.appendChild(el("div", { id: "funnel-empty-state", className: "wb-empty", style: "margin-bottom:1rem;", text: msg }));
     }
 
-    const stageDefs = [
-      ["universe", "Universe"],
-      ["screened", "Screened"],
-      ["strategy", "Strategy"],
-      ["debate", "Debate"],
-      ["gates", "Gates"],
-      ["executed", "Executed"],
-    ];
-    const total = Math.max(1, funnel.counts.universe);
-    const stagesEl = el("div", { className: "wb-funnel-stages" });
-    stageDefs.forEach(([key, label]) => {
-      const val = funnel.counts[key] || 0;
-      const pct = Math.round((val / total) * 100);
-      stagesEl.appendChild(
-        el(
-          "div",
-          { className: "wb-funnel-stage", dataset: { stage: key } },
-          el("span", { className: "wb-funnel-stage-name", text: label }),
-          el("span", { className: "wb-funnel-stage-count", text: String(val) }),
-          el("span", { className: "wb-funnel-stage-pct", text: `${pct}% of universe` })
-        )
-      );
-    });
-    container.appendChild(stagesEl);
+    // Plain-English Rejections List
+    if (funnel && Array.isArray(funnel.breakdown) && funnel.breakdown.length > 0) {
+      const rejTitle = el("div", { className: "wb-label", style: "margin-bottom:0.5rem", text: "Universe Filter Results (Plain English)" });
+      container.appendChild(rejTitle);
+      const rejectionsList = el("div", { className: "wb-mc-rejections" });
+      const legacyGateList = el("div", { className: "wb-gate-list", style: "margin-top:0.5rem;" });
 
-    if (funnel.breakdown.length > 0) {
-      const gateList = el("div", { className: "wb-gate-list" });
       funnel.breakdown.forEach((g) => {
         const gid = g.gate_id || "gate";
         const label = g.label || gid;
         const count = g.count ?? 0;
         const paramKeys = Array.isArray(g.param_keys) ? g.param_keys.filter(Boolean) : [];
         const isStructural = Boolean(g.structural) || STRUCTURAL_GATES.has(gid) || paramKeys.length === 0;
+        const translatedReason = translateGateRejection(gid, label);
 
-        if (isStructural) {
-          gateList.appendChild(
-            el("span", {
-              className: "wb-gate-chip wb-gate-chip--structural",
-              dataset: { gateId: gid, structural: "true" },
-              text: `${label}: ${count} (Structural)`,
+        const card = el(
+          "div",
+          { className: "wb-mc-rejection-card", dataset: { gateId: gid } },
+          el(
+            "div",
+            { className: "wb-mc-rejection-text" },
+            el("span", { className: "wb-badge wb-badge--rose wb-mono", text: `${count} stocks` }),
+            el("span", { text: translatedReason })
+          )
+        );
+
+        if (!isStructural && paramKeys.length > 0) {
+          const targetParam = paramKeys[0];
+          card.appendChild(
+            el("button", {
+              type: "button",
+              className: "wb-btn wb-btn--sm wb-btn--ghost",
+              dataset: { deepLink: "config", param: targetParam, gate: gid },
+              text: `Adjust ${targetParam}`,
+              onClick: () => {
+                state.viewMode = "advanced";
+                navigateTo("config", { param: targetParam, gate: gid });
+              },
             })
           );
-        } else {
-          const targetParam = paramKeys[0];
-          gateList.appendChild(
+          legacyGateList.appendChild(
             el("button", {
               type: "button",
               className: "wb-gate-chip wb-gate-chip--link",
@@ -2740,10 +3013,112 @@
               onClick: () => navigateTo("config", { param: targetParam, gate: gid }),
             })
           );
+        } else {
+          legacyGateList.appendChild(
+            el("span", {
+              className: "wb-gate-chip wb-gate-chip--structural",
+              dataset: { gateId: gid, structural: "true" },
+              text: `${label}: ${count} (Structural)`,
+            })
+          );
         }
+        rejectionsList.appendChild(card);
       });
-      container.appendChild(gateList);
+      container.appendChild(rejectionsList);
+      container.appendChild(legacyGateList);
     }
+
+    // Expandable 24-Stock Pipeline Tracker
+    const watchlist = (state.data && Array.isArray(state.data.pairs_watchlist)) ? state.data.pairs_watchlist : [];
+    const activeSignals = (state.data && Array.isArray(state.data.active_signals)) ? state.data.active_signals : [];
+    const activeTickerSet = new Set(activeSignals.map((s) => s.ticker));
+
+    const trackerSection = el("div", { className: "wb-tracker-tray" });
+    const toggleBtn = el(
+      "button",
+      {
+        type: "button",
+        id: "tracker-toggle-btn",
+        className: "wb-btn wb-btn--sm wb-btn--ghost",
+        style: "display: flex; align-items: center; gap: 0.4rem; font-weight: 600;",
+        onClick: () => {
+          state.trackerExpanded = !state.trackerExpanded;
+          renderMissionControlCard(container);
+        },
+      },
+      el("span", { text: state.trackerExpanded ? "▲ Hide Universe Stock Tracker" : `▼ Show Universe Stock Tracker (${watchlist.length || 24} assets)` })
+    );
+    trackerSection.appendChild(toggleBtn);
+
+    if (state.trackerExpanded) {
+      const grid = el("div", { className: "wb-tracker-grid" });
+
+      // Column 1: Filtered Out
+      const colFiltered = el("div", { className: "wb-tracker-col" });
+      colFiltered.appendChild(el("div", { className: "wb-tracker-col-header" }, el("span", { text: "1. Filtered Out" })));
+
+      // Column 2: In Debate
+      const colDebate = el("div", { className: "wb-tracker-col" });
+      colDebate.appendChild(el("div", { className: "wb-tracker-col-header" }, el("span", { text: "2. In Debate" })));
+
+      // Column 3: Risk Sizing
+      const colSizing = el("div", { className: "wb-tracker-col" });
+      colSizing.appendChild(el("div", { className: "wb-tracker-col-header" }, el("span", { text: "3. Risk Sizing" })));
+
+      // Column 4: Active Trade
+      const colActive = el("div", { className: "wb-tracker-col" });
+      colActive.appendChild(el("div", { className: "wb-tracker-col-header" }, el("span", { text: "4. Active Trade" })));
+
+      // Populate Active Trades
+      activeSignals.forEach((sig) => {
+        const item = el(
+          "div",
+          { className: "wb-tracker-item" },
+          el("span", { className: "wb-tracker-item-ticker", text: sig.ticker || sig.display_name }),
+          el("span", { className: "wb-badge wb-badge--emerald", text: `${sig.direction} • ${sig.pnl_pct ? sig.pnl_pct.toFixed(1) + "%" : "ACTIVE"}` })
+        );
+        colActive.appendChild(item);
+      });
+
+      // Populate other watchlist items
+      watchlist.forEach((pair) => {
+        const tk = pair.long_ticker || pair.underlying;
+        if (activeTickerSet.has(tk)) return;
+
+        // If currently in debate/progress
+        if (progress && Array.isArray(progress.active_assets) && progress.active_assets.includes(tk)) {
+          if (progress.step === 4) {
+            colDebate.appendChild(el("div", { className: "wb-tracker-item" }, el("span", { className: "wb-tracker-item-ticker", text: tk }), el("span", { className: "wb-badge wb-badge--indigo", text: "Debating" })));
+            return;
+          } else if (progress.step === 5 || progress.step === 6) {
+            colSizing.appendChild(el("div", { className: "wb-tracker-item" }, el("span", { className: "wb-tracker-item-ticker", text: tk }), el("span", { className: "wb-badge wb-badge--sky", text: "Sizing" })));
+            return;
+          }
+        }
+
+        // Filtered out item
+        colFiltered.appendChild(
+          el(
+            "div",
+            { className: "wb-tracker-item" },
+            el("span", { className: "wb-tracker-item-ticker", text: tk }),
+            el("span", { className: "wb-muted", style: "font-size:0.7rem", text: pair.adx ? `ADX ${pair.adx}` : "Skipped" })
+          )
+        );
+      });
+
+      grid.appendChild(colFiltered);
+      grid.appendChild(colDebate);
+      grid.appendChild(colSizing);
+      grid.appendChild(colActive);
+      trackerSection.appendChild(grid);
+    }
+
+    container.appendChild(trackerSection);
+  }
+
+  function renderFunnelCard(container) {
+    return renderMissionControlCard(container);
   }
 
   function renderPositionsSection(container) {
@@ -3324,6 +3699,245 @@
     slot.appendChild(groupsWrap);
   }
 
+  function renderQuickControls(container, readOnly) {
+    const doc = getDoc();
+    if (!doc) return;
+    let card = doc.getElementById("quick-controls-card");
+    if (!card) {
+      card = el("section", { id: "quick-controls-card", className: "wb-quick-controls" });
+      if (typeof container.insertBefore === "function" && container.firstChild) {
+        container.insertBefore(card, container.firstChild);
+      } else {
+        container.appendChild(card);
+      }
+    }
+    clearNode(card);
+
+    const activeStrat = getEffectiveConfigValue("ACTIVE_STRATEGY") || "directional_trend";
+    const currentRisk = Number(getEffectiveConfigValue("MAX_RISK_PER_TRADE") || 0.015);
+    const currentSlMult = Number(getEffectiveConfigValue("ATR_SL_MULTIPLIER") || 2.2);
+    const currentCutoff = String(getEffectiveConfigValue("SESSION_CLOSE_CUTOFF_UTC") || "16:20").trim();
+
+    const header = el(
+      "div",
+      { className: "wb-mc-header" },
+      el(
+        "div",
+        { className: "wb-mc-title-group" },
+        el("h2", { className: "wb-card-title", text: "Quick Controls (Simple Mode)" }),
+        el("span", { className: "wb-badge wb-badge--emerald", text: "Core 4 Controls" })
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          id: "toggle-advanced-from-quick-btn",
+          className: "wb-btn wb-btn--sm wb-btn--primary",
+          onClick: () => {
+            state.viewMode = "advanced";
+            try {
+              const win = getWin();
+              if (win && win.sessionStorage) win.sessionStorage.setItem("quant_workbench_view_mode", "advanced");
+            } catch (_) {}
+            renderConfigWorkspace(true);
+            renderHeader();
+          },
+        },
+        "Show Advanced Settings (50+ Parameters & Diff Drawer)"
+      )
+    );
+    card.appendChild(header);
+
+    const grid = el("div", { className: "wb-quick-grid" });
+
+    // 1. Active Strategy
+    const stratSelect = el(
+      "select",
+      {
+        id: "quick-strat-select",
+        className: "wb-input",
+        disabled: readOnly,
+        onChange: (e) => {
+          stageParameterValue("ACTIVE_STRATEGY", e.target.value);
+          renderQuickControls(container, readOnly);
+        },
+      },
+      el("option", { value: "directional_trend", selected: activeStrat === "directional_trend", text: "Directional Trend (Momentum Breakout)" }),
+      el("option", { value: "supertrend", selected: activeStrat === "supertrend", text: "Supertrend (Area 2 - Next in Line)" })
+    );
+    grid.appendChild(
+      el(
+        "div",
+        { className: "wb-field" },
+        el("label", { className: "wb-label", htmlFor: "quick-strat-select", text: "1. Active Strategy" }),
+        stratSelect,
+        el("div", { className: "wb-kpi-sub", text: "Governs technical screening & momentum rules" })
+      )
+    );
+
+    // 2. Risk Level (Segmented Control: Conservative, Balanced, Aggressive)
+    let riskTier = "balanced";
+    if (currentRisk <= 0.008) riskTier = "conservative";
+    else if (currentRisk >= 0.018) riskTier = "aggressive";
+
+    const segControl = el("div", { className: "wb-segmented-control" });
+    const tiers = [
+      ["conservative", "Conservative (0.5%)", 0.0075, 2.5],
+      ["balanced", "Balanced (1.0%)", 0.015, 2.2],
+      ["aggressive", "Aggressive (1.5%)", 0.02, 1.8],
+    ];
+    tiers.forEach(([tierKey, tierLabel, riskVal, slVal]) => {
+      segControl.appendChild(
+        el(
+          "button",
+          {
+            type: "button",
+            id: `quick-risk-${tierKey}`,
+            className: `wb-seg-btn ${riskTier === tierKey ? "wb-seg-btn--active" : ""}`,
+            disabled: readOnly,
+            onClick: () => {
+              stageParameterValue("MAX_RISK_PER_TRADE", riskVal);
+              stageParameterValue("ATR_SL_MULTIPLIER", slVal);
+              renderQuickControls(container, readOnly);
+            },
+          },
+          tierLabel
+        )
+      );
+    });
+    grid.appendChild(
+      el(
+        "div",
+        { className: "wb-field" },
+        el("label", { className: "wb-label", text: "2. Risk Profile" }),
+        segControl,
+        el("div", { className: "wb-kpi-sub", text: "Sets position sizing cap & stop distance" })
+      )
+    );
+
+    // 3. Stop Loss Buffer (ATR Multiplier)
+    const slSelect = el(
+      "select",
+      {
+        id: "quick-sl-select",
+        className: "wb-input",
+        disabled: readOnly,
+        onChange: (e) => {
+          stageParameterValue("ATR_SL_MULTIPLIER", Number(e.target.value));
+          renderQuickControls(container, readOnly);
+        },
+      },
+      [1.5, 1.8, 2.0, 2.2, 2.5, 2.8, 3.0].map((mult) =>
+        el("option", {
+          value: String(mult),
+          selected: Math.abs(currentSlMult - mult) < 0.05,
+          text: `${mult.toFixed(1)}x ATR Noise Buffer`,
+        })
+      )
+    );
+    grid.appendChild(
+      el(
+        "div",
+        { className: "wb-field" },
+        el("label", { className: "wb-label", htmlFor: "quick-sl-select", text: "3. Stop Loss Buffer" }),
+        slSelect,
+        el("div", { className: "wb-kpi-sub", text: "Multiplier above market noise" })
+      )
+    );
+
+    // 4. Session Cutoff
+    const cutoffInput = el("input", {
+      type: "text",
+      id: "quick-cutoff-input",
+      className: "wb-input wb-mono",
+      value: currentCutoff,
+      disabled: readOnly,
+      placeholder: "16:20",
+      onInput: (e) => {
+        stageParameterValue("SESSION_CLOSE_CUTOFF_UTC", e.target.value.trim());
+      },
+    });
+    grid.appendChild(
+      el(
+        "div",
+        { className: "wb-field" },
+        el("label", { className: "wb-label", htmlFor: "quick-cutoff-input", text: "4. LSE Gap Cutoff (UTC)" }),
+        cutoffInput,
+        el("div", { className: "wb-kpi-sub", text: "Session flatten time (e.g. 16:20)" })
+      )
+    );
+
+    card.appendChild(grid);
+
+    // If staged changes exist, show a prominent Save bar
+    const stagedCount = Object.keys(state.stagedChanges).length;
+    if (stagedCount > 0) {
+      const saveBar = el(
+        "div",
+        {
+          className: "wb-pill-row",
+          style: "margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border-subtle); justify-content: space-between;",
+        },
+        el("span", { className: "wb-badge wb-badge--amber", text: `${stagedCount} setting(s) staged for save` }),
+        el(
+          "div",
+          { className: "wb-pill-row" },
+          el(
+            "button",
+            {
+              type: "button",
+              className: "wb-btn wb-btn--sm wb-btn--ghost",
+              onClick: () => {
+                discardStagedDraft();
+                renderQuickControls(container, readOnly);
+              },
+            },
+            "Discard"
+          ),
+          el(
+            "button",
+            {
+              type: "button",
+              id: "quick-save-btn",
+              className: "wb-btn wb-btn--sm wb-btn--emerald",
+              disabled: readOnly || state.isCommitting,
+              onClick: async () => {
+                await submitConfigCommit();
+                renderQuickControls(container, readOnly);
+              },
+            },
+            state.isCommitting ? "Saving..." : "Apply & Save Settings"
+          )
+        )
+      );
+      card.appendChild(saveBar);
+    }
+  }
+
+  function applyConfigViewModeVisibility(controlsRoot, drawer, readOnly) {
+    const doc = getDoc();
+    if (!doc) return;
+    if (state.route.param) {
+      state.viewMode = "advanced";
+    }
+    const slot = doc.getElementById("config-param-groups-slot");
+    const tb = doc.getElementById("config-toolbar");
+    const qc = doc.getElementById("quick-controls-card");
+
+    if (state.viewMode === "simple") {
+      renderQuickControls(controlsRoot, readOnly);
+      if (drawer) drawer.hidden = true;
+      if (slot) slot.hidden = true;
+      if (tb) tb.hidden = true;
+      if (qc) qc.hidden = false;
+    } else {
+      if (qc) qc.hidden = true;
+      if (drawer) drawer.hidden = false;
+      if (slot) slot.hidden = false;
+      if (tb) tb.hidden = false;
+    }
+  }
+
   function computeConfigSignature(params, readOnly) {
     return (
       params.map((p) => p.key).join("|") +
@@ -3382,18 +3996,21 @@
     if (!forceRebuildControls && focusInsideGroups && state.lastSchemaSignature === schemaSig) {
       renderConfigDeepLinkSlot(controlsRoot, schemaByKey);
       patchConfigBadgesInPlace(params);
+      applyConfigViewModeVisibility(controlsRoot, drawer, readOnly);
       return;
     }
 
     if (!forceRebuildControls && state.lastSchemaSignature === schemaSig && groupsSlot) {
       renderConfigDeepLinkSlot(controlsRoot, schemaByKey);
       patchConfigBadgesInPlace(params);
+      applyConfigViewModeVisibility(controlsRoot, drawer, readOnly);
       return;
     }
 
     state.lastSchemaSignature = schemaSig;
     renderConfigDeepLinkSlot(controlsRoot, schemaByKey);
     renderConfigParamGroups(controlsRoot, params, readOnly);
+    applyConfigViewModeVisibility(controlsRoot, drawer, readOnly);
   }
 
   function formatStat(val) {
@@ -4124,8 +4741,11 @@
 
   function updateCountdown() {
     const doc = getDoc();
-    const countdownEl = doc && doc.getElementById("cutoff-countdown");
-    if (!countdownEl) return;
+    if (!doc) return;
+    const countdownEl = doc.getElementById("cutoff-countdown");
+    const mcCutoffEl = doc.getElementById("cutoff-countdown-mc");
+    const scanCountdownEl = doc.getElementById("next-scan-countdown");
+    const monCountdownEl = doc.getElementById("next-monitor-countdown");
 
     const cfg = getActiveConfigValues();
     const rawCutoff = String(cfg.SESSION_CLOSE_CUTOFF_UTC || "16:20").trim();
@@ -4137,19 +4757,44 @@
     const nowUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
     let targetUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), ch, cm, 0);
     let diff = targetUtc - nowUtc;
+    let cutoffStr = "--:--:--";
     if (diff < 0) {
       if (diff > -600000) {
-        countdownEl.textContent = "FLATTENING";
-        return;
+        cutoffStr = "FLATTENING";
+      } else {
+        targetUtc += 86400000;
+        diff = targetUtc - nowUtc;
+        const hours = Math.floor(diff / 3600000);
+        const mins = Math.floor((diff % 3600000) / 60000);
+        const secs = Math.floor((diff % 60000) / 1000);
+        const pad = (n) => String(n).padStart(2, "0");
+        cutoffStr = `${pad(hours)}:${pad(mins)}:${pad(secs)}`;
       }
-      targetUtc += 86400000;
-      diff = targetUtc - nowUtc;
+    } else {
+      const hours = Math.floor(diff / 3600000);
+      const mins = Math.floor((diff % 3600000) / 60000);
+      const secs = Math.floor((diff % 60000) / 1000);
+      const pad = (n) => String(n).padStart(2, "0");
+      cutoffStr = `${pad(hours)}:${pad(mins)}:${pad(secs)}`;
     }
-    const hours = Math.floor(diff / 3600000);
-    const mins = Math.floor((diff % 3600000) / 60000);
-    const secs = Math.floor((diff % 60000) / 1000);
+
+    if (countdownEl) countdownEl.textContent = cutoffStr;
+    if (mcCutoffEl) mcCutoffEl.textContent = cutoffStr;
+
+    // Next Scan (5m = 300s) and Next Monitor (30s) timers
+    const nowSec = Math.floor(Date.now() / 1000);
+    const remScan = 300 - (nowSec % 300);
+    const remMon = 30 - (nowSec % 30);
     const pad = (n) => String(n).padStart(2, "0");
-    countdownEl.textContent = `${pad(hours)}:${pad(mins)}:${pad(secs)}`;
+
+    if (scanCountdownEl) {
+      const sm = Math.floor(remScan / 60);
+      const ss = remScan % 60;
+      scanCountdownEl.textContent = `${pad(sm)}:${pad(ss)}`;
+    }
+    if (monCountdownEl) {
+      monCountdownEl.textContent = `${remMon}s`;
+    }
   }
 
   async function fetchCatchUpData(isManual) {
@@ -4216,6 +4861,18 @@
 
       es.addEventListener("snapshot", handlePayloadEvent);
       es.addEventListener("dashboard_update", handlePayloadEvent);
+      es.addEventListener("pipeline_progress", (ev) => {
+        state.sse.lastHeartbeatAt = Date.now();
+        try {
+          const parsed = JSON.parse(ev.data);
+          state.pipelineProgress = parsed;
+          const doc = getDoc();
+          const mc = doc && (doc.getElementById("mission-control-panel") || doc.getElementById("funnel-panel"));
+          if (mc) renderMissionControlCard(mc);
+        } catch (_) {
+          // ignore malformed frames
+        }
+      });
       es.addEventListener("config_epoch_changed", (ev) => {
         state.sse.lastHeartbeatAt = Date.now();
         try {

@@ -256,6 +256,18 @@ class Orchestrator:
             else {"status": "pre_scan", "reason": "No completed universe scan cycle recorded yet."}
         )
         self._last_funnel_inputs: Optional[Dict[str, Any]] = None
+        self._current_cycle_id: str = ""
+        self._current_pipeline_progress: Dict[str, Any] = {
+            "step": 7,
+            "total_steps": 7,
+            "name": "Standby",
+            "detail": "Engine standing by. Next scan countdown active.",
+            "status": "standby",
+            "active_assets": [],
+            "timestamp": time.time(),
+            "iso_time": datetime.now(timezone.utc).isoformat(),
+            "cycle_id": "",
+        }
 
         # ── 1. Trading 212 API Client ─────────────────────────────
         self.t212 = t212_client or Trading212Client(
@@ -556,6 +568,34 @@ class Orchestrator:
             SSEBroadcaster.get_instance().broadcast(event_type, data)
         except Exception as exc:
             logger.debug("SSE broadcast (%s) skipped: %s", event_type, exc)
+
+    def _broadcast_pipeline_progress(
+        self,
+        step: int,
+        name: str,
+        detail: str,
+        *,
+        total_steps: int = 7,
+        active_assets: Optional[Sequence[str]] = None,
+        cycle_id: Optional[str] = None,
+        status: str = "active",
+    ) -> Dict[str, Any]:
+        """Broadcast real-time scan pipeline stage progression over SSE with zero broker quota."""
+        c_id = str(cycle_id or getattr(self, "_current_cycle_id", "") or "")
+        payload = {
+            "step": int(step),
+            "total_steps": int(total_steps),
+            "name": str(name),
+            "detail": str(detail),
+            "status": str(status),
+            "active_assets": list(active_assets or ()),
+            "timestamp": time.time(),
+            "iso_time": datetime.now(timezone.utc).isoformat(),
+            "cycle_id": c_id,
+        }
+        self._current_pipeline_progress = payload
+        self._broadcast_sse("pipeline_progress", copy.deepcopy(payload))
+        return payload
 
     def _get_cached_broker_view(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Read cached Trading 212 snapshot and rate telemetry with ZERO HTTP calls."""
@@ -992,6 +1032,7 @@ class Orchestrator:
             "config_quarantine_warnings": list(cfg_snap.config_quarantine_warnings),
             "epoch_history": self.config_bus.epoch_history(limit=25),
             "funnel": funnel_dict,
+            "pipeline_progress": copy.deepcopy(getattr(self, "_current_pipeline_progress", None)),
             "audit": last_audit.to_dict() if last_audit is not None else None,
             "audit_history": [a.to_dict() for a in audit_hist],
             "rate_limit_telemetry": rate_telemetry,
@@ -2310,6 +2351,11 @@ class Orchestrator:
                 return []
 
             actionable.sort(key=lambda item: item[1].conviction_score, reverse=True)
+            self._broadcast_pipeline_progress(
+                5, "Risk Sizing", f"Computing position sizing, ATR stop buffers, and portfolio heat for {len(actionable)} approved assets.",
+                active_assets=[card.ticker for _, card in actionable],
+                cycle_id=self._current_cycle_id,
+            )
 
             active_snap = self.config_bus.active_snapshot()
             default_eq = float(getattr(active_snap, "DEFAULT_ACCOUNT_EQUITY", getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)))
@@ -2349,6 +2395,12 @@ class Orchestrator:
 
             is_test_mode = getattr(self.t212, "rate_limit_delay", 1.25) < 0.5
             pacing_delay = self.t212.rate_limit_delay if is_test_mode else 1.5
+
+            self._broadcast_pipeline_progress(
+                6, "Order Route", f"Routing {len(actionable)} candidate orders to broker client with capital pacing.",
+                active_assets=[card.ticker for _, card in actionable],
+                cycle_id=self._current_cycle_id,
+            )
 
             for i, (cand, card) in enumerate(actionable):
                 latest_snap = self.config_bus.active_snapshot()
@@ -2521,6 +2573,12 @@ class Orchestrator:
         else:
             self._refresh_read_model_snapshot(persist_funnel=True, broadcast=True)
 
+        self._broadcast_pipeline_progress(
+            7, "Standby", f"Cycle complete. {len(executed_cards)} orders routed. Position monitor active.",
+            cycle_id=self._current_cycle_id,
+            status="standby",
+        )
+
     # ─────────────────────────────────────────────────────────────
     # Complete Single Cycle & Deliberation Pipeline
     # ─────────────────────────────────────────────────────────────
@@ -2534,9 +2592,15 @@ class Orchestrator:
         from types import SimpleNamespace
 
         cycle_snapshot = self.config_bus.active_snapshot()
+        if not getattr(self, "_current_cycle_id", None):
+            self._current_cycle_id = f"cycle-{int(time.time())}"
 
         if self._is_pm_halted():
             logger.warning("Scan aborted: System is currently HALTED following emergency panic flatten.")
+            self._broadcast_pipeline_progress(
+                7, "Standby", "System is halted following emergency panic flatten.",
+                cycle_id=self._current_cycle_id, status="halted"
+            )
             halted_report = build_cycle_funnel_report(
                 universe_metrics={},
                 screener_results=[],
@@ -2557,7 +2621,11 @@ class Orchestrator:
             )
             return []
 
-        # Step 1: Ingestion under cycle_snapshot
+        # Step 2: Fetch Data (Ingestion under cycle_snapshot)
+        self._broadcast_pipeline_progress(
+            2, "Fetch Data", f"Ingesting 15m candle bars & metrics for {len(self.universe)} universe assets.",
+            cycle_id=self._current_cycle_id
+        )
         ingest_fn = self.ingest_universe_data
         metrics_dict = (
             ingest_fn(config_snapshot=cycle_snapshot)
@@ -2566,6 +2634,10 @@ class Orchestrator:
         )
         if not metrics_dict:
             logger.warning("No market data ingested — scan aborted")
+            self._broadcast_pipeline_progress(
+                7, "Standby", "No market data ingested during universe scan. Standing by.",
+                cycle_id=self._current_cycle_id, status="standby"
+            )
             empty_report = build_cycle_funnel_report(
                 universe_metrics={},
                 screener_results=[],
@@ -2586,7 +2658,12 @@ class Orchestrator:
             )
             return []
 
-        # Step 2: Screening under cycle_snapshot (with per-ticker gate attribution)
+        # Step 3: Trend Filter (Screening under cycle_snapshot)
+        active_strat = getattr(cycle_snapshot, "ACTIVE_STRATEGY", "directional_trend")
+        self._broadcast_pipeline_progress(
+            3, "Trend Filter", f"Screening universe indicators against {active_strat} momentum rules.",
+            cycle_id=self._current_cycle_id
+        )
         candidates, all_screener_results = self.screen_candidates_with_funnel(
             metrics_dict,
             config_snapshot=cycle_snapshot,
@@ -2599,6 +2676,10 @@ class Orchestrator:
 
         if not candidates:
             logger.info("No candidates passed 3x momentum filter this cycle.")
+            self._broadcast_pipeline_progress(
+                7, "Standby", "No candidates passed screener filter this cycle. Standing by.",
+                cycle_id=self._current_cycle_id, status="standby"
+            )
             zero_inputs = {
                 "universe_metrics": metrics_dict,
                 "screener_results": all_screener_results,
@@ -2663,11 +2744,20 @@ class Orchestrator:
                     broadcast=True,
                     inputs=stale_inputs,
                 )
+                self._broadcast_pipeline_progress(
+                    7, "Standby", "Scan aborted due to mid-scan config change. Standing by.",
+                    cycle_id=self._current_cycle_id, status="standby"
+                )
                 return []
 
-        # Step 3: Parallel Deliberation across Candidates
+        # Step 4: Parallel Deliberation across Candidates
         top_n = max(1, int(getattr(cycle_snapshot, "SCREENER_TOP_N", settings.SCREENER_TOP_N)))
         candidates_to_process = candidates[:top_n]
+        self._broadcast_pipeline_progress(
+            4, "Debate", f"Running multi-agent consensus deliberation on {len(candidates_to_process)} candidate assets.",
+            active_assets=[c.ticker for c in candidates_to_process],
+            cycle_id=self._current_cycle_id,
+        )
         candidate_cards: List[tuple[ScreenerResult, DecisionCard]] = []
         delib_cap = int(getattr(cycle_snapshot, "PARALLEL_DELIBERATION_WORKERS", self.parallel_deliberation_workers))
         n_delib_workers = max(1, min(len(candidates_to_process), delib_cap))
@@ -2814,6 +2904,12 @@ class Orchestrator:
 
     def run_cycle(self) -> List[DecisionCard]:
         """Execute one complete Scan → Filter → Debate → Execute cycle."""
+        cycle_id = f"cycle-{int(time.time())}"
+        self._current_cycle_id = cycle_id
+        self._broadcast_pipeline_progress(
+            1, "Market Check", "Checking exchange market hours, circuit breakers, and halt state.",
+            cycle_id=cycle_id,
+        )
         logger.info("━━━ Starting 3x Quantitative Cycle at %s ━━━",
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
 

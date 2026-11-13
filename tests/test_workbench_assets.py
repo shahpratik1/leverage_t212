@@ -141,6 +141,34 @@ class TestWorkbenchAssetsStatic(unittest.TestCase):
         self.assertIn(".wb-diff-drawer", self.styles_text)
         self.assertIn(".wb-modal", self.styles_text)
 
+    def test_mission_control_and_simple_mode_markers(self) -> None:
+        markers = [
+            "renderMissionControlCard",
+            "workflow-stepper",
+            "PLAIN_ENGLISH_GATE_TRANSLATIONS",
+            "translateGateRejection",
+            "renderQuickControls",
+            "quick-controls-card",
+            "header-view-mode-btn",
+            "next-scan-countdown",
+            "next-monitor-countdown",
+        ]
+        for m in markers:
+            self.assertIn(m, self.js_text, f"Missing Mission Control marker {m!r} in workbench.js")
+
+        css_markers = [
+            ".wb-mc-card",
+            ".wb-stepper",
+            ".wb-step--active",
+            ".wb-step--completed",
+            ".wb-mc-now-box",
+            ".wb-quick-controls",
+            ".wb-segmented-control",
+            ".wb-tracker-tray",
+        ]
+        for c in css_markers:
+            self.assertIn(c, self.styles_text, f"Missing CSS class {c!r} in styles.css")
+
 
 _NODE_HARNESS_SCRIPT = r"""
 const fs = require("fs");
@@ -1158,6 +1186,88 @@ async function runAll() {
     assert.strictEqual(env.doc.getElementById("config-search-input"), searchBefore);
     assert.ok(env.doc.getElementById("cfg-input-RISK_PER_TRADE_PCT"));
     assert.strictEqual(env.doc.getElementById("cfg-input-MIN_ADX_TREND"), null);
+
+    env.api.destroyWorkbench();
+  }
+
+  // 11. Mission Control: Live 7-step stepper and SSE progress updates
+  {
+    const env = createMockEnv({ hash: "#monitor" });
+    const stepper = env.doc.getElementById("workflow-stepper");
+    assert.ok(stepper, "Workflow stepper must be rendered on #monitor");
+    assert.ok(env.doc.getElementById("step-1"), "Step 1 Market Check rendered");
+    assert.ok(env.doc.getElementById("step-7"), "Step 7 Standby rendered");
+
+    // Emit intermediate pipeline_progress SSE event (Step 3: Trend Filter)
+    env.sseInstances[0].emit("pipeline_progress", {
+      step: 3,
+      name: "Trend Filter",
+      detail: "Screening universe indicators against directional_trend rules.",
+      status: "active",
+      cycle_id: "cycle-test-1",
+      active_assets: ["QQQ3l_EQ"],
+    });
+
+    const step3 = env.doc.getElementById("step-3");
+    assert.ok(step3.classList.contains("wb-step--active"), "Step 3 must have active state");
+    const step1 = env.doc.getElementById("step-1");
+    assert.ok(step1.classList.contains("wb-step--completed"), "Step 1 must have completed state");
+
+    const nowVal = env.doc.getElementById("workflow-now-val");
+    assert.ok(nowVal.textContent.includes("Screening universe indicators"), "Now box updates from SSE");
+
+    env.api.destroyWorkbench();
+  }
+
+  // 12. Plain-English Rejection Translation and Expandable Stock Tracker
+  {
+    const env = createMockEnv({ hash: "#monitor" });
+    const trackerToggle = env.doc.getElementById("tracker-toggle-btn");
+    assert.ok(trackerToggle, "Tracker toggle button must be rendered");
+
+    // Expand stock tracker
+    trackerToggle.click();
+    assert.ok(env.doc.querySelector(".wb-tracker-grid"), "Tracker grid rendered upon expansion");
+    const expandedToggle = env.doc.getElementById("tracker-toggle-btn");
+    assert.ok(expandedToggle.textContent.includes("Hide Universe Stock Tracker"), "Button text toggles to Hide");
+
+    // Collapse stock tracker
+    expandedToggle.click();
+    assert.strictEqual(env.doc.querySelector(".wb-tracker-grid"), null, "Tracker grid unmounted on collapse");
+
+    env.api.destroyWorkbench();
+  }
+
+  // 13. Default Simple Mode vs Advanced Mode in #config
+  {
+    const env = createMockEnv({ hash: "#config" });
+    const quickCard = env.doc.getElementById("quick-controls-card");
+    assert.ok(quickCard, "Quick controls card rendered by default in Simple Mode");
+    assert.strictEqual(quickCard.hidden, false);
+
+    const slot = env.doc.getElementById("config-param-groups-slot");
+    assert.strictEqual(slot.hidden, true, "Full 50-param groups slot hidden in Simple Mode");
+
+    const drawer = env.doc.getElementById("diff-drawer");
+    assert.strictEqual(drawer.hidden, true, "Diff drawer hidden in Simple Mode");
+
+    // Click Conservative in Quick Controls
+    const conBtn = env.doc.getElementById("quick-risk-conservative");
+    assert.ok(conBtn, "Conservative risk button exists");
+    conBtn.click();
+
+    const state = env.api.getState();
+    assert.strictEqual(state.stagedChanges["MAX_RISK_PER_TRADE"], 0.0075);
+    assert.strictEqual(state.stagedChanges["ATR_SL_MULTIPLIER"], 2.5);
+
+    // Switch to Advanced Mode via toggle button
+    const toggleAdvBtn = env.doc.getElementById("toggle-advanced-from-quick-btn");
+    assert.ok(toggleAdvBtn);
+    toggleAdvBtn.click();
+
+    assert.strictEqual(state.viewMode, "advanced");
+    assert.strictEqual(slot.hidden, false, "Full groups slot revealed in Advanced Mode");
+    assert.strictEqual(drawer.hidden, false, "Diff drawer revealed in Advanced Mode");
 
     env.api.destroyWorkbench();
   }
