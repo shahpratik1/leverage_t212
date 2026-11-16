@@ -67,7 +67,6 @@ from trading_system.screener.laya_screener import (
     simulate_screener_gate_impact,
 )
 from trading_system.agents.risk_manager import DecisionCard, RiskManager
-from trading_system.agents.strategy_improvement_agent import StrategyImprovementAgent
 
 logger = logging.getLogger(__name__)
 
@@ -334,12 +333,7 @@ class Orchestrator:
             max_catalyst_risk=float(snap.SCREENER_MAX_CATALYST_RISK),
             top_n=int(snap.SCREENER_TOP_N),
         )
-        audit_history_path = (
-            self.data_dir / "audit_history.jsonl"
-            if (explicit_isolation or is_testing)
-            else Path("data") / "audit_history.jsonl"
-        )
-        self.improvement_agent = StrategyImprovementAgent(audit_history_path=audit_history_path)
+        self.improvement_agent = None
 
         # ── 5. System 2: Pure Quantitative Risk & Sizing Stack ───
         self.technical_analyst = DummyAnalyst()
@@ -989,8 +983,8 @@ class Orchestrator:
                 "executed_tickers": [],
             }
 
-        last_audit = getattr(self.improvement_agent, "last_audit", None)
-        audit_hist = list(getattr(self.improvement_agent, "audit_history", ()) or ())
+        last_audit = None
+        audit_hist = []
 
         scrubbed_cfg = _scrub_mapping(cfg_snap.to_dict())
         schema_dict = export_config_schema(cfg_snap.dynamic_parameter_specs)
@@ -1043,8 +1037,8 @@ class Orchestrator:
             "epoch_history": self.config_bus.epoch_history(limit=25),
             "funnel": funnel_dict,
             "pipeline_progress": copy.deepcopy(getattr(self, "_current_pipeline_progress", None)),
-            "audit": last_audit.to_dict() if last_audit is not None else None,
-            "audit_history": [a.to_dict() for a in audit_hist],
+            "audit": None,
+            "audit_history": [],
             "rate_limit_telemetry": rate_telemetry,
             "positions_behind_epoch": positions_behind_epoch,
             "unprotected_positions": unprotected_positions,
@@ -1684,22 +1678,6 @@ class Orchestrator:
             config_snapshot=snap,
             config_epoch_id=snap.config_epoch_id,
         )
-
-        # Record cycle yield with StrategyImprovementAgent
-        if getattr(self, "improvement_agent", None):
-            try:
-                rec_fn = self.improvement_agent.record_cycle_yield
-                rec_kwargs: Dict[str, Any] = {
-                    "candidate_count": len(candidates),
-                    "universe_metrics": universe_metrics,
-                }
-                if self._supports_kwarg(rec_fn, "config_snapshot"):
-                    rec_kwargs["config_snapshot"] = snap
-                if self._supports_kwarg(rec_fn, "gate_breakdown"):
-                    rec_kwargs["gate_breakdown"] = prelim_report.gate_breakdown
-                rec_fn(**rec_kwargs)
-            except Exception as audit_exc:
-                logger.debug("StrategyImprovementAgent record notice: %s", audit_exc)
 
         logger.info(
             "Candidate pre-filter passed %d assets for System 2 deliberation: %s",

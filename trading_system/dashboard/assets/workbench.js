@@ -1006,7 +1006,7 @@
     const tabPart = (qIdx >= 0 ? stripped.slice(0, qIdx) : stripped).replace(/^\/+/, "").toLowerCase();
     const queryPart = qIdx >= 0 ? stripped.slice(qIdx + 1) : "";
 
-    const validTabs = ["monitor", "config", "audit"];
+    const validTabs = ["monitor", "config"];
     const tab = validTabs.includes(tabPart) ? tabPart : "monitor";
     let param = null;
     let gate = null;
@@ -1046,7 +1046,7 @@
     const doc = getDoc();
     if (!doc) return;
     const activeTab = state.route.tab || "monitor";
-    ["monitor", "config", "audit"].forEach((tabId) => {
+    ["monitor", "config"].forEach((tabId) => {
       const tabBtn = doc.getElementById(`tab-${tabId}`);
       const panel = doc.getElementById(`workspace-${tabId}`);
       const isSelected = tabId === activeTab;
@@ -1063,8 +1063,6 @@
       renderConfigWorkspace();
       renderDiffDrawer();
       focusDeepLinkedParam();
-    } else if (activeTab === "audit") {
-      renderAuditWorkspace();
     } else {
       renderMonitorWorkspace();
     }
@@ -2414,8 +2412,6 @@
       } else if (nextEpoch !== prevEpoch) {
         renderDiffDrawer();
       }
-    } else if (state.route.tab === "audit") {
-      renderAuditWorkspace();
     }
   }
 
@@ -4731,220 +4727,12 @@
     }
   }
 
-  /* ── Render: #audit Workspace ──────────────────────────────────────────── */
-
-  function extractParamLinksFromAudit(auditObj) {
-    const links = [];
-    const schemaKeys = new Set(getSchemaParameters().map((p) => p.key));
-    const explicit = auditObj.param_links || auditObj.deep_links || auditObj.recommended_params || auditObj.parameter_recommendations || [];
-    if (Array.isArray(explicit)) {
-      explicit.forEach((item) => {
-        if (typeof item === "string" && schemaKeys.has(item)) {
-          links.push({ param: item, label: item });
-        } else if (item && typeof item === "object" && (item.param_key || item.param || item.key)) {
-          const k = item.param_key || item.param || item.key;
-          links.push({ param: k, gate: item.gate_id || null, label: item.label || k });
-        }
-      });
-    }
-    const recs = Array.isArray(auditObj.recommendations) ? auditObj.recommendations : [];
-    recs.forEach((rec) => {
-      if (rec && typeof rec === "object") {
-        const pk = rec.param_key || (Array.isArray(rec.param_keys) && rec.param_keys[0]);
-        if (pk) links.push({ param: pk, gate: rec.gate_id || null, label: pk });
-      } else if (typeof rec === "string") {
-        schemaKeys.forEach((sk) => {
-          if (rec.includes(sk)) links.push({ param: sk, label: sk });
-        });
-      }
-    });
-    const dedup = [];
-    const seen = new Set();
-    links.forEach((l) => {
-      if (!seen.has(l.param)) {
-        seen.add(l.param);
-        dedup.push(l);
-      }
-    });
-    return dedup;
-  }
+  /* ── Audit & Regime (Disabled & Deprecated) ───────────────────────────── */
 
   function renderAuditWorkspace() {
     const doc = getDoc();
     const root = doc && doc.getElementById("workspace-audit");
-    if (!root) return;
-    clearNode(root);
-
-    const d = state.data || {};
-    const auditPayload = d.audit || d.improvement_audit || {};
-    const latestAudit = auditPayload.latest || (auditPayload.health_status ? auditPayload : null);
-    const auditHistory = Array.isArray(d.audit_history)
-      ? d.audit_history
-      : (Array.isArray(auditPayload.history) ? auditPayload.history : []);
-    const epochHistory = Array.isArray(d.epoch_history)
-      ? d.epoch_history
-      : (Array.isArray(d.config_epochs) ? d.config_epochs : []);
-    const crossMetrics = getCrossSectionalMetricsMap();
-
-    // 1. ImprovementAudit Status & Anomaly Card
-    const statusCard = el("section", { id: "audit-status-card", className: "wb-card" });
-    statusCard.appendChild(
-      el(
-        "div",
-        { className: "wb-card-header" },
-        el("h2", { className: "wb-card-title", text: "Strategy Improvement Audit" }),
-        latestAudit
-          ? el("span", {
-              className: latestAudit.health_status === "HEALTHY"
-                ? "wb-badge wb-badge--emerald"
-                : (latestAudit.health_status === "DEGRADED" ? "wb-badge wb-badge--amber" : "wb-badge wb-badge--rose"),
-              text: latestAudit.health_status || "UNKNOWN",
-            })
-          : null
-      )
-    );
-
-    if (!latestAudit) {
-      statusCard.appendChild(
-        el("div", {
-          id: "audit-empty-placeholder",
-          className: "wb-empty",
-          text: "No StrategyImprovementAgent audits recorded yet. Audits emit after universe scan cycles complete.",
-        })
-      );
-    } else {
-      const isAnomaly = latestAudit.health_status && latestAudit.health_status !== "HEALTHY";
-      if (isAnomaly) {
-        statusCard.appendChild(
-          el("div", {
-            className: latestAudit.health_status === "DEGRADED" ? "wb-banner wb-banner--warn" : "wb-banner wb-banner--danger",
-            text: `Pipeline Health Anomaly (${latestAudit.health_status}): ${latestAudit.consecutive_zero_cycles ?? 0} consecutive zero-yield cycle(s) in ${latestAudit.regime || "NORMAL"} regime.`,
-          })
-        );
-      }
-
-      statusCard.appendChild(
-        el(
-          "div",
-          { className: "wb-kpi-grid", style: "margin-bottom:0.85rem" },
-          el("div", { className: "wb-kpi-card" }, el("div", { className: "wb-kpi-label", text: "Regime" }), el("div", { className: "wb-kpi-value", style: "font-size:1.05rem", text: latestAudit.regime || "NORMAL" })),
-          el("div", { className: "wb-kpi-card" }, el("div", { className: "wb-kpi-label", text: "Mean ADX(14)" }), el("div", { className: "wb-kpi-value wb-mono", style: "font-size:1.05rem", text: formatStat(latestAudit.mean_adx) })),
-          el("div", { className: "wb-kpi-card" }, el("div", { className: "wb-kpi-label", text: "Mean Realized Vol" }), el("div", { className: "wb-kpi-value wb-mono", style: "font-size:1.05rem", text: `${(Number(latestAudit.mean_realized_vol || 0) * 100).toFixed(1)}%` })),
-          el("div", { className: "wb-kpi-card" }, el("div", { className: "wb-kpi-label", text: "Audited / Null Metrics" }), el("div", { className: "wb-kpi-value wb-mono", style: "font-size:1.05rem", text: `${latestAudit.total_assets_audited ?? 0} / ${latestAudit.null_metrics_count ?? 0}` }))
-        )
-      );
-
-      const recs = Array.isArray(latestAudit.recommendations) ? latestAudit.recommendations : [];
-      if (recs.length > 0) {
-        const recList = el("ul", { className: "wb-banner-list", style: "margin-bottom:0.75rem" });
-        recs.forEach((r) => {
-          recList.appendChild(el("li", { text: typeof r === "string" ? r : (r.message || r.text || JSON.stringify(r)) }));
-        });
-        statusCard.appendChild(recList);
-      }
-
-      const links = extractParamLinksFromAudit(latestAudit);
-      if (links.length > 0) {
-        statusCard.appendChild(
-          el(
-            "div",
-            { className: "wb-gate-list" },
-            links.map((lk) =>
-              el("button", {
-                type: "button",
-                className: "wb-gate-chip wb-gate-chip--link",
-                dataset: { deepLink: "config", param: lk.param },
-                text: `Tune ${lk.label}`,
-                onClick: () => navigateTo("config", { param: lk.param, gate: lk.gate }),
-              })
-            )
-          )
-        );
-      }
-    }
-    root.appendChild(statusCard);
-
-    // 2. Cross-Sectional Regime Metrics Card
-    const metricsCard = el("section", { id: "audit-regime-metrics-card", className: "wb-card" });
-    metricsCard.appendChild(el("h3", { className: "wb-card-title", style: "margin-bottom:0.75rem", text: "Cross-Sectional Regime Indicator Distributions" }));
-    const metricKeys = Object.keys(crossMetrics);
-    if (metricKeys.length === 0) {
-      metricsCard.appendChild(el("div", { className: "wb-empty", text: "No cross-sectional metric distribution captured yet." }));
-    } else {
-      const tbody = el("tbody");
-      metricKeys.sort().forEach((mk) => {
-        const st = crossMetrics[mk] || {};
-        tbody.appendChild(
-          el(
-            "tr",
-            null,
-            el("td", { className: "wb-mono", text: mk }),
-            el("td", { className: "wb-mono", text: formatStat(st.min) }),
-            el("td", { className: "wb-mono", text: formatStat(st.p25) }),
-            el("td", { className: "wb-mono", style: "font-weight:700", text: formatStat(st.median) }),
-            el("td", { className: "wb-mono", text: formatStat(st.p75) }),
-            el("td", { className: "wb-mono", text: formatStat(st.max) })
-          )
-        );
-      });
-      metricsCard.appendChild(
-        el(
-          "div",
-          { className: "wb-table-scroll" },
-          el(
-            "table",
-            { className: "wb-table" },
-            el("thead", null, el("tr", null, el("th", { text: "Indicator" }), el("th", { text: "Min" }), el("th", { text: "P25" }), el("th", { text: "Median" }), el("th", { text: "P75" }), el("th", { text: "Max" }))),
-            tbody
-          )
-        )
-      );
-    }
-    root.appendChild(metricsCard);
-
-    // 3. Epoch & Audit History Timeline
-    const timelineCard = el("section", { id: "audit-history-timeline", className: "wb-card" });
-    timelineCard.appendChild(el("h3", { className: "wb-card-title", style: "margin-bottom:0.75rem", text: "Epoch & Audit History Timeline" }));
-    if (auditHistory.length === 0 && epochHistory.length === 0) {
-      timelineCard.appendChild(el("div", { className: "wb-empty", text: "No historical audits or config epochs recorded yet." }));
-    } else {
-      const list = el("div", { className: "wb-audit-list" });
-      epochHistory.forEach((ep) => {
-        const diffSummary = Array.isArray(ep.diff) && ep.diff.length > 0
-          ? ep.diff.map((df) => `${df.key}: ${formatShortValue(df.old_value)} -> ${formatShortValue(df.new_value)}`).join(", ")
-          : (ep.commit_reason || "Snapshot recorded");
-        list.appendChild(
-          el(
-            "div",
-            { className: "wb-audit-item" },
-            el(
-              "div",
-              { style: "display:flex;justify-content:space-between;gap:0.5rem;flex-wrap:wrap" },
-              el("span", { className: "wb-badge wb-badge--sky wb-mono", text: ep.config_epoch_id || "epoch" }),
-              el("span", { className: "wb-mono wb-muted", style: "font-size:0.72rem", text: `${ep.committed_at || ""} (${ep.committed_by || "operator"})` })
-            ),
-            el("div", { className: "wb-mono", style: "font-size:0.78rem;margin-top:0.35rem", text: diffSummary })
-          )
-        );
-      });
-      auditHistory.forEach((ah) => {
-        list.appendChild(
-          el(
-            "div",
-            { className: "wb-audit-item" },
-            el(
-              "div",
-              { style: "display:flex;justify-content:space-between;gap:0.5rem;flex-wrap:wrap" },
-              el("span", { className: "wb-badge wb-mono", text: `${ah.health_status || "AUDIT"} • ${ah.regime || "NORMAL"}` }),
-              el("span", { className: "wb-mono wb-muted", style: "font-size:0.72rem", text: ah.timestamp || "" })
-            ),
-            el("div", { className: "wb-muted", style: "font-size:0.78rem;margin-top:0.3rem", text: `Zero cycles: ${ah.consecutive_zero_cycles ?? 0} | Mean ADX: ${formatStat(ah.mean_adx)}` })
-          )
-        );
-      });
-      timelineCard.appendChild(list);
-    }
-    root.appendChild(timelineCard);
+    if (root) clearNode(root);
   }
 
   /* ── Timers, Countdown & SSE Engine ────────────────────────────────────── */
@@ -5166,8 +4954,7 @@
     if (tabsEl.children.length === 0) {
       const tabDefs = [
         ["monitor", "Live Monitor"],
-        ["config", "Config & Diff"],
-        ["audit", "Audit & Regime"],
+        ["config", "Configuration"],
       ];
       tabDefs.forEach(([id, label], idx) => {
         const btn = el("button", {
@@ -5183,7 +4970,7 @@
           onKeyDown: (ev) => {
             if (ev.key === "ArrowRight" || ev.key === "ArrowLeft") {
               ev.preventDefault();
-              const order = ["monitor", "config", "audit"];
+              const order = ["monitor", "config"];
               const curIdx = order.indexOf(id);
               const nextIdx = ev.key === "ArrowRight" ? (curIdx + 1) % order.length : (curIdx - 1 + order.length) % order.length;
               const nextId = order[nextIdx];

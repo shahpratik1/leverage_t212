@@ -109,7 +109,7 @@ class TestWorkbenchAssetsStatic(unittest.TestCase):
         ]:
             self.assertIn(marker, self.js_text, f"Missing compatibility marker {marker!r}")
 
-        for route in ["monitor", "config", "audit"]:
+        for route in ["monitor", "config"]:
             self.assertIn(f"#{route}", self.js_text)
             self.assertIn(f"workspace-{route}", self.js_text)
 
@@ -804,8 +804,7 @@ async function runAll() {
     assert.ok(fallback && fallback.textContent.includes("structural"));
 
     env.win.setHash("#audit");
-    assert.strictEqual(env.doc.getElementById("tab-audit").getAttribute("aria-selected"), "true");
-    assert.ok(env.doc.getElementById("audit-status-card").textContent.includes("TREND"));
+    assert.strictEqual(env.doc.getElementById("tab-monitor").getAttribute("aria-selected"), "true");
     env.api.destroyWorkbench();
   }
 
