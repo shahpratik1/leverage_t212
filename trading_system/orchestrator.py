@@ -240,9 +240,12 @@ class Orchestrator:
         config_bus: Optional[ConfigBus] = None,
         data_dir: Optional[Path | str] = None,
     ) -> None:
-        settings.validate()
         self.dry_run = dry_run
         is_testing = _is_unittest_process()
+        if dry_run or is_testing:
+            settings.validate(required_keys=[])
+        else:
+            settings.validate()
 
         # ── 0. Data Directory & Control-Plane ConfigBus ──────────
         self._owns_temp_data_dir = False
@@ -258,6 +261,7 @@ class Orchestrator:
             self.data_dir = Path("data")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._funnel_state_path = self.data_dir / "funnel_state.json"
+        self._cash_cache_path = self.data_dir / "cached_cash.json"
 
         self.config_bus = config_bus if config_bus is not None else ConfigBus(data_dir=self.data_dir)
         snap = self.config_bus.active_snapshot()
@@ -294,8 +298,9 @@ class Orchestrator:
         }
 
         # ── 1. Trading 212 API Client ─────────────────────────────
+        effective_api_key = settings.TRADING212_API_KEY or "DRY_RUN_MOCK_KEY"
         self.t212 = t212_client or Trading212Client(
-            api_key=settings.TRADING212_API_KEY,
+            api_key=effective_api_key,
             api_secret=settings.TRADING212_API_SECRET,
             base_url=settings.api_base_url,
             rate_limit_delay=float(getattr(snap, "RATE_LIMIT_INTER_CALL_DELAY", settings.RATE_LIMIT_INTER_CALL_DELAY)),
@@ -411,10 +416,12 @@ class Orchestrator:
         # Non-unit-test warm-up using non-forced broker getters before initial snapshot publish
         if not is_testing and not self.dry_run and settings.TRADING212_API_KEY:
             try:
-                self.t212.get_account_cash(
+                boot_cash = self.t212.get_account_cash(
                     fallback_equity=float(snap.DEFAULT_ACCOUNT_EQUITY),
                     force_refresh=False,
                 )
+                if boot_cash and getattr(boot_cash, "total", 0.0) > 0:
+                    self._persist_cached_cash(boot_cash)
             except Exception as warm_exc:
                 logger.debug("Boot cash cache warm-up deferred: %s", warm_exc)
             if hasattr(self.t212, "get_historical_orders"):
@@ -610,6 +617,28 @@ class Orchestrator:
         self._broadcast_sse("pipeline_progress", copy.deepcopy(payload))
         return payload
 
+    def _persist_cached_cash(self, cash: Any) -> None:
+        """Persist live broker cash snapshot atomically to data/cached_cash.json."""
+        if cash is None:
+            return
+        total = getattr(cash, "total", None) if not isinstance(cash, dict) else cash.get("total")
+        if not isinstance(total, (int, float)) or total <= 0:
+            return
+        try:
+            payload = {
+                "free": float(getattr(cash, "free", 0.0) if not isinstance(cash, dict) else cash.get("free", 0.0)),
+                "invested": float(getattr(cash, "invested", 0.0) if not isinstance(cash, dict) else cash.get("invested", 0.0)),
+                "total": float(total),
+                "blocked": float(getattr(cash, "blocked", 0.0) if not isinstance(cash, dict) else cash.get("blocked", 0.0)),
+                "result": float(getattr(cash, "result", 0.0) if not isinstance(cash, dict) else cash.get("result", 0.0)),
+                "ppl_result": float(getattr(cash, "ppl_result", 0.0) if not isinstance(cash, dict) else cash.get("ppl_result", 0.0)),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if hasattr(self, "_cash_cache_path"):
+                _atomic_write_json(self._cash_cache_path, payload)
+        except Exception as exc:
+            logger.debug("Failed persisting cached cash: %s", exc)
+
     def _get_cached_broker_view(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Read cached Trading 212 snapshot and rate telemetry with ZERO HTTP calls."""
         cached: Dict[str, Any] = {}
@@ -641,6 +670,17 @@ class Orchestrator:
             except Exception:
                 pass
             cached = {"cash": cash_dict, "portfolio": None, "orders": None, "historical_orders": None}
+
+        # Check persisted cash cache if cash is missing or total is non-positive
+        cur_cash = cached.get("cash")
+        if not cur_cash or float(cur_cash.get("total") or 0.0) <= 0.0:
+            if hasattr(self, "_cash_cache_path") and self._cash_cache_path.is_file():
+                try:
+                    persisted = json.loads(self._cash_cache_path.read_text(encoding="utf-8"))
+                    if isinstance(persisted, dict) and float(persisted.get("total") or 0.0) > 0.0:
+                        cached["cash"] = persisted
+                except Exception:
+                    pass
 
         telemetry: Dict[str, Any] = {}
         if hasattr(self.t212, "get_rate_limit_telemetry"):
@@ -1023,20 +1063,51 @@ class Orchestrator:
             history, local_notifs, broker_notifs = [], [], []
 
         seen_notifs: Set[Tuple[Any, ...]] = set()
+        seen_order_ids: Set[str] = set()
+        broker_tickers_with_pnl: Set[str] = set()
         merged_notifs: List[Dict[str, Any]] = []
-        for item in list(broker_notifs) + list(local_notifs):
-            if not isinstance(item, dict):
+
+        for b_ev in broker_notifs:
+            if not isinstance(b_ev, dict):
                 continue
-            dedup_key = (item.get("event_type"), item.get("ticker"), round(float(item.get("price") or 0.0), 3), str(item.get("timestamp", ""))[:16])
+            oid = str(b_ev.get("order_id") or "")
+            if oid:
+                seen_order_ids.add(oid)
+            tk = b_ev.get("ticker", "")
+            if tk and b_ev.get("pnl") is not None:
+                broker_tickers_with_pnl.add(tk)
+            dedup_key = (b_ev.get("event_type"), tk, round(float(b_ev.get("price") or 0.0), 3), str(b_ev.get("timestamp", ""))[:16])
+            seen_notifs.add(dedup_key)
+            merged_notifs.append(dict(b_ev))
+
+        for n in local_notifs:
+            if not isinstance(n, dict):
+                continue
+            n_oid = str(n.get("order_id") or "")
+            if n_oid and n_oid in seen_order_ids:
+                continue
+            n_tk = n.get("ticker", "")
+            # Suppress false 0.0 P&L reconciliation entries when a broker fill exists for that ticker
+            if n_tk in broker_tickers_with_pnl and n.get("pnl") == 0.0 and "Reconciliation" in str(n.get("rationale") or ""):
+                continue
+            dedup_key = (n.get("event_type"), n_tk, round(float(n.get("price") or 0.0), 3), str(n.get("timestamp", ""))[:16])
             if dedup_key in seen_notifs:
                 continue
             seen_notifs.add(dedup_key)
-            merged_notifs.append(dict(item))
+            merged_notifs.append(dict(n))
+
         merged_notifs.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
         recent_notifications = merged_notifs[:30]
 
         cached_cash = cached_broker.get("cash") if isinstance(cached_broker.get("cash"), Mapping) else None
         cached_total = float(cached_cash.get("total") or 0.0) if cached_cash else 0.0
+        if cached_total <= 0.0 and hasattr(self, "_cash_cache_path") and self._cash_cache_path.is_file():
+            try:
+                p_c = json.loads(self._cash_cache_path.read_text(encoding="utf-8"))
+                if float(p_c.get("total") or 0.0) > 0:
+                    cached_total = float(p_c["total"])
+            except Exception:
+                pass
         default_eq = float(getattr(cfg_snap, "DEFAULT_ACCOUNT_EQUITY", 10000.0))
         base_equity = round(cached_total, 2) if cached_total > 0 else round(default_eq, 2)
 
@@ -3073,6 +3144,18 @@ class Orchestrator:
             rec = self.position_monitor.reconcile_with_broker(adopt_untracked=True, active_metrics=active_metrics) or {}
             if rec.get("closed_externally") or rec.get("quantity_synced") or rec.get("adopted_from_broker"):
                 logger.info("Active trade reconciliation: %s", rec)
+            if hasattr(self.t212, "get_account_cash") and not self.dry_run:
+                try:
+                    c_obj = self.t212.get_account_cash(force_refresh=False)
+                    if c_obj and getattr(c_obj, "total", 0.0) > 0:
+                        self._persist_cached_cash(c_obj)
+                except Exception as cash_err:
+                    logger.debug("Active monitor cash refresh notice: %s", cash_err)
+            if hasattr(self.t212, "get_historical_orders") and not self.dry_run:
+                try:
+                    self.t212.get_historical_orders(limit=30, force_refresh=False)
+                except Exception as hist_err:
+                    logger.debug("Active monitor historical orders refresh notice: %s", hist_err)
             self._last_reconciliation_time = now_ts
 
         # 2. Sync native broker orders ("set the price" on broker server)

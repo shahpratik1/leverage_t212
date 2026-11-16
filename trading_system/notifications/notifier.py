@@ -57,6 +57,7 @@ class TradeNotification:
     rationale: str = ""                 # Context / commentary
     timestamp: str = ""
     currency: Optional[str] = None      # Quote currency (e.g. 'EUR', 'GBX', 'USD')
+    order_id: Optional[str] = None      # Broker order ID (if associated with live execution)
 
     def __post_init__(self) -> None:
         if not self.timestamp:
@@ -297,10 +298,12 @@ class Notifier:
         direction: str = "LONG",
         is_tsl: bool = False,
         details: str = "",
+        order_id: Optional[str] = None,
     ) -> None:
         """Send a Stop Loss / Position Closure notification."""
+        event_type = "TSL" if is_tsl or (realized_pnl is not None and realized_pnl > 0) else "SL"
         note = TradeNotification(
-            event_type="SL",
+            event_type=event_type,
             ticker=ticker,
             underlying=underlying,
             direction=direction,
@@ -313,7 +316,8 @@ class Notifier:
             tp3=0.0,
             pnl=realized_pnl,
             pnl_pct=realized_pnl_pct,
-            rationale=details or f"Stop Loss triggered at ${price:.2f}. Position closed.",
+            rationale=details or f"{'Trailing Stop' if event_type == 'TSL' else 'Stop Loss'} triggered at ${price:.2f}. Position closed.",
+            order_id=str(order_id) if order_id else None,
         )
         self.dispatch(note)
 
@@ -327,27 +331,34 @@ class Notifier:
         locked_in_pnl_pct: float,
         is_triggered: bool = False,
         event_type: str = "TSL",
+        quantity: float = 0.0,
+        realized_pnl: Optional[float] = None,
+        details: str = "",
+        order_id: Optional[str] = None,
     ) -> None:
         """Send a Trailing Stop Loss (TSL) update or execution notification."""
-        action_text = (
-            f"Trailing Stop TRIGGERED at ${current_price:.2f}! Position closed to bank profits."
-            if is_triggered
-            else f"Trailing Stop ratcheted UP to ${new_tsl:.2f} (Locking in +{locked_in_pnl_pct:.1f}% min gain)."
-        )
+        if details:
+            action_text = details
+        elif is_triggered:
+            action_text = f"Trailing Stop TRIGGERED at ${current_price:.2f}! Position closed to bank profits."
+        else:
+            action_text = f"Trailing Stop ratcheted UP to ${new_tsl:.2f} (Locking in +{locked_in_pnl_pct:.1f}% min gain)."
         note = TradeNotification(
             event_type=event_type,
             ticker=ticker,
             underlying=underlying,
             direction=direction,
             price=current_price,
-            quantity=0.0,
+            quantity=quantity,
             stop_loss=new_tsl,
             trailing_stop=new_tsl,
             tp1=0.0,
             tp2=0.0,
             tp3=0.0,
+            pnl=realized_pnl,
             pnl_pct=locked_in_pnl_pct,
             rationale=action_text,
+            order_id=str(order_id) if order_id else None,
         )
         self.dispatch(note)
     def notify_session_exit(

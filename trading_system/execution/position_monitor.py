@@ -2147,6 +2147,17 @@ class PositionMonitor:
             except Exception as ord_exc:
                 logger.debug("Reconciliation open orders fetch notice: %s", ord_exc)
 
+            historical_orders_list: List[Dict[str, Any]] = []
+            if hasattr(self.t212, "get_historical_orders"):
+                try:
+                    h_orders = self.t212.get_historical_orders(limit=50, force_refresh=False)
+                    if isinstance(h_orders, dict):
+                        historical_orders_list = list(h_orders.get("items") or [])
+                    elif isinstance(h_orders, list):
+                        historical_orders_list = list(h_orders)
+                except Exception as hist_err:
+                    logger.debug("Reconciliation historical orders fetch notice: %s", hist_err)
+
             with self._state_lock:
                 local_items = list(self.positions.items())
 
@@ -2171,8 +2182,51 @@ class PositionMonitor:
                         self.cancel_all_broker_orders(pos)
                         summary["closed_externally"].append(ticker)
 
-                        # Register anti-churn loss cooldown on RiskManager to prevent immediate whipsaw re-entry
-                        if hasattr(self.risk_manager, "register_loss_exit"):
+                        # Match against historical orders to extract actual broker fill price, quantity, and realized P&L
+                        matched_fill_item = None
+                        for h_item in historical_orders_list:
+                            if not isinstance(h_item, dict):
+                                continue
+                            h_ord = h_item.get("order") if isinstance(h_item.get("order"), dict) else {}
+                            h_fill = h_item.get("fill") if isinstance(h_item.get("fill"), dict) else {}
+                            if h_ord.get("ticker") == ticker and (h_fill or str(h_ord.get("status", "")).upper() in ("FILLED", "EXECUTED")):
+                                matched_fill_item = h_item
+                                break
+
+                        real_pnl: Optional[float] = None
+                        real_pnl_pct: Optional[float] = None
+                        fill_px = float(pos.stop_loss or pos.current_price or pos.entry_price or 0.0)
+                        fill_qty = float(pos.remaining_quantity or pos.original_quantity or 1.0)
+                        order_id = str(getattr(pos, "broker_stop_order_id", "") or "")
+
+                        if matched_fill_item:
+                            h_ord = matched_fill_item.get("order", {})
+                            h_fill = matched_fill_item.get("fill", {})
+                            w_impact = h_fill.get("walletImpact", {}) if isinstance(h_fill.get("walletImpact"), dict) else {}
+                            order_id = str(h_ord.get("id") or order_id)
+                            fill_px = float(h_fill.get("price") or h_ord.get("stopPrice") or fill_px)
+                            fill_qty = abs(float(h_fill.get("quantity") or h_ord.get("filledQuantity") or fill_qty))
+                            raw_rpnl = w_impact.get("realisedProfitLoss")
+                            net_val = float(w_impact.get("netValue") or 0.0)
+
+                            if raw_rpnl is not None:
+                                real_pnl = float(raw_rpnl)
+                                if net_val > 0:
+                                    cost_basis = net_val - real_pnl
+                                    real_pnl_pct = round((real_pnl / cost_basis) * 100.0, 2) if cost_basis > 0 else 0.0
+                                elif fill_px > 0 and fill_qty > 0:
+                                    cost_basis = (fill_px * fill_qty) - real_pnl
+                                    real_pnl_pct = round((real_pnl / cost_basis) * 100.0, 2) if cost_basis > 0 else 0.0
+                                else:
+                                    real_pnl_pct = 0.0
+
+                        if real_pnl is None:
+                            real_pnl, real_pnl_pct = self._calculate_pnl(pos, fill_px, fill_qty)
+
+                        is_profit = real_pnl > 0
+
+                        # Register anti-churn loss cooldown on RiskManager ONLY if trade realized a loss
+                        if not is_profit and hasattr(self.risk_manager, "register_loss_exit"):
                             cooldown = float(self._snap_val(
                                 pos_snap,
                                 "TRADE_LOSS_COOLDOWN_SECONDS",
@@ -2180,22 +2234,59 @@ class PositionMonitor:
                             ))
                             self.risk_manager.register_loss_exit(pos.ticker, pos.underlying, cooldown_seconds=cooldown)
 
-                        # Dispatch notification outside _state_lock
-                        if hasattr(self.notifier, "notify_stop_loss"):
-                            try:
-                                self.notifier.notify_stop_loss(
-                                    ticker=pos.ticker,
-                                    underlying=pos.underlying,
-                                    price=pos.stop_loss,
-                                    quantity=pos.original_quantity,
-                                    realized_pnl=0.0,
-                                    realized_pnl_pct=0.0,
-                                    direction=pos.direction,
-                                    is_tsl=False,
-                                    details="Reconciliation: Position closed on broker (Native stop hit, limit filled, or manual close)",
-                                )
-                            except Exception as notif_exc:
-                                logger.debug("Reconciliation exit notification failed: %s", notif_exc)
+                        # Dispatch appropriate notification outside _state_lock
+                        if is_profit:
+                            if hasattr(self.notifier, "notify_tsl"):
+                                try:
+                                    self.notifier.notify_tsl(
+                                        ticker=pos.ticker,
+                                        underlying=pos.underlying,
+                                        direction=pos.direction,
+                                        current_price=fill_px,
+                                        new_tsl=fill_px,
+                                        locked_in_pnl_pct=real_pnl_pct or 0.0,
+                                        is_triggered=True,
+                                        event_type="TSL",
+                                        quantity=fill_qty,
+                                        realized_pnl=real_pnl,
+                                        details=f"Live T212 Profit Target/Exit Filled #{order_id}" if order_id else "Reconciliation: Position closed on broker in profit",
+                                        order_id=order_id,
+                                    )
+                                except Exception as notif_exc:
+                                    logger.debug("Reconciliation profit exit notification failed: %s", notif_exc)
+                            elif hasattr(self.notifier, "notify_stop_loss"):
+                                try:
+                                    self.notifier.notify_stop_loss(
+                                        ticker=pos.ticker,
+                                        underlying=pos.underlying,
+                                        price=fill_px,
+                                        quantity=fill_qty,
+                                        realized_pnl=real_pnl,
+                                        realized_pnl_pct=real_pnl_pct or 0.0,
+                                        direction=pos.direction,
+                                        is_tsl=True,
+                                        details=f"Live T212 Profit Target/Exit Filled #{order_id}" if order_id else "Reconciliation: Position closed on broker in profit",
+                                        order_id=order_id,
+                                    )
+                                except Exception as notif_exc:
+                                    logger.debug("Reconciliation exit notification failed: %s", notif_exc)
+                        else:
+                            if hasattr(self.notifier, "notify_stop_loss"):
+                                try:
+                                    self.notifier.notify_stop_loss(
+                                        ticker=pos.ticker,
+                                        underlying=pos.underlying,
+                                        price=fill_px,
+                                        quantity=fill_qty,
+                                        realized_pnl=real_pnl,
+                                        realized_pnl_pct=real_pnl_pct or 0.0,
+                                        direction=pos.direction,
+                                        is_tsl=False,
+                                        details=f"Live T212 Stop Order Executed #{order_id}" if order_id else "Reconciliation: Position closed on broker",
+                                        order_id=order_id,
+                                    )
+                                except Exception as notif_exc:
+                                    logger.debug("Reconciliation loss exit notification failed: %s", notif_exc)
                 else:
                     bp = broker_map[ticker]
                     cur_px = bp.current_price if (bp.current_price or 0.0) > 0 else (bp.average_price or 0.0)

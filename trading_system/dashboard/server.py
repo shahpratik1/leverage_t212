@@ -882,6 +882,14 @@ def _normalize_dashboard_snapshot(
     snap["equity_history"] = list(equity_series)
 
     default_equity = float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0) or 10000.0)
+    persisted_cash_file = Path("data/cached_cash.json")
+    if persisted_cash_file.is_file():
+        try:
+            p_data = json.loads(persisted_cash_file.read_text(encoding="utf-8"))
+            if isinstance(p_data.get("total"), (int, float)) and p_data["total"] > 0:
+                default_equity = float(p_data["total"])
+        except Exception:
+            pass
     if snap.get("base_equity") is None:
         snap["base_equity"] = default_equity
     if snap.get("starting_equity") is None:
@@ -983,6 +991,16 @@ def build_dashboard_data(
     global _DASHBOARD_DATA_CACHE, _DASHBOARD_DATA_CACHE_TIME, _DASHBOARD_DATA_CACHE_STAMP
 
     active_client = client if client is not None else _DASHBOARD_SHARED_CLIENT
+    is_testing_env = "unittest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    if active_client is None and not is_testing_env and bool(getattr(settings, "TRADING212_API_KEY", "")):
+        try:
+            active_client = Trading212Client(
+                api_key=settings.TRADING212_API_KEY,
+                api_secret=settings.TRADING212_API_SECRET,
+                base_url=settings.api_base_url,
+            )
+        except Exception as cli_exc:
+            logger.debug("Automatic broker client initialization skipped: %s", cli_exc)
 
     if orchestrator is not None:
         raw_snapshot = orchestrator.get_dashboard_snapshot()
@@ -1200,17 +1218,24 @@ def build_dashboard_data(
             broker_events = fetch_live_broker_notifications(active_client, universe, limit=25)
             if broker_events:
                 seen_orders = set()
+                broker_tickers_with_pnl = set()
                 merged_events = []
                 for b_ev in broker_events:
                     oid = str(b_ev.get("order_id") or "")
                     if oid:
                         seen_orders.add(oid)
+                    tk = b_ev.get("ticker", "")
+                    if tk and b_ev.get("pnl") is not None:
+                        broker_tickers_with_pnl.add(tk)
                     merged_events.append(b_ev)
                 for n in recent_notifications:
                     n_oid = str(n.get("order_id") or "")
                     if n_oid and n_oid in seen_orders:
                         continue
                     tk = n.get("ticker", "")
+                    # Suppress false 0.0 P&L reconciliation entries when a broker fill exists for that ticker
+                    if tk in broker_tickers_with_pnl and n.get("pnl") == 0.0 and "Reconciliation" in str(n.get("rationale") or ""):
+                        continue
                     if tk:
                         auth_dir = universe.get_etp_direction(tk) if universe else get_etp_direction(tk)
                         if auth_dir:
@@ -1225,8 +1250,20 @@ def build_dashboard_data(
             else sum(1 for s in active_signals if s.get("broker_stop_order_id"))
         )
 
+        persisted_cash_file = Path("data/cached_cash.json")
+        persisted_total = None
+        if persisted_cash_file.is_file():
+            try:
+                p_data = json.loads(persisted_cash_file.read_text(encoding="utf-8"))
+                if isinstance(p_data.get("total"), (int, float)) and p_data["total"] > 0:
+                    persisted_total = float(p_data["total"])
+            except Exception:
+                pass
+
         if live_account_cash_total is not None:
             base_equity = round(live_account_cash_total, 2)
+        elif persisted_total is not None:
+            base_equity = round(persisted_total, 2)
         else:
             default_eq = float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0) or 10000.0)
             base_equity = round(default_eq, 2)
