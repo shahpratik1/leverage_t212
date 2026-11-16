@@ -2,7 +2,7 @@
 set -e
 
 echo "⏳ Watching for Raspberry Pi to boot up on the network..."
-CANDIDATES=("shahpratik11@192.168.178.54" "trading212-pi" "shahpratik11@trading212-pi.local" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61")
+CANDIDATES=("trading212-pi" "shahpratik11@trading212-pi.local" "shahpratik11@192.168.178.54" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61")
 
 while true; do
     for cand in "${CANDIDATES[@]}"; do
