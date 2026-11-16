@@ -1089,8 +1089,12 @@ class Trading212Client:
 
         now = time.time()
         with self._cache_lock:
+            # Enforce endpoint minimum pacing floor (5.2s) even if force_refresh=True to eliminate 429 retries
+            min_gap = self.ENDPOINT_MIN_DELAYS.get("orders_query", 5.2)
+            if self._orders_cache is not None and (now - self._orders_cache_time) < min_gap:
+                return copy.deepcopy(self._orders_cache)
             if not force_refresh and self._orders_cache is not None and (now - self._orders_cache_time) < 15.0:
-                return self._orders_cache
+                return copy.deepcopy(self._orders_cache)
 
         data = self._request("GET", "/equity/orders")
         if not isinstance(data, list):
@@ -1115,12 +1119,15 @@ class Trading212Client:
 
         now = time.time()
         with self._cache_lock:
+            min_gap = self.ENDPOINT_MIN_DELAYS.get("orders_query", 5.2)
+            if self._history_orders_cache is not None and (now - self._history_orders_cache_time) < min_gap:
+                return copy.deepcopy(self._history_orders_cache)
             if (
                 not force_refresh
                 and self._history_orders_cache is not None
                 and (now - self._history_orders_cache_time) < 15.0
             ):
-                return self._history_orders_cache
+                return copy.deepcopy(self._history_orders_cache)
 
         try:
             data = self._request("GET", f"/equity/history/orders?limit={limit}")

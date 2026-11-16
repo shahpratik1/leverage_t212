@@ -376,6 +376,31 @@ class BacktestEngine:
 
         return adx_series, pdi_series, mdi_series
 
+    @staticmethod
+    def _calculate_rolling_vwap(
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        volumes: List[float],
+        window: int = 20,
+    ) -> List[Optional[float]]:
+        """Calculate rolling volume-weighted average price (VWAP) over *window* bars."""
+        vwap: List[Optional[float]] = []
+        for i in range(len(closes)):
+            start_idx = max(0, i - window + 1)
+            h_win = highs[start_idx : i + 1]
+            l_win = lows[start_idx : i + 1]
+            c_win = closes[start_idx : i + 1]
+            v_win = volumes[start_idx : i + 1]
+            sum_v = sum(v_win)
+            if sum_v > 0:
+                typ_px = [(h_win[j] + l_win[j] + c_win[j]) / 3.0 for j in range(len(c_win))]
+                val = sum(typ_px[j] * v_win[j] for j in range(len(c_win))) / sum_v
+                vwap.append(round(val, 4))
+            else:
+                vwap.append(round(sum(c_win) / len(c_win), 4))
+        return vwap
+
     def run(
         self,
         symbol: str,
@@ -396,12 +421,14 @@ class BacktestEngine:
         highs = [float(c["high"]) for c in candles]
         lows = [float(c["low"]) for c in candles]
         closes = [float(c["close"]) for c in candles]
+        volumes = [float(c.get("volume", 1.0) or 1.0) for c in candles]
 
         # Indicator Series
         sma200 = self._calculate_sma(closes, 200)
         ema20 = self._calculate_ema(closes, 20)
         ema50 = self._calculate_ema(closes, 50)
         adx14, plus_di14, minus_di14 = self._calculate_wilder_adx(highs, lows, closes, 14)
+        vwap20 = self._calculate_rolling_vwap(highs, lows, closes, volumes, 20)
         rsi3 = self._calculate_rsi(closes, 3)
         rsi7 = self._calculate_rsi(closes, 7)
         atr14 = self._calculate_atr(highs, lows, closes, 14)
@@ -411,8 +438,10 @@ class BacktestEngine:
 
         from trading_system.strategies.base import read_config_value
         from trading_system.strategies.directional_trend import DirectionalTrendStrategy
+        from trading_system.strategies.vwap import VWAPStrategy
 
         directional_strategy = DirectionalTrendStrategy()
+        vwap_strategy = VWAPStrategy()
         if config_snapshot is not None:
             max_catalyst_risk = float(
                 read_config_value(config_snapshot, "SCREENER_MAX_CATALYST_RISK", 0.25)
@@ -784,6 +813,36 @@ class BacktestEngine:
                         signal_dir = dir_sig.direction
                         strategy_name = "directional_trend"
 
+                # VWAP Session Trend Strategy
+                if not signal_dir and strategy_filter in ("vwap", "all"):
+                    curr_vwap = vwap20[i] if (vwap20 and vwap20[i] is not None) else curr_c
+                    vwap_dist = ((curr_c - curr_vwap) / curr_vwap) * 100.0 if curr_vwap > 0 else 0.0
+                    e20 = ema20[i] if i < len(ema20) and ema20[i] is not None else curr_c
+                    e50 = ema50[i] if i < len(ema50) and ema50[i] is not None else curr_c
+                    vwap_bar_metrics: Dict[str, Any] = {
+                        "close": curr_c,
+                        "vwap": curr_vwap,
+                        "vwap_dist_pct": vwap_dist,
+                        "sma200": curr_sma if curr_sma is not None else 0.0,
+                        "ema20": e20,
+                        "ema50": e50,
+                        "ema20_daily": e20,
+                        "ema50_daily": e50,
+                        "adx": adx14[i] if i < len(adx14) and adx14[i] is not None else 0.0,
+                        "plus_di": plus_di14[i] if i < len(plus_di14) and plus_di14[i] is not None else 0.0,
+                        "minus_di": minus_di14[i] if i < len(minus_di14) and minus_di14[i] is not None else 0.0,
+                        "atr": curr_atr,
+                        "realized_vol": curr_vol,
+                    }
+                    if candles[i].get("earnings_in_days") is not None:
+                        vwap_bar_metrics["earnings_in_days"] = candles[i]["earnings_in_days"]
+                    vwap_sig = vwap_strategy.evaluate_candidate(
+                        symbol, vwap_bar_metrics, config_snapshot=config_snapshot
+                    )
+                    if vwap_sig.is_actionable and vwap_sig.catalyst_risk <= max_catalyst_risk:
+                        signal_dir = vwap_sig.direction
+                        strategy_name = "vwap"
+
                 # 3-RSI Mean Reversion (standalone or fallback if not multi_factor only)
                 if not signal_dir and strategy_filter in ("both", "3rsi"):
                     if curr_r3 is not None and curr_r7 is not None and curr_sma is not None:
@@ -976,12 +1035,19 @@ class BacktestEngine:
         )
 
     def run_comparison(
-        self, symbol: str, candles: List[Dict[str, Any]]
+        self,
+        symbol: str,
+        candles: List[Dict[str, Any]],
+        strategy_a: str = "baseline",
+        strategy_b: str = "multi_factor",
+        config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Dict[str, BacktestResult]:
-        """Run both standard baseline and multi-factor strategies and return comparative results."""
-        baseline_res = self.run(symbol, candles, strategy_filter="both")
-        mf_res = self.run(symbol, candles, strategy_filter="multi_factor")
-        return {"baseline": baseline_res, "multi_factor": mf_res}
+        """Run two strategies and return comparative results."""
+        filter_a = "both" if strategy_a == "baseline" else strategy_a
+        filter_b = "both" if strategy_b == "baseline" else strategy_b
+        res_a = self.run(symbol, candles, strategy_filter=filter_a, config_snapshot=config_snapshot)
+        res_b = self.run(symbol, candles, strategy_filter=filter_b, config_snapshot=config_snapshot)
+        return {strategy_a: res_a, strategy_b: res_b}
 
 
 def generate_synthetic_candles(symbol: str, count: int = 150) -> List[Dict[str, Any]]:
@@ -1053,28 +1119,43 @@ def print_backtest_report(res: BacktestResult) -> None:
 
 
 def print_comparison_report(comp: Dict[str, BacktestResult]) -> None:
-    """Print side-by-side comparative table between baseline and multi-factor strategy."""
-    b = comp.get("baseline")
-    m = comp.get("multi_factor")
+    """Print side-by-side comparative table between two strategies."""
+    keys = list(comp.keys())
+    if len(keys) < 2:
+        return
+    k_a, k_b = keys[0], keys[1]
+    b = comp[k_a]
+    m = comp[k_b]
     if not b or not m:
         return
 
-    sep = "═" * 76
-    sub_sep = "─" * 76
+    name_map = {
+        "baseline": "Baseline (3-RSI/Mom)",
+        "multi_factor": "Multi-Factor (Nixtla/Sent)",
+        "vwap": "VWAP Session Trend",
+        "directional_trend": "Directional Trend",
+        "3rsi": "3-RSI Mean Reversion",
+        "momentum": "Momentum Breakout",
+    }
+    label_a = name_map.get(k_a, k_a)
+    label_b = name_map.get(k_b, k_b)
+
+    sep = "═" * 78
+    sub_sep = "─" * 78
     print(sep)
-    print(f"  📊 STRATEGY COMPARISON REPORT: BASELINE vs MULTI-FACTOR ({b.symbol})")
+    print(f"  📊 STRATEGY COMPARISON REPORT: {label_a.upper()} vs {label_b.upper()} ({b.symbol})")
     print(sep)
-    print(f"  {'Metric':<26} | {'Baseline (3-RSI/Mom)':<20} | {'Multi-Factor (Nixtla/Sent)':<22}")
+    print(f"  {'Metric':<26} | {label_a:<22} | {label_b:<22}")
     print(sub_sep)
-    print(f"  {'Total Return':<26} | {b.total_return_pct:>+19.2f}% | {m.total_return_pct:>+21.2f}%")
-    print(f"  {'Benchmark (1x B&H)':<26} | {b.benchmark_return_pct:>+19.2f}% | {m.benchmark_return_pct:>+21.2f}%")
-    print(f"  {'Total Trades':<26} | {b.total_trades:>20} | {m.total_trades:>22}")
-    print(f"  {'Win Rate':<26} | {f'{b.win_rate_pct:.1f}%':>20} | {f'{m.win_rate_pct:.1f}%':>22}")
-    print(f"  {'Profit Factor':<26} | {b.profit_factor:>20.2f} | {m.profit_factor:>22.2f}")
-    print(f"  {'Max Drawdown':<26} | {f'{b.max_drawdown_pct:.2f}%':>20} | {f'{m.max_drawdown_pct:.2f}%':>22}")
-    print(f"  {'Sharpe Ratio':<26} | {b.sharpe_ratio:>20.2f} | {m.sharpe_ratio:>22.2f}")
-    print(f"  {'Avg Trade PnL':<26} | {f'${b.avg_trade_pnl:+.2f}':>20} | {f'${m.avg_trade_pnl:+.2f}':>22}")
-    print(f"  {'Avg Holding Period':<26} | {f'{b.avg_hold_days:.1f} days':>20} | {f'{m.avg_hold_days:.1f} days':>22}")
+    print(f"  {'Total Return':<26} | {b.total_return_pct:>+21.2f}% | {m.total_return_pct:>+21.2f}%")
+    print(f"  {'Benchmark (1x B&H)':<26} | {b.benchmark_return_pct:>+21.2f}% | {m.benchmark_return_pct:>+21.2f}%")
+    print(f"  {'Total Trades':<26} | {b.total_trades:>22} | {m.total_trades:>22}")
+    print(f"  {'Win Rate':<26} | {f'{b.win_rate_pct:.1f}%':>22} | {f'{m.win_rate_pct:.1f}%':>22}")
+    print(f"  {'Profit Factor':<26} | {b.profit_factor:>22.2f} | {m.profit_factor:>22.2f}")
+    print(f"  {'Max Drawdown':<26} | {f'{b.max_drawdown_pct:.2f}%':>22} | {f'{m.max_drawdown_pct:.2f}%':>22}")
+    print(f"  {'Sharpe Ratio':<26} | {b.sharpe_ratio:>22.2f} | {m.sharpe_ratio:>22.2f}")
+    print(f"  {'Avg Trade PnL':<26} | {f'${b.avg_trade_pnl:+.2f}':>22} | {f'${m.avg_trade_pnl:+.2f}':>22}")
+    print(f"  {'Avg Holding Period':<26} | {f'{b.avg_hold_days:.1f} days':>22} | {f'{m.avg_hold_days:.1f} days':>22}")
     print(sep)
 
 
@@ -1087,12 +1168,19 @@ def main() -> None:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["3rsi", "momentum", "multi_factor", "both"],
+        choices=["3rsi", "momentum", "multi_factor", "directional_trend", "vwap", "both", "all"],
         default="both",
         help="Strategy to test",
     )
     parser.add_argument("--leverage", type=int, default=3, help="Leverage multiplier (default 3)")
     parser.add_argument("--compare", action="store_true", help="Compare baseline vs multi-factor strategy side-by-side")
+    parser.add_argument(
+        "--compare-strategies",
+        nargs=2,
+        metavar=("STRAT_A", "STRAT_B"),
+        default=None,
+        help="Compare any two strategies side-by-side (e.g. --compare-strategies vwap directional_trend)",
+    )
     parser.add_argument("--json", action="store_true", help="Output raw JSON results")
     parser.add_argument("--dry-run", action="store_true", help="Run quick verification with synthetic candles")
     parser.add_argument("--pure-tsl", dest="pure_tsl", action="store_true", default=None, help="Enforce 100% Pure Trailing Stop Loss engine")
@@ -1133,7 +1221,14 @@ def main() -> None:
         pure_tsl_mode=args.pure_tsl,
     )
 
-    if args.compare:
+    if args.compare_strategies:
+        strat_a, strat_b = args.compare_strategies
+        comp = engine.run_comparison(symbol=args.symbol, candles=candles, strategy_a=strat_a, strategy_b=strat_b)
+        if args.json:
+            print(json.dumps({k: v.to_dict() for k, v in comp.items()}, indent=2))
+        else:
+            print_comparison_report(comp)
+    elif args.compare:
         comp = engine.run_comparison(symbol=args.symbol, candles=candles)
         if args.json:
             print(json.dumps({k: v.to_dict() for k, v in comp.items()}, indent=2))

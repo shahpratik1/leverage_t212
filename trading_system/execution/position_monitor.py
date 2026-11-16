@@ -2136,7 +2136,7 @@ class PositionMonitor:
             limit_orders_by_ticker: Dict[str, Any] = {}
             try:
                 if hasattr(self.t212, "get_orders"):
-                    open_orders = self.t212.get_orders(force_refresh=True)
+                    open_orders = self.t212.get_orders(force_refresh=False)
                     for o in open_orders:
                         o_ticker = o.get("ticker") if isinstance(o, dict) else getattr(o, "ticker", "")
                         o_type = str(o.get("type") if isinstance(o, dict) else getattr(o, "type", "")).upper()

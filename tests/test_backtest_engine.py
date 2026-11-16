@@ -193,6 +193,28 @@ class TestBacktestEngine(unittest.TestCase):
         self.assertEqual(comp["baseline"].symbol, "QQQ")
         self.assertEqual(comp["multi_factor"].symbol, "QQQ")
 
+    def test_vwap_strategy_simulation(self):
+        """Run backtest with vwap strategy filter and verify trade tagging and execution."""
+        candles = generate_synthetic_candles("QQQ", count=160)
+        res = self.engine.run(symbol="QQQ", candles=candles, strategy_filter="vwap")
+        self.assertIsInstance(res, BacktestResult)
+        self.assertGreater(res.total_trades, 0)
+        for t in res.trades:
+            self.assertEqual(t.strategy, "vwap")
+
+    def test_run_comparison_vwap_directional(self):
+        """Verify side-by-side comparison between vwap and directional_trend."""
+        candles = generate_synthetic_candles("QQQ", count=160)
+        comp = self.engine.run_comparison(
+            symbol="QQQ", candles=candles, strategy_a="vwap", strategy_b="directional_trend"
+        )
+        self.assertIn("vwap", comp)
+        self.assertIn("directional_trend", comp)
+        self.assertIsInstance(comp["vwap"], BacktestResult)
+        self.assertIsInstance(comp["directional_trend"], BacktestResult)
+        self.assertGreater(comp["vwap"].total_trades, 0)
+        self.assertGreater(comp["directional_trend"].total_trades, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

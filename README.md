@@ -111,11 +111,46 @@ python3 -m trading_system.orchestrator
 ```
 
 ### 4. Running the Signals Dashboard
-To start the local interactive dashboard server:
+
+The interactive signals dashboard provides real-time broker equity tracking, active positions, working native GTC stop badges, trade history, and manual execution cards.
+
+#### Starting the Standalone Dashboard Server
 ```bash
 python3 -m trading_system.dashboard.server --port 8888
 ```
-Then navigate to `http://localhost:8888/signals_dashboard.html` in your browser.
+Navigate to `http://localhost:8888/signals_dashboard.html` in your browser.
+
+#### Common Dashboard CLI Options
+| Flag | Description | Example |
+|---|---|---|
+| `--port <PORT>` | Set listening port (default: `8888`) | `python3 -m trading_system.dashboard.server --port 8888` |
+| `--host <HOST>` | Bind to a specific network interface | `python3 -m trading_system.dashboard.server --host 127.0.0.1` |
+| `--no-browser` | Run headlessly without auto-opening a browser window | `python3 -m trading_system.dashboard.server --port 8888 --no-browser` |
+| `--print-token` | Print active dashboard auth token to stdout | `python3 -m trading_system.dashboard.server --print-token` |
+| `--token-file <PATH>` | Custom file path for persistent auth token | `python3 -m trading_system.dashboard.server --token-file data/.dashboard_token` |
+| `--generate-only` | Regenerate static `signals_dashboard.html` and exit | `python3 -m trading_system.dashboard.server --generate-only` |
+| `--output <PATH>` | Custom output destination for generated HTML | `python3 -m trading_system.dashboard.server --generate-only --output dashboard.html` |
+
+#### Running Dashboard Embedded with the Orchestrator
+When running the full autonomous engine, the dashboard server runs embedded and enabled by default:
+```bash
+# Run orchestrator with embedded dashboard on port 8888
+python3 -m trading_system.orchestrator --dashboard-port 8888
+
+# Open browser automatically on launch
+python3 -m trading_system.orchestrator --dashboard-port 8888 --open-browser
+
+# Run engine headless without starting the embedded dashboard server
+python3 -m trading_system.orchestrator --no-dashboard
+```
+
+#### Synchronizing Remote Raspberry Pi Dashboard
+If running on a 24/7 dedicated Raspberry Pi runner (`trading-bot.service` on port `8080`):
+- Access directly on your local network: `http://trading212-pi.local:8080/signals_dashboard.html`
+- Sync live dashboard HTML and state files to your local machine:
+  ```bash
+  ./scripts/fetch_live_state.sh
+  ```
 
 ### 5. Running the Test Suite
 The codebase includes comprehensive unit tests verifying risk sizing, 3-tier profit taking, the 16:20 UTC session protocol, and broker rate-limiting:
