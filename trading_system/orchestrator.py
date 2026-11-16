@@ -417,7 +417,7 @@ class Orchestrator:
         if not is_testing and not self.dry_run and settings.TRADING212_API_KEY:
             try:
                 boot_cash = self.t212.get_account_cash(
-                    fallback_equity=float(snap.DEFAULT_ACCOUNT_EQUITY),
+                    fallback_equity=self._get_fallback_equity(snap),
                     force_refresh=False,
                 )
                 if boot_cash and getattr(boot_cash, "total", 0.0) > 0:
@@ -638,6 +638,20 @@ class Orchestrator:
                 _atomic_write_json(self._cash_cache_path, payload)
         except Exception as exc:
             logger.debug("Failed persisting cached cash: %s", exc)
+
+    def _get_fallback_equity(self, snap: Optional[Any] = None) -> float:
+        """Resolve baseline equity, preferring cached broker cash before config default."""
+        if hasattr(self, "_cash_cache_path") and self._cash_cache_path.is_file():
+            try:
+                p_c = json.loads(self._cash_cache_path.read_text(encoding="utf-8"))
+                val = float(p_c.get("total") or 0.0)
+                if val > 0:
+                    return round(val, 2)
+            except Exception:
+                pass
+        if snap is not None and hasattr(snap, "DEFAULT_ACCOUNT_EQUITY"):
+            return float(snap.DEFAULT_ACCOUNT_EQUITY)
+        return float(getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0) or 10000.0)
 
     def _get_cached_broker_view(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Read cached Trading 212 snapshot and rate telemetry with ZERO HTTP calls."""
@@ -1108,7 +1122,7 @@ class Orchestrator:
                     cached_total = float(p_c["total"])
             except Exception:
                 pass
-        default_eq = float(getattr(cfg_snap, "DEFAULT_ACCOUNT_EQUITY", 10000.0))
+        default_eq = self._get_fallback_equity(cfg_snap)
         base_equity = round(cached_total, 2) if cached_total > 0 else round(default_eq, 2)
 
         equity_points: List[Dict[str, Any]] = [{"time": "Start", "equity": base_equity}]
@@ -1991,7 +2005,7 @@ class Orchestrator:
                 logger.debug("Debate hook execution notice for %s: %s", underlying, exc)
 
         # ── 4. Risk Management & Sizing ──────────────────────────
-        default_equity = float(getattr(snap, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
+        default_equity = self._get_fallback_equity(snap)
         try:
             if account_equity is None or account_equity <= 0:
                 account = self.t212.get_account_cash(fallback_equity=default_equity)
@@ -2084,7 +2098,7 @@ class Orchestrator:
             return False
 
         # ── Pre-trade validation ─────────────────────────────────
-        default_equity = float(getattr(active_snap, "DEFAULT_ACCOUNT_EQUITY", getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)))
+        default_equity = self._get_fallback_equity(active_snap)
         account_total = default_equity
         if available_cash is not None and positions is not None:
             account_free = available_cash
@@ -2483,7 +2497,7 @@ class Orchestrator:
             actionable.sort(key=lambda item: item[1].conviction_score, reverse=True)
 
             active_snap = self.config_bus.active_snapshot()
-            default_eq = float(getattr(active_snap, "DEFAULT_ACCOUNT_EQUITY", getattr(settings, "DEFAULT_ACCOUNT_EQUITY", 10000.0)))
+            default_eq = self._get_fallback_equity(active_snap)
             running_equity = default_eq
             try:
                 account = self.t212.get_account_cash(fallback_equity=default_eq)
@@ -2895,7 +2909,7 @@ class Orchestrator:
             cycle_snapshot.config_epoch_id,
         )
 
-        default_eq = float(getattr(cycle_snapshot, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
+        default_eq = self._get_fallback_equity(cycle_snapshot)
         try:
             account = self.t212.get_account_cash(fallback_equity=default_eq)
             baseline_equity = account.total or default_eq
@@ -3248,7 +3262,7 @@ class Orchestrator:
                 # Daily Circuit Breaker Calendar Date Rollover Reset
                 today_date = now_utc.strftime("%Y-%m-%d")
                 if getattr(self, "_last_session_cb_date", "") != today_date:
-                    default_eq = float(getattr(snap, "DEFAULT_ACCOUNT_EQUITY", settings.DEFAULT_ACCOUNT_EQUITY))
+                    default_eq = self._get_fallback_equity(snap)
                     try:
                         acc = self.t212.get_account_cash(fallback_equity=default_eq)
                         new_eq = acc.total or default_eq

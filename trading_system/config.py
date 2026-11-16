@@ -576,6 +576,18 @@ class Settings:
                 except ValueError:
                     pass
 
+        is_testing = "unittest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        if not is_testing and not os.environ.get("DEFAULT_ACCOUNT_EQUITY"):
+            cached_cash_p = Path("data/cached_cash.json")
+            if cached_cash_p.is_file():
+                try:
+                    p_c = json.loads(cached_cash_p.read_text(encoding="utf-8"))
+                    c_tot = float(p_c.get("total") or 0.0)
+                    if c_tot > 0 and math.isfinite(c_tot):
+                        self.DEFAULT_ACCOUNT_EQUITY = c_tot
+                except Exception:
+                    pass
+
         int_fields = (
             "PARALLEL_INGESTION_WORKERS",
             "PARALLEL_DELIBERATION_WORKERS",
