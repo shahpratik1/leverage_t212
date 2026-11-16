@@ -6,7 +6,7 @@ if [ -n "$1" ]; then
     PI_DEST="$1"
 else
     echo "🔍 Probing for active Raspberry Pi host on local network..."
-    CANDIDATES=("trading212-pi" "shahpratik11@trading212-pi.local" "shahpratik11@192.168.178.54" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61")
+    CANDIDATES=("shahpratik11@trading212-pi.local" "trading212-pi" "shahpratik11@192.168.178.54" "shahpratik11@192.168.68.50" "shahpratik11@192.168.68.61")
     FOUND=""
     for cand in "${CANDIDATES[@]}"; do
         if ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no "$cand" "true" 2>/dev/null; then
@@ -85,7 +85,10 @@ ssh "$PI_DEST" << 'EOF'
       sudo systemctl daemon-reload
       echo "Restarting trading-bot service..."
       sudo systemctl restart trading-bot
+      sleep 4
       sudo systemctl status trading-bot --no-pager
+      echo "Verifying dashboard HTTP server on port 8080..."
+      curl -s -I http://localhost:8080/ | head -n 1 || echo "Dashboard warming up..."
   fi
 EOF
 

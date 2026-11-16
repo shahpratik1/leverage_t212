@@ -311,6 +311,31 @@ class TestEmbeddedDashboard(unittest.TestCase):
         self.assertIn("renderEquityChart", html_text)
         self.assertIn("equity_history", html_text)
 
+    def test_dual_stack_ipv6_binding(self):
+        """Verify server binds to IPv6 dual-stack when host='::' is specified."""
+        if not getattr(socket, "has_ipv6", False):
+            self.skipTest("IPv6 not supported on this platform")
+
+        test_html = Path(self.temp_dir.name) / "test_ipv6.html"
+        test_html.write_text("<html><body>Dual Stack Test</body></html>", encoding="utf-8")
+
+        thread, httpd, url = start_local_server_thread(
+            html_file=str(test_html),
+            port=8985,
+            open_browser=False,
+            host="::",
+            allow_port_fallback=False,
+        )
+        try:
+            self.assertIsNotNone(httpd)
+            self.assertEqual(httpd.address_family, socket.AF_INET6)
+            self.assertEqual(httpd.server_address[0], "::")
+            self.assertTrue(url.startswith("http://localhost:8985/"))
+        finally:
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

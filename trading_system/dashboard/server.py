@@ -103,6 +103,27 @@ class ThreadingDashboardServer(socketserver.ThreadingMixIn, socketserver.TCPServ
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(
+        self,
+        server_address: Tuple[str, int],
+        RequestHandlerClass: Any,
+        bind_and_activate: bool = True,
+        use_dual_stack: bool = True,
+    ) -> None:
+        host, port = server_address
+        if use_dual_stack and getattr(socket, "has_ipv6", False) and host in ("::", ""):
+            self.address_family = socket.AF_INET6
+            server_address = ("::", port)
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate=bind_and_activate)
+
+    def server_bind(self) -> None:
+        if self.address_family == getattr(socket, "AF_INET6", None):
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        super().server_bind()
+
     def shutdown(self) -> None:
         """Wake active SSE streams before shutting down the TCP accept loop."""
         SSEBroadcaster.get_instance().close_all()
@@ -1469,7 +1490,10 @@ def make_dashboard_handler(
         def _client_ip(self) -> str:
             addr = getattr(self, "client_address", None)
             if isinstance(addr, (tuple, list)) and addr:
-                return str(addr[0])
+                raw_ip = str(addr[0])
+                if raw_ip.startswith("::ffff:"):
+                    return raw_ip[7:]
+                return raw_ip
             return "127.0.0.1"
 
         def _scrub(self, exc_or_msg: Any) -> str:
@@ -2349,7 +2373,7 @@ def _ensure_port_free(host: str, port: int) -> None:
     """Detect active listeners occupying ``port`` across wildcard/loopback interfaces."""
     if port <= 0:
         return
-    if host in ("0.0.0.0", "127.0.0.1", "localhost"):
+    if host in ("0.0.0.0", "127.0.0.1", "localhost", "::", ""):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("0.0.0.0", port))
@@ -2371,7 +2395,10 @@ def _bind_dashboard_server(
 ) -> ThreadingDashboardServer:
     """Bind ThreadingDashboardServer to ``(host, port)`` after checking active listeners."""
     _ensure_port_free(host, port)
-    return ThreadingDashboardServer((host, port), handler_cls)
+    try:
+        return ThreadingDashboardServer((host, port), handler_cls, use_dual_stack=True)
+    except OSError:
+        return ThreadingDashboardServer((host, port), handler_cls, use_dual_stack=False)
 
 
 def start_local_server_thread(

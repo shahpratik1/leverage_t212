@@ -234,6 +234,7 @@ class Orchestrator:
         trades_log: Optional[Path | str] = None,
         enable_dashboard: Optional[bool] = None,
         dashboard_port: Optional[int] = None,
+        dashboard_host: Optional[str] = None,
         open_browser: bool = False,
         t212_client: Optional[Trading212Client] = None,
         config_bus: Optional[ConfigBus] = None,
@@ -447,6 +448,7 @@ class Orchestrator:
 
         self.enable_dashboard = enable_dashboard
         self.dashboard_port = dashboard_port or getattr(settings, "DASHBOARD_PORT", 8888)
+        self.dashboard_host = (dashboard_host if dashboard_host is not None else getattr(settings, "DASHBOARD_HOST", "")).strip()
 
         if self.enable_dashboard:
             try:
@@ -467,6 +469,9 @@ class Orchestrator:
                     srv_kwargs["orchestrator"] = self
                 if "allow_port_fallback" in srv_sig.parameters or accepts_var_kw:
                     srv_kwargs["allow_port_fallback"] = False
+                if "host" in srv_sig.parameters or accepts_var_kw:
+                    if self.dashboard_host:
+                        srv_kwargs["host"] = self.dashboard_host
                 self.dashboard_thread, self.dashboard_server, self.dashboard_url = start_local_server_thread(
                     **srv_kwargs
                 )
@@ -3250,6 +3255,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Run in paper-trade mode without real order execution")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the embedded local signals dashboard web server")
     parser.add_argument("--dashboard-port", type=int, default=settings.DASHBOARD_PORT, help=f"Port for embedded dashboard server (default: {settings.DASHBOARD_PORT})")
+    parser.add_argument("--dashboard-host", type=str, default=getattr(settings, "DASHBOARD_HOST", ""), help="Host to bind embedded dashboard server (default: system LAN default)")
     parser.add_argument("--open-browser", action="store_true", help="Automatically open dashboard in default browser on startup")
     parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
     parser.add_argument("--backtest", action="store_true", help="Run historical strategy backtest simulator and benchmark report")
@@ -3299,6 +3305,7 @@ def main() -> None:
         dry_run=args.dry_run,
         enable_dashboard=not args.no_dashboard,
         dashboard_port=args.dashboard_port,
+        dashboard_host=args.dashboard_host or None,
         open_browser=args.open_browser,
     )
 
