@@ -2,7 +2,11 @@
 
 import unittest
 from unittest.mock import MagicMock
-from trading_system.data.leveraged_universe import LeveragedUniverse, normalize_quote_to_eur
+from trading_system.data.leveraged_universe import (
+    LeveragedUniverse,
+    format_price_detailed,
+    normalize_quote_to_eur,
+)
 from trading_system.data.trading212_client import Position
 from trading_system.dashboard.server import build_dashboard_data
 
@@ -125,6 +129,59 @@ class TestBrokerPnLSync(unittest.TestCase):
         self.assertEqual(mod["current_price"], 217.98)
         self.assertEqual(mod["pnl_amount_eur"], 1.88)
         self.assertAlmostEqual(mod["pnl_pct"], 0.87, places=2)
+
+    def test_coinbase_pnl_and_currency_sync(self):
+        """Verify Coinbase short (S3CO1l_EQ) displays broker EUR PnL and GBX pence correctly."""
+        mock_client = MagicMock()
+        mock_client.get_account_cash.return_value = MagicMock(total=10000.0)
+        mock_client.get_orders.return_value = []
+        mock_client.get_portfolio.return_value = [
+            Position(
+                ticker="S3CO1l_EQ",
+                quantity=41.0,
+                average_price=1940.5,
+                current_price=1940.3,
+                ppl=-1.13,
+                max_buy=100.0,
+                max_sell=41.0,
+                currency="GBX",
+            )
+        ]
+
+        data = build_dashboard_data(force=True, client=mock_client)
+        signals = {s["ticker"]: s for s in data["active_signals"]}
+
+        self.assertIn("S3CO1l_EQ", signals)
+        coin = signals["S3CO1l_EQ"]
+        self.assertEqual(coin["currency_code"], "GBX")
+        self.assertEqual(coin["currency_suffix"], "p")
+        self.assertEqual(coin["currency_prefix"], "")
+        self.assertEqual(coin["entry_price"], 1940.5)
+        self.assertEqual(coin["current_price"], 1940.3)
+        self.assertEqual(coin["quantity"], 41.0)
+        # Broker P&L in EUR must be -€1.13
+        self.assertEqual(coin["pnl_amount_eur"], -1.13)
+        # Percentage must be -0.12% on EUR cost basis (~957.91 EUR)
+        self.assertAlmostEqual(coin["pnl_pct"], -0.12, places=2)
+        # Native pence P&L must be -8.20p
+        self.assertAlmostEqual(coin["pnl_amount"], -8.20, places=2)
+
+    def test_format_price_detailed(self):
+        """Verify dual formatting of prices for GBX, USD, EUR, and GBP."""
+        # GBX
+        gbx_str = format_price_detailed(1940.5, "GBX")
+        self.assertIn("1940.50p", gbx_str)
+        self.assertIn("£19.41", gbx_str)
+        self.assertIn("€23.36", gbx_str)
+
+        # USD
+        usd_str = format_price_detailed(150.5, "USD")
+        self.assertIn("$150.50", usd_str)
+        self.assertIn("€138.71", usd_str)
+
+        # EUR
+        eur_str = format_price_detailed(216.1, "EUR")
+        self.assertEqual(eur_str, "€216.10")
 
 
 if __name__ == "__main__":

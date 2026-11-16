@@ -453,6 +453,41 @@
     return `${sign}${prefix || ""}${absStr}${suffix || ""}`;
   }
 
+  function formatPriceWithCurrency(px, curCode, prefix, suffix, opts = {}) {
+    const num = Number(px);
+    if (!Number.isFinite(num) || num <= 0) return "—";
+    const code = (curCode || (suffix === "p" ? "GBX" : (prefix === "$" ? "USD" : "EUR"))).toUpperCase();
+    const compact = Boolean(opts.compact);
+
+    if (code === "GBX" || suffix === "p") {
+      const gbp = num / 100.0;
+      const eur = gbp * 1.204;
+      const penceStr = formatNumber(num, 2) + "p";
+      const gbpStr = "£" + formatNumber(gbp, 2);
+      if (compact) {
+        return `${penceStr} (${gbpStr})`;
+      }
+      return `${penceStr} (${gbpStr} • ≈ €${formatNumber(eur, 2)})`;
+    }
+
+    if (code === "USD" || prefix === "$") {
+      const eur = num / 1.085;
+      const usdStr = "$" + formatNumber(num, 2);
+      if (compact) {
+        return `${usdStr} (≈ €${formatNumber(eur, 2)})`;
+      }
+      return `${usdStr} (≈ €${formatNumber(eur, 2)})`;
+    }
+
+    if (code === "GBP" || prefix === "£") {
+      const eur = num * 1.204;
+      const gbpStr = "£" + formatNumber(num, 2);
+      return `${gbpStr} (≈ €${formatNumber(eur, 2)})`;
+    }
+
+    return `€${formatNumber(num, 2)}`;
+  }
+
   function valuesEqual(a, b) {
     if (Array.isArray(a) && Array.isArray(b)) {
       if (a.length !== b.length) return false;
@@ -3396,7 +3431,7 @@
     const lev = s.leverage || (s.ticker && String(s.ticker).includes("5") ? 5 : 3);
     const prefix = s.currency_prefix !== undefined && s.currency_prefix !== null ? s.currency_prefix : "€";
     const suffix = s.currency_suffix || "";
-    const curCode = s.currency_code || "EUR";
+    const curCode = (s.currency_code || (suffix === "p" ? "GBX" : (prefix === "$" ? "USD" : "EUR"))).toUpperCase();
     const remQty = Number(s.remaining_quantity !== undefined ? s.remaining_quantity : (s.quantity || 0));
     const entryPx = Number(s.entry_price || 0);
     const curPx = Number(s.current_price || entryPx);
@@ -3453,7 +3488,24 @@
       );
     }
 
-    const pnlStyle = pnlPct > 0 ? "color:var(--emerald)" : (pnlPct < 0 ? "color:var(--rose)" : "");
+    const pnlStyle = pnlEur > 0 ? "color:var(--emerald)" : (pnlEur < 0 ? "color:var(--rose)" : "");
+    const eurSign = pnlEur > 0 ? "+" : (pnlEur < 0 ? "-" : "");
+    const eurFormatted = `${eurSign}€${Math.abs(pnlEur).toFixed(2)}`;
+    const pctFormatted = `(${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`;
+
+    let posValueStr = `${remQty.toFixed(2)} shs`;
+    if (curCode === "GBX" || suffix === "p") {
+      const totalGbp = (remQty * curPx) / 100.0;
+      const totalEur = totalGbp * 1.204;
+      posValueStr = `${remQty.toFixed(2)} shs • £${formatNumber(totalGbp, 2)} (≈ €${formatNumber(totalEur, 2)})`;
+    } else if (curCode === "USD" || prefix === "$") {
+      const totalUsd = remQty * curPx;
+      const totalEur = totalUsd / 1.085;
+      posValueStr = `${remQty.toFixed(2)} shs • $${formatNumber(totalUsd, 2)} (≈ €${formatNumber(totalEur, 2)})`;
+    } else if (curCode === "EUR") {
+      const totalEur = remQty * curPx;
+      posValueStr = `${remQty.toFixed(2)} shs • €${formatNumber(totalEur, 2)}`;
+    }
 
     return el(
       "article",
@@ -3469,7 +3521,7 @@
             "div",
             null,
             el("div", { style: "font-weight:800;font-size:1rem", text: s.name || s.underlying || s.ticker }),
-            el("div", { className: "wb-mono wb-muted", style: "font-size:0.75rem", text: `${s.ticker} • ${curCode}` })
+            el("div", { className: "wb-mono wb-muted", style: "font-size:0.75rem", text: `${s.ticker} • ${curCode === "GBX" ? "GBX (London Pence • 100p = £1)" : curCode}` })
           ),
           el("div", { className: "wb-pill-row" }, badges)
         ),
@@ -3482,24 +3534,29 @@
           el(
             "div",
             { style: "display:flex;justify-content:space-between;align-items:baseline;gap:0.5rem" },
-            el("div", { className: "wb-mono", style: `font-weight:800;font-size:1.1rem;${pnlStyle}`, text: `${formatCurrencyAmount(pnlAmt, prefix, suffix)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)` }),
-            el("div", { className: "wb-mono wb-muted", style: "font-size:0.75rem", text: `${remQty.toFixed(2)} shs` })
+            el("div", { className: "wb-mono", style: `font-weight:800;font-size:1.15rem;${pnlStyle}`, text: `${eurFormatted} ${pctFormatted}` }),
+            el("div", { className: "wb-mono wb-muted", style: "font-size:0.75rem", text: posValueStr })
           ),
           curCode !== "EUR"
-            ? el("div", { className: "wb-mono wb-muted", style: "font-size:0.74rem", text: `≈ €${pnlEur.toFixed(2)}` })
+            ? el(
+                "div",
+                { className: "wb-mono wb-muted", style: "font-size:0.74rem;margin-top:0.25rem;display:flex;justify-content:space-between" },
+                el("span", { text: "Native Broker P&L:" }),
+                el("span", { style: `font-weight:600;${pnlAmt > 0 ? "color:var(--emerald)" : (pnlAmt < 0 ? "color:var(--rose)" : "")}`, text: formatCurrencyAmount(pnlAmt, prefix, suffix) })
+              )
             : null,
           el(
             "div",
-            { className: "wb-mono wb-muted", style: "font-size:0.74rem;margin-top:0.35rem;display:flex;justify-content:space-between" },
-            el("span", { text: `Entry: ${formatCurrencyAmount(entryPx, prefix, suffix)}` }),
-            el("span", { text: `Live: ${formatCurrencyAmount(curPx, prefix, suffix)}` })
+            { className: "wb-mono wb-muted", style: "font-size:0.74rem;margin-top:0.35rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:0.25rem" },
+            el("span", { text: `Entry: ${formatPriceWithCurrency(entryPx, curCode, prefix, suffix, { compact: true })}` }),
+            el("span", { text: `Live: ${formatPriceWithCurrency(curPx, curCode, prefix, suffix, { compact: true })}` })
           )
         ),
         el(
           "div",
           { className: "wb-pos-rows", style: "margin-top:0.65rem" },
-          el("div", { className: "wb-pos-row" }, el("span", { text: "Stop Loss (SL)" }), el("span", { className: "wb-mono", text: formatCurrencyAmount(s.stop_loss || 0, prefix, suffix) })),
-          el("div", { className: "wb-pos-row" }, el("span", { text: "Trailing Stop (TSL)" }), el("span", { className: "wb-mono", text: `${formatCurrencyAmount(s.trailing_stop_loss || s.stop_loss || 0, prefix, suffix)} (${s.tsl_status || "Active"})` })),
+          el("div", { className: "wb-pos-row" }, el("span", { text: "Stop Loss (SL)" }), el("span", { className: "wb-mono", text: formatPriceWithCurrency(s.stop_loss || 0, curCode, prefix, suffix, { compact: false }) })),
+          el("div", { className: "wb-pos-row" }, el("span", { text: "Trailing Stop (TSL)" }), el("span", { className: "wb-mono", text: `${formatPriceWithCurrency(s.trailing_stop_loss || s.stop_loss || 0, curCode, prefix, suffix, { compact: false })} (${s.tsl_status || "Active"})` })),
           el("div", { className: "wb-pos-row" }, el("span", { text: "Broker GTC Stop" }), el("span", { className: "wb-mono", text: s.broker_stop_order_id ? `#${s.broker_stop_order_id}` : "Unverified / Missing" }))
         )
       ),

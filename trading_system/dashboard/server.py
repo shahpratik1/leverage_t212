@@ -50,6 +50,7 @@ from trading_system.data.leveraged_universe import (
     CURATED_3X_PAIRS,
     GBX_TICKERS,
     LeveragedUniverse,
+    format_price_detailed,
     get_currency_display,
     get_etp_direction,
     get_ticker_currency,
@@ -315,13 +316,10 @@ def load_active_signals(
                 pnl_amount = 0.0
 
             # Convert native pnl_amount to EUR
-            pnl_amount_eur = pnl_amount
-            if curr == "GBX" or ticker in GBX_TICKERS or (curr == "GBP" and (entry > 500 or current_price > 500)):
-                pnl_amount_eur = (pnl_amount / 100.0) * 1.204
-            elif curr == "GBP":
-                pnl_amount_eur = pnl_amount * 1.204
-            elif curr == "USD":
-                pnl_amount_eur = pnl_amount / 1.08
+            pnl_amount_eur = normalize_quote_to_eur(ticker, pnl_amount, curr)
+            cost_basis_eur = normalize_quote_to_eur(ticker, entry, curr) * remaining_quantity
+            if cost_basis_eur > 0:
+                pnl_pct = (pnl_amount_eur / cost_basis_eur) * 100.0
 
             # Calculate risk & reward percentages
             risk_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0.0
@@ -429,10 +427,10 @@ def load_active_signals(
                 "copy_text": (
                     f"STRATEGY: {strategy_type.upper()} ({win_rate_exp} Win-Rate)\n"
                     f"ACTION: {direction} {ticker} (Underlying: {underlying})\n"
-                    f"ENTRY: {currency_prefix}{entry:.2f}{currency_suffix}\n"
-                    f"CURRENT: {currency_prefix}{current_price:.2f}{currency_suffix} ({pnl_pct:+.2f}%)\n"
-                    f"STOP LOSS: {currency_prefix}{sl:.2f}{currency_suffix} (-{risk_pct:.2f}%)\n"
-                    f"ACTIVE TSL: {currency_prefix}{tsl:.2f}{currency_suffix} ({tsl_status})\n"
+                    f"ENTRY: {format_price_detailed(entry, curr)}\n"
+                    f"CURRENT: {format_price_detailed(current_price, curr)} ({pnl_pct:+.2f}% • ≈ €{pnl_amount_eur:+.2f})\n"
+                    f"STOP LOSS: {format_price_detailed(sl, curr)} (-{risk_pct:.2f}%)\n"
+                    f"ACTIVE TSL: {format_price_detailed(tsl, curr)} ({tsl_status})\n"
                     f"DECAY ENVELOPE: {decay_label}\n"
                     f"{stop_broker_line}"
                     f"QUANTITY: {remaining_quantity:.2f} / {original_quantity:.2f} shares (100% Ride)\n"
@@ -1066,7 +1064,11 @@ def build_dashboard_data(
                     entry = float(s.get("entry_price") or bp_avg)
                     cur_px = float(s.get("current_price") or bp_cur or entry)
                     rem_qty = float(s.get("remaining_quantity") or bp_qty or 1.0)
-                    curr = s.get("currency_code") or (universe.get_ticker_currency(tk) if universe else get_ticker_currency(tk))
+                    curr = universe.get_ticker_currency(tk) if universe else get_ticker_currency(tk)
+                    currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
+                    s["currency_code"] = currency_code
+                    s["currency_prefix"] = currency_prefix
+                    s["currency_suffix"] = currency_suffix
 
                     if getattr(bp_obj, "ppl", None) is not None:
                         ppl_val = float(bp_obj.ppl)

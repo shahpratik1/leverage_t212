@@ -1470,7 +1470,7 @@ CURRENCY_ALTERNATIVES: Dict[str, Dict[str, Tuple[Optional[str], Optional[str]]]]
     "SPCX": {"EUR": ("ELONm_EQ", "S3PXd_EQ"), "USD": ("ELONl_EQ", "3SPSl_EQ")},
     "META": {"EUR": ("3LFEl_EQ", "3SFEl_EQ"), "USD": ("3LFEl_EQ", "3SFPl_EQ")},
     "NFLX": {"EUR": ("3NFEl_EQ", "3SNEl_EQ"), "USD": ("NFL3l_EQ", "3SNFl_EQ")},
-    "COIN": {"EUR": ("3LCOm_EQ", "S3CO1l_EQ"), "USD": ("3LCOOl_EQ", "S3CO1l_EQ")},
+    "COIN": {"EUR": ("3LCOm_EQ", "S3CO1l_EQ"), "USD": ("3LCOOl_EQ", "CO3S1l_EQ"), "GBX": ("3CONl_EQ", "S3CO1l_EQ")},
     "BA": {"EUR": ("3BAEl_EQ", "BAESl_EQ"), "USD": ("BA3l_EQ", "BASl_EQ")},
     "UBER": {"EUR": ("3LUEl_EQ", "SUBEl_EQ"), "USD": ("3LUBl_EQ", "SUBEl_EQ")},
     "BABA": {"EUR": ("3BBEl_EQ", "3SBEl_EQ"), "USD": ("3BABl_EQ", "BA3Sl_EQ")},
@@ -1990,6 +1990,30 @@ def format_price(price: float, currency: str = "EUR") -> str:
     """
     _, prefix, suffix = get_currency_display(currency)
     return f"{prefix}{price:.2f}{suffix}"
+
+
+def format_price_detailed(price: float, currency: str = "EUR") -> str:
+    """Format a numeric price with dual currency equivalents for GBX/USD.
+
+    Examples:
+        format_price_detailed(1940.5, 'GBX') -> '1940.50p (£19.41 • ≈ €23.36)'
+        format_price_detailed(150.5, 'USD')  -> '$150.50 (≈ €138.71)'
+        format_price_detailed(216.1, 'EUR')  -> '€216.10'
+    """
+    if price == 0.0:
+        return "—"
+    c = (currency or "").upper().strip()
+    if c == "GBX":
+        gbp = price / 100.0
+        eur = gbp * 1.204
+        return f"{price:.2f}p (£{gbp:.2f} • ≈ €{eur:.2f})"
+    elif c == "USD":
+        eur = price / 1.085
+        return f"${price:.2f} (≈ €{eur:.2f})"
+    elif c == "GBP":
+        eur = price * 1.204
+        return f"£{price:.2f} (≈ €{eur:.2f})"
+    return f"€{price:.2f}"
 
 
 _DEFAULT_UNIVERSE: Optional[LeveragedUniverse] = None

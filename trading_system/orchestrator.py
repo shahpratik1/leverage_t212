@@ -43,6 +43,7 @@ from trading_system.config_schema import (
 from trading_system.dashboard.auth import sanitize_mapping
 from trading_system.data.leveraged_universe import (
     LeveragedUniverse,
+    get_currency_display,
     get_ticker_currency,
     normalize_quote_to_eur,
 )
@@ -724,8 +725,7 @@ class Orchestrator:
             tsl = float(pos.get("trailing_stop_loss") or sl)
 
             currency_code = get_ticker_currency(ticker)
-            currency_prefix = "€" if currency_code == "EUR" else ("$" if currency_code == "USD" else "")
-            currency_suffix = "p" if currency_code == "GBX" else (" £" if currency_code == "GBP" else "")
+            currency_code, currency_prefix, currency_suffix = get_currency_display(currency_code)
 
             bp_ppl = (bp.get("ppl") if isinstance(bp, Mapping) else getattr(bp, "ppl", None)) if bp else None
             if bp_ppl is not None:
@@ -872,8 +872,7 @@ class Orchestrator:
                 sl_dist = round(b_avg * 0.05, 4)
                 sl = round(max(0.01, b_avg - sl_dist), 4)
                 currency_code = get_ticker_currency(b_ticker)
-                currency_prefix = "€" if currency_code == "EUR" else ("$" if currency_code == "USD" else "")
-                currency_suffix = "p" if currency_code == "GBX" else (" £" if currency_code == "GBP" else "")
+                currency_code, currency_prefix, currency_suffix = get_currency_display(currency_code)
 
                 b_ppl = (b_pos.get("ppl") if isinstance(b_pos, Mapping) else getattr(b_pos, "ppl", None))
                 if b_ppl is not None:
