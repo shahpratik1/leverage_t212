@@ -53,6 +53,7 @@ from trading_system.data.leveraged_universe import (
     get_currency_display,
     get_etp_direction,
     get_ticker_currency,
+    normalize_quote_to_eur,
 )
 from trading_system.data.trading212_client import Trading212Client
 from trading_system.execution.position_monitor import (
@@ -1050,8 +1051,35 @@ def build_dashboard_data(
                 tk = s.get("ticker")
                 if tk in broker_positions_map:
                     bp_obj = broker_positions_map[tk]
+                    bp_avg = float(getattr(bp_obj, "average_price", 0.0) or 0.0)
+                    bp_cur = float(getattr(bp_obj, "current_price", 0.0) or 0.0)
+                    bp_qty = float(getattr(bp_obj, "quantity", 0.0) or 0.0)
+
+                    if bp_avg > 0:
+                        s["entry_price"] = round(bp_avg, 4 if bp_avg < 10 else 2)
+                    if bp_cur > 0:
+                        s["current_price"] = round(bp_cur, 4 if bp_cur < 10 else 2)
+                    if bp_qty > 0:
+                        s["quantity"] = bp_qty
+                        s["remaining_quantity"] = bp_qty
+
+                    entry = float(s.get("entry_price") or bp_avg)
+                    cur_px = float(s.get("current_price") or bp_cur or entry)
+                    rem_qty = float(s.get("remaining_quantity") or bp_qty or 1.0)
+                    curr = s.get("currency_code") or (universe.get_ticker_currency(tk) if universe else get_ticker_currency(tk))
+
                     if getattr(bp_obj, "ppl", None) is not None:
-                        s["pnl_amount_eur"] = round(float(bp_obj.ppl), 2)
+                        ppl_val = float(bp_obj.ppl)
+                        s["pnl_amount_eur"] = round(ppl_val, 2)
+                        cost_basis_eur = normalize_quote_to_eur(tk, entry, curr) * rem_qty
+                        if cost_basis_eur > 0:
+                            s["pnl_pct"] = round((ppl_val / cost_basis_eur) * 100.0, 2)
+                        elif entry > 0:
+                            s["pnl_pct"] = round(((cur_px - entry) / entry * 100.0), 2)
+                    elif entry > 0:
+                        s["pnl_pct"] = round(((cur_px - entry) / entry * 100.0), 2)
+
+                    s["pnl_amount"] = round((cur_px - entry) * rem_qty, 2)
 
             known_tickers = {s.get("ticker") for s in active_signals}
             for b_ticker, bp in broker_positions_map.items():
@@ -1077,12 +1105,21 @@ def build_dashboard_data(
                 cur_px = bp.current_price if getattr(bp, "current_price", 0.0) > 0 else avg_px
                 sl_dist = round(avg_px * 0.05, 2)
                 sl = round(max(0.01, avg_px - sl_dist), 2)
-                pnl_pct = ((cur_px - avg_px) / avg_px * 100.0) if avg_px > 0 else 0.0
-                pnl_amount = round((cur_px - avg_px) * bp.quantity, 2)
-                pnl_amount_eur = round(float(getattr(bp, "ppl", 0.0) or 0.0), 2)
 
                 curr = universe.get_ticker_currency(b_ticker) if universe else get_ticker_currency(b_ticker)
                 currency_code, currency_prefix, currency_suffix = get_currency_display(curr)
+
+                ppl_val = float(getattr(bp, "ppl", 0.0) or 0.0)
+                cost_basis_eur = normalize_quote_to_eur(b_ticker, avg_px, curr) * bp.quantity
+                if getattr(bp, "ppl", None) is not None and cost_basis_eur > 0:
+                    pnl_pct = round((ppl_val / cost_basis_eur) * 100.0, 2)
+                elif avg_px > 0:
+                    pnl_pct = round(((cur_px - avg_px) / avg_px * 100.0), 2)
+                else:
+                    pnl_pct = 0.0
+
+                pnl_amount = round((cur_px - avg_px) * bp.quantity, 2)
+                pnl_amount_eur = round(ppl_val, 2)
 
                 active_signals.append(
                     {

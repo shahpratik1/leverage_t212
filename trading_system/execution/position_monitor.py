@@ -2234,33 +2234,39 @@ class PositionMonitor:
                                     setattr(pos, "nixtla_5d_target", float(m["nixtla_5d_target"]))
                                     setattr(pos, "nixtla_expected_return_pct", float(m.get("nixtla_expected_return_pct", 0.0)))
 
-                        # Detect and fix entry-price currency scale mismatch (e.g. GBX pence stored vs EUR)
+                        # Detect and fix entry-price currency scale mismatch or fill price drift
                         broker_avg = getattr(bp, "average_price", 0.0) or 0.0
-                        if broker_avg > 0 and pos.entry_price > 0:
-                            ratio = pos.entry_price / broker_avg
-                            if ratio > 5.0 or ratio < 0.20:
-                                logger.warning(
-                                    "Entry price scale mismatch for %s: stored=%.4f broker_avg=%.4f (ratio=%.1f×). "
-                                    "Recalibrating position levels to broker average price.",
-                                    ticker, pos.entry_price, broker_avg, ratio,
-                                )
-                                levels = self.calculate_exit_levels(
-                                    entry_price=broker_avg,
-                                    direction=pos.direction,
-                                    existing_stop_price=pos.stop_loss if (0.2 < (pos.stop_loss / broker_avg) < 5.0) else None,
-                                    ticker=ticker,
-                                    config_snapshot=self._resolve_position_snapshot(pos),
-                                )
+                        if broker_avg > 0:
+                            if abs(pos.entry_price - broker_avg) > 1e-4:
+                                ratio = pos.entry_price / broker_avg if broker_avg > 0 else 1.0
+                                if ratio > 1.20 or ratio < 0.80:
+                                    logger.warning(
+                                        "Entry price scale mismatch for %s: stored=%.4f broker_avg=%.4f (ratio=%.2f×). "
+                                        "Recalibrating position levels to broker average price.",
+                                        ticker, pos.entry_price, broker_avg, ratio,
+                                    )
+                                    levels = self.calculate_exit_levels(
+                                        entry_price=broker_avg,
+                                        direction=pos.direction,
+                                        existing_stop_price=pos.stop_loss if (0.2 < (pos.stop_loss / broker_avg) < 5.0) else None,
+                                        ticker=ticker,
+                                        config_snapshot=self._resolve_position_snapshot(pos),
+                                    )
+                                    pos.stop_loss = levels["stop_loss"]
+                                    pos.trailing_stop_loss = levels["trailing_stop_loss"]
+                                    pos.tp1 = levels["tp1"]
+                                    pos.tp2 = levels["tp2"]
+                                    pos.tp3 = levels["tp3"]
+                                    pos.atr = levels["atr"]
+                                    pos.highest_price = cur_px if cur_px > 0 else broker_avg
+                                    pos.lowest_price = cur_px if cur_px > 0 else broker_avg
+                                    pos.scale_calibrated = True
+                                else:
+                                    logger.info(
+                                        "Synchronized entry price for %s: %.4f -> %.4f (broker average)",
+                                        ticker, pos.entry_price, broker_avg,
+                                    )
                                 pos.entry_price = broker_avg
-                                pos.stop_loss = levels["stop_loss"]
-                                pos.trailing_stop_loss = levels["trailing_stop_loss"]
-                                pos.tp1 = levels["tp1"]
-                                pos.tp2 = levels["tp2"]
-                                pos.tp3 = levels["tp3"]
-                                pos.atr = levels["atr"]
-                                pos.highest_price = cur_px if cur_px > 0 else broker_avg
-                                pos.lowest_price = cur_px if cur_px > 0 else broker_avg
-                                pos.scale_calibrated = True
                                 state_changed = True
 
                         # Link native stop order from broker if missing or unlinked

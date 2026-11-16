@@ -1826,15 +1826,19 @@ class LeveragedUniverse:
 
     @staticmethod
     def normalize_quote_to_eur(ticker: str, price: float, currency: Optional[str] = None) -> float:
-        """Convert a quoted instrument price to base EUR currency.
+        """Convert a quoted instrument price or P&L amount to base EUR currency.
 
         - If quoted in GBX (pence), ticker in GBX_TICKERS, or price > 500 in GBP:
           Divides by 100.0 to convert pence -> GBP, then multiplies by benchmark FX rate 1.204 (GBP->EUR).
         - If quoted in USD: Converts using benchmark rate (1.0 / 1.085 ≈ 0.9217 EUR/USD).
         - If quoted in EUR: Returns price unchanged.
+        - Preserves negative signs for P&L conversions.
         """
-        if price <= 0:
+        if price == 0.0:
             return 0.0
+
+        sign = -1.0 if price < 0.0 else 1.0
+        abs_price = abs(price)
 
         c = (currency or "").upper().strip()
         clean_ticker = (ticker or "").strip()
@@ -1845,27 +1849,27 @@ class LeveragedUniverse:
         is_pence = (
             c == "GBX"
             or (clean_ticker and clean_ticker in GBX_TICKERS)
-            or (c == "GBP" and price > 500.0)
-            or (clean_ticker and clean_ticker.endswith(".L") and price > 500.0)
+            or (c == "GBP" and abs_price > 500.0)
+            or (clean_ticker and clean_ticker.endswith(".L") and abs_price > 500.0)
         )
 
         if is_pence:
-            price_gbp = price / 100.0
+            price_gbp = abs_price / 100.0
             c = "GBP"
         else:
-            price_gbp = price
+            price_gbp = abs_price
 
         benchmark_gbp_eur = 1.204
         benchmark_eur_usd = 1.085
 
         if c in ("GBP", "GBX"):
-            return round(price_gbp * benchmark_gbp_eur, 4)
+            return sign * round(price_gbp * benchmark_gbp_eur, 4)
         elif c == "USD":
-            return round(price / benchmark_eur_usd, 4)
+            return sign * round(abs_price / benchmark_eur_usd, 4)
         else:
             if is_pence:
-                return round(price_gbp * benchmark_gbp_eur, 4)
-            return round(price, 4)
+                return sign * round(price_gbp * benchmark_gbp_eur, 4)
+            return sign * round(abs_price, 4)
 
 
 # ── Authoritative Currency Resolution for Trading 212 Instruments ──────────────

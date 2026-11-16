@@ -694,6 +694,7 @@ class Orchestrator:
         pos_rows: List[Tuple[str, Dict[str, Any]]],
         cached_prices: Mapping[str, float],
         cfg_snap: ConfigSnapshot,
+        broker_positions_map: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Build enriched active_signals, positions_behind_epoch, and unprotected_positions lists."""
         active_epoch_id = cfg_snap.config_epoch_id
@@ -710,10 +711,15 @@ class Orchestrator:
             auth_dir = self.leveraged_universe.get_etp_direction(ticker)
             direction = auth_dir if auth_dir else ("SHORT" if "SHORT" in raw_dir or "SELL" in raw_dir else "LONG")
 
-            entry = float(pos.get("entry_price") or 0.0)
-            cur_px = float(cached_prices.get(ticker) or pos.get("current_price") or entry)
-            orig_qty = float(pos.get("original_quantity") or 0.0)
-            rem_qty = float(pos.get("remaining_quantity") or 0.0)
+            bp = broker_positions_map.get(ticker) if broker_positions_map else None
+            bp_avg = float((bp.get("average_price") if isinstance(bp, Mapping) else getattr(bp, "average_price", 0.0)) or 0.0) if bp else 0.0
+            bp_cur = float((bp.get("current_price") if isinstance(bp, Mapping) else getattr(bp, "current_price", 0.0)) or 0.0) if bp else 0.0
+            bp_qty = float((bp.get("quantity") if isinstance(bp, Mapping) else getattr(bp, "quantity", 0.0)) or 0.0) if bp else 0.0
+
+            entry = bp_avg if bp_avg > 0 else float(pos.get("entry_price") or 0.0)
+            cur_px = bp_cur if bp_cur > 0 else float(cached_prices.get(ticker) or pos.get("current_price") or entry)
+            orig_qty = bp_qty if bp_qty > 0 else float(pos.get("original_quantity") or 0.0)
+            rem_qty = bp_qty if bp_qty > 0 else float(pos.get("remaining_quantity") or 0.0)
             sl = float(pos.get("stop_loss") or 0.0)
             tsl = float(pos.get("trailing_stop_loss") or sl)
 
@@ -721,9 +727,21 @@ class Orchestrator:
             currency_prefix = "€" if currency_code == "EUR" else ("$" if currency_code == "USD" else "")
             currency_suffix = "p" if currency_code == "GBX" else (" £" if currency_code == "GBP" else "")
 
-            pnl_pct = ((cur_px - entry) / entry * 100.0) if entry > 0 else 0.0
-            pnl_amount = (cur_px - entry) * rem_qty
-            pnl_amount_eur = normalize_quote_to_eur(ticker, pnl_amount, currency_code)
+            bp_ppl = (bp.get("ppl") if isinstance(bp, Mapping) else getattr(bp, "ppl", None)) if bp else None
+            if bp_ppl is not None:
+                pnl_amount_eur = round(float(bp_ppl), 2)
+                cost_basis_eur = normalize_quote_to_eur(ticker, entry, currency_code) * rem_qty
+                if cost_basis_eur > 0:
+                    pnl_pct = round((pnl_amount_eur / cost_basis_eur) * 100.0, 2)
+                elif entry > 0:
+                    pnl_pct = round(((cur_px - entry) / entry * 100.0), 2)
+                else:
+                    pnl_pct = 0.0
+                pnl_amount = round((cur_px - entry) * rem_qty, 2)
+            else:
+                pnl_pct = ((cur_px - entry) / entry * 100.0) if entry > 0 else 0.0
+                pnl_amount = (cur_px - entry) * rem_qty
+                pnl_amount_eur = normalize_quote_to_eur(ticker, pnl_amount, currency_code)
 
             risk_pct = ((entry - sl) / entry * 100.0) if entry > 0 and sl > 0 else 0.0
             broker_stop_id = pos.get("broker_stop_order_id")
@@ -829,6 +847,87 @@ class Orchestrator:
                     "remaining_quantity": rem_qty,
                 })
 
+        # Adopt any live broker positions not currently tracked in local rows
+        known_tickers = {s.get("ticker") for s in signals}
+        if broker_positions_map:
+            for b_ticker, b_pos in broker_positions_map.items():
+                if b_ticker in known_tickers:
+                    continue
+                pair = self.leveraged_universe.get_pair_for_etp(b_ticker)
+                underlying = (
+                    pair.underlying_symbol
+                    if pair
+                    else b_ticker.replace("l_EQ", "").replace("_US_EQ", "")
+                )
+                underlying_name = pair.name if pair else underlying
+                direction = (
+                    self.leveraged_universe.get_etp_direction(b_ticker)
+                    or "LONG"
+                )
+                b_avg = float((b_pos.get("average_price") if isinstance(b_pos, Mapping) else getattr(b_pos, "average_price", 0.0)) or 0.0)
+                b_cur = float((b_pos.get("current_price") if isinstance(b_pos, Mapping) else getattr(b_pos, "current_price", 0.0)) or b_avg)
+                b_qty = float((b_pos.get("quantity") if isinstance(b_pos, Mapping) else getattr(b_pos, "quantity", 0.0)) or 0.0)
+                if b_qty <= 0:
+                    continue
+                sl_dist = round(b_avg * 0.05, 4)
+                sl = round(max(0.01, b_avg - sl_dist), 4)
+                currency_code = get_ticker_currency(b_ticker)
+                currency_prefix = "€" if currency_code == "EUR" else ("$" if currency_code == "USD" else "")
+                currency_suffix = "p" if currency_code == "GBX" else (" £" if currency_code == "GBP" else "")
+
+                b_ppl = (b_pos.get("ppl") if isinstance(b_pos, Mapping) else getattr(b_pos, "ppl", None))
+                if b_ppl is not None:
+                    pnl_amount_eur = round(float(b_ppl), 2)
+                    cost_basis_eur = normalize_quote_to_eur(b_ticker, b_avg, currency_code) * b_qty
+                    pnl_pct = round((pnl_amount_eur / cost_basis_eur) * 100.0, 2) if cost_basis_eur > 0 else 0.0
+                else:
+                    pnl_amount_eur = normalize_quote_to_eur(b_ticker, (b_cur - b_avg) * b_qty, currency_code)
+                    pnl_pct = round(((b_cur - b_avg) / b_avg * 100.0), 2) if b_avg > 0 else 0.0
+                pnl_amount = round((b_cur - b_avg) * b_qty, 2)
+
+                signals.append({
+                    "ticker": b_ticker,
+                    "underlying": underlying,
+                    "name": underlying_name,
+                    "direction": direction,
+                    "leverage": 5 if ("5" in b_ticker) else 3,
+                    "entry_price": round(b_avg, 4),
+                    "current_price": round(b_cur, 4),
+                    "pnl_pct": pnl_pct,
+                    "pnl_amount": pnl_amount,
+                    "pnl_amount_eur": pnl_amount_eur,
+                    "currency_code": currency_code,
+                    "currency_prefix": currency_prefix,
+                    "currency_suffix": currency_suffix,
+                    "stop_loss": sl,
+                    "trailing_stop_loss": sl,
+                    "tp1": round(b_avg * 1.05, 4),
+                    "tp2": round(b_avg * 1.10, 4),
+                    "tp3": round(b_avg * 1.15, 4),
+                    "highest_price": round(b_cur, 4),
+                    "lowest_price": round(b_cur, 4),
+                    "tsl_status": "Initial Stop Active",
+                    "session_count": 1,
+                    "is_runner": False,
+                    "decay_multiplier": 2.2,
+                    "decay_label": "Session 1 (2.20x ATR)",
+                    "stop_distance_pct": 5.0,
+                    "broker_stop_order_id": None,
+                    "broker_tp_order_id": None,
+                    "quantity": b_qty,
+                    "remaining_quantity": b_qty,
+                    "status": "ACTIVE (Broker Placed)",
+                    "entry_time": datetime.now(timezone.utc).isoformat(),
+                    "atr": round(b_avg * 0.025, 4),
+                    "earnings_in_days": None,
+                    "config_epoch_id": active_epoch_id,
+                    "position_epoch_id": active_epoch_id,
+                    "pure_tsl_mode": cfg_snap.PURE_TSL_MODE,
+                    "is_behind_epoch": False,
+                    "panic_failed": False,
+                    "unprotected_reason": None,
+                })
+
         return signals, behind_epoch, unprotected
 
     def _build_pairs_watchlist_snapshot(self, cfg_snap: ConfigSnapshot) -> Tuple[List[Dict[str, Any]], str, Dict[str, int]]:
@@ -881,16 +980,20 @@ class Orchestrator:
 
         cached_broker, rate_telemetry = self._get_cached_broker_view()
         cached_prices: Dict[str, float] = {}
+        broker_positions_map: Dict[str, Any] = {}
         for p in (cached_broker.get("portfolio") or []):
-            if isinstance(p, Mapping):
-                tk = str(p.get("ticker") or "")
-                px = float(p.get("current_price") or p.get("average_price") or 0.0)
-                if tk and px > 0:
+            tk = str((p.get("ticker") if isinstance(p, Mapping) else getattr(p, "ticker", "")) or "")
+            if tk:
+                broker_positions_map[tk] = p
+                px = float((p.get("current_price") if isinstance(p, Mapping) else getattr(p, "current_price", 0.0)) or 0.0)
+                if px <= 0:
+                    px = float((p.get("average_price") if isinstance(p, Mapping) else getattr(p, "average_price", 0.0)) or 0.0)
+                if px > 0:
                     cached_prices[tk] = px
 
         is_halted, pos_rows = self._snapshot_positions_under_lock()
         active_signals, positions_behind_epoch, unprotected_positions = self._build_active_signals_snapshot(
-            pos_rows, cached_prices, cfg_snap
+            pos_rows, cached_prices, cfg_snap, broker_positions_map=broker_positions_map
         )
         pairs_watchlist, eur_ratio, currency_mix = self._build_pairs_watchlist_snapshot(cfg_snap)
 
