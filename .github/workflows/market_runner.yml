@@ -1,0 +1,123 @@
+name: Trading 212 Market Hours Live Runner
+
+on:
+  schedule:
+    # ── London Stock Exchange (08:00 - 16:30 UTC / 09:00 - 17:30 CET, Mon-Fri) ──
+    # Morning Session: 08:00 UTC (runs 270 mins = 4.5 hours until 12:30 UTC)
+    - cron: '0 8 * * 1-5'
+    # Afternoon Session: 12:30 UTC (runs 245 mins = ~4 hours until 16:35 UTC market close)
+    - cron: '30 12 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Duration in minutes to run the engine (max 350 for GitHub Actions)'
+        required: true
+        default: '270'
+        type: string
+      dry_run:
+        description: 'Run in paper-trade / dry-run mode'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  run-market-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: 📥 Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r trading_system/requirements.txt
+
+      - name: 🌐 Install Cloudflare Quick Tunnel
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: 🚀 Start Cloudflare Tunnel & Extract Live Dashboard URL
+        id: tunnel
+        run: |
+          nohup cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cloudflared.log 2>&1 &
+          sleep 5
+          TUNNEL_URL=""
+          for i in {1..12}; do
+            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+          
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            echo "### 📊 Live Trading Dashboard" >> $GITHUB_STEP_SUMMARY
+            echo "Access your live signals and control workbench anywhere (phone/desktop):" >> $GITHUB_STEP_SUMMARY
+            echo "👉 **[Open Live Dashboard]($TUNNEL_URL)** (\`$TUNNEL_URL\`)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "=========================================================="
+            echo "🎉 LIVE DASHBOARD ONLINE AT: $TUNNEL_URL"
+            echo "=========================================================="
+          else
+            echo "⚠️ Could not extract Cloudflare tunnel URL; logs:"
+            cat /tmp/cloudflared.log || true
+          fi
+
+      - name: 📈 Execute Quantitative Leveraged Trading Engine
+        env:
+          TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
+          TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
+          USE_LIVE: ${{ secrets.USE_LIVE || 'true' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DASHBOARD_HOST: '0.0.0.0'
+          DASHBOARD_PORT: '8080'
+          LIVE_DASHBOARD_PUBLIC_URL: ${{ env.TUNNEL_URL }}
+        run: |
+          DURATION="${{ inputs.duration_minutes || '270' }}"
+          DRY_RUN_FLAG=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          
+          echo "Starting engine with duration: ${DURATION}m (DryRun: ${DRY_RUN_FLAG:-false})"
+          python3 -m trading_system.orchestrator \
+            --interval 5 \
+            --monitor-interval 10 \
+            --dashboard-port 8080 \
+            --dashboard-host 0.0.0.0 \
+            --duration-minutes "$DURATION" \
+            $DRY_RUN_FLAG
+
+      - name: 💾 Synchronize Active Trades State to Repository
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Market Runner"
+          git pull origin main --rebase || true
+          git add active_trades.json trades.jsonl data/ 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(state): persist active trades from market runner [skip ci]"
+            git push origin main
+            echo "✅ Successfully synced active trades and logs back to main."
+          else
+            echo "ℹ️ No changes in active trades or logs to persist."
+          fi

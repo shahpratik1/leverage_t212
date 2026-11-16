@@ -441,6 +441,10 @@ class TestHTTPSecurityValidators(unittest.TestCase):
             self.assertFalse(is_valid_host_header("custom-pi.lan.evil.com"))
             self.assertFalse(is_valid_host_header("0.0.0.0:8080"))
 
+        self.assertTrue(is_valid_host_header("abc-123.trycloudflare.com"))
+        self.assertTrue(is_valid_host_header("abc-123.trycloudflare.com:443"))
+        self.assertFalse(is_valid_host_header("trycloudflare.com"))
+
         self.assertTrue(
             is_valid_origin_header("http://trading212-pi:8080", "trading212-pi:8080")
         )

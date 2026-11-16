@@ -475,6 +475,9 @@ class Orchestrator:
                 self.dashboard_thread, self.dashboard_server, self.dashboard_url = start_local_server_thread(
                     **srv_kwargs
                 )
+                pub_url = os.environ.get("LIVE_DASHBOARD_PUBLIC_URL", "").strip()
+                if pub_url:
+                    self.dashboard_url = pub_url
             except Exception as exc:
                 logger.warning("Failed to start embedded dashboard server: %s", exc)
 
@@ -3124,7 +3127,12 @@ class Orchestrator:
 
         return events
 
-    def run_loop(self, scan_interval_minutes: int = 5, monitor_interval_seconds: int = 30) -> None:
+    def run_loop(
+        self,
+        scan_interval_minutes: int = 5,
+        monitor_interval_seconds: int = 30,
+        duration_minutes: Optional[int] = None,
+    ) -> None:
         """Run continuous engine loop.
 
         Prioritizes Active Trade Management on high-frequency intervals:
@@ -3134,14 +3142,23 @@ class Orchestrator:
         - Decouples 120-asset universe scan into background worker so active trades are never starved.
         """
         logger.info(
-            "Starting continuous Active-Trade engine (Scan Interval: %dm, Monitor Interval: %ds). Press Ctrl+C to stop.",
-            scan_interval_minutes, monitor_interval_seconds
+            "Starting continuous Active-Trade engine (Scan Interval: %dm, Monitor Interval: %ds, Duration: %s). Press Ctrl+C to stop.",
+            scan_interval_minutes,
+            monitor_interval_seconds,
+            f"{duration_minutes}m" if duration_minutes else "indefinite",
         )
         last_scan_time = 0.0
+        loop_start_time = time.time()
 
         while True:
             try:
                 now = time.time()
+                if duration_minutes and duration_minutes > 0 and (now - loop_start_time >= duration_minutes * 60):
+                    logger.info(
+                        "Session duration reached (%d minutes) — shutting down loop cleanly.",
+                        duration_minutes,
+                    )
+                    break
                 now_utc = datetime.now(timezone.utc)
                 snap = self.config_bus.active_snapshot()
 
@@ -3256,6 +3273,7 @@ def main() -> None:
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the embedded local signals dashboard web server")
     parser.add_argument("--dashboard-port", type=int, default=settings.DASHBOARD_PORT, help=f"Port for embedded dashboard server (default: {settings.DASHBOARD_PORT})")
     parser.add_argument("--dashboard-host", type=str, default=getattr(settings, "DASHBOARD_HOST", ""), help="Host to bind embedded dashboard server (default: system LAN default)")
+    parser.add_argument("--duration-minutes", type=int, default=0, help="Optional duration in minutes to run before clean shutdown (default: 0 = run indefinitely)")
     parser.add_argument("--open-browser", action="store_true", help="Automatically open dashboard in default browser on startup")
     parser.add_argument("--test-notifications", action="store_true", help="Dispatch test alerts for all 7 event types (BUY, SELL, TP1, TP2, TP3, SL, TSL)")
     parser.add_argument("--backtest", action="store_true", help="Run historical strategy backtest simulator and benchmark report")
@@ -3358,6 +3376,7 @@ def main() -> None:
             engine.run_loop(
                 scan_interval_minutes=args.interval,
                 monitor_interval_seconds=args.monitor_interval,
+                duration_minutes=args.duration_minutes or None,
             )
     finally:
         engine.shutdown()

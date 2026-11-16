@@ -375,6 +375,8 @@ def _parse_and_validate_host(host_header: Optional[str]) -> Optional[Tuple[str, 
         return (host_norm, port)
     if host_norm.endswith(".local") and len(labels) >= 2:
         return (host_norm, port)
+    if host_norm.endswith(".trycloudflare.com") and len(labels) >= 3:
+        return (host_norm, port)
     if host_norm.endswith(".fritz.box") and len(labels) >= 3:
         return (host_norm, port)
     local_hostname = _local_machine_hostname()
