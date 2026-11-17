@@ -102,7 +102,8 @@ jobs:
           DASHBOARD_PORT: '8080'
           LIVE_DASHBOARD_PUBLIC_URL: ${{ env.TUNNEL_URL }}
         run: |
-          DURATION="${{ inputs.duration_minutes || '270' }}"
+          # Morning session: 270m (08:00 - 12:30 UTC), Afternoon session: 245m (12:30 - 16:35 UTC)
+          DURATION="${{ inputs.duration_minutes || (github.event.schedule == '30 12 * * 1-5' && '245') || '270' }}"
           DRY_RUN_FLAG=""
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             DRY_RUN_FLAG="--dry-run"
