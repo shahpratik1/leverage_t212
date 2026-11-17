@@ -1581,6 +1581,24 @@ class MarketDataProvider:
     _CANDLE_CACHE: Dict[str, Tuple[float, Any]] = {}
     _EARNINGS_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
 
+    YAHOO_TRANSLATIONS: Dict[str, str] = {
+        "COFF": "KC=F",
+        "WEAT": "ZW=F",
+        "BUND": "IS0L.DE",
+        "3GIL": "GLTY.L",
+        "MBG": "MBG.DE",
+        "BAE": "BA.L",
+        "RR": "RR.L",
+        "SHEL": "SHEL.L",
+        "AZN": "AZN.L",
+        "BTP": "IITB.MI",
+        "SILV": "SIL",
+        "BLC": "BLOK",
+        "DFNS": "ITA",
+        "CRWV": "NVDA",
+        "SPCX": "RKLB",
+    }
+
     @classmethod
     def get_company_fundamentals(cls, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
         """Legacy stub for company fundamentals."""
@@ -2017,24 +2035,7 @@ class MarketDataProvider:
                 return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
 
         clean_upper = symbol.upper().strip()
-        yahoo_translations = {
-            "COFF": "KC=F",
-            "WEAT": "ZW=F",
-            "BUND": "DBR.DE",
-            "3GIL": "GLTY.L",
-            "MBG": "MBG.DE",
-            "BAE": "BA.L",
-            "RR": "RR.L",
-            "SHEL": "SHEL.L",
-            "AZN": "AZN.L",
-            "BTP": "EUNV.DE",
-            "SILV": "SIL",
-            "BLC": "BLOK",
-            "DFNS": "ITA",
-            "CRWV": "NVDA",
-            "SPCX": "RKLB",
-        }
-        query_sym = yahoo_translations.get(clean_upper, symbol)
+        query_sym = MarketDataProvider.YAHOO_TRANSLATIONS.get(clean_upper, symbol)
 
         # ── Fast-path: Check persistent CandleDatabase ──
         fetch_period = period
@@ -2197,24 +2198,7 @@ class MarketDataProvider:
                 return val.copy() if hasattr(val, "copy") else [dict(x) for x in val]
 
         clean_upper = symbol.upper().strip()
-        yahoo_translations = {
-            "COFF": "KC=F",
-            "WEAT": "ZW=F",
-            "BUND": "DBR.DE",
-            "3GIL": "GLTY.L",
-            "MBG": "MBG.DE",
-            "BAE": "BA.L",
-            "RR": "RR.L",
-            "SHEL": "SHEL.L",
-            "AZN": "AZN.L",
-            "BTP": "EUNV.DE",
-            "SILV": "SIL",
-            "BLC": "BLOK",
-            "DFNS": "ITA",
-            "CRWV": "NVDA",
-            "SPCX": "RKLB",
-        }
-        query_sym = yahoo_translations.get(clean_upper, symbol)
+        query_sym = MarketDataProvider.YAHOO_TRANSLATIONS.get(clean_upper, symbol)
 
         # ── Fast-path: Check persistent CandleDatabase ──
         fetch_period = period
