@@ -1,15 +1,11 @@
 """Orchestrator — 3x Leveraged Long & Short Quantitative Engine.
 
-Main Execution Pipeline:
-1. Data Ingestion: Ingests OHLCV for liquid 3x underlying assets (Indices, Tech Giants, Commodities).
-2. Quantitative Pre-Filtering: Scans universe metrics for directional trend candidates with DMI polarity gating and multi-timeframe EMA slope filtering,
-   rejecting choppy consolidation (ADX < 18) to prevent volatility decay.
-3. System 2 Deliberation: Deliberative multi-agent debate (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter) & Risk Manager compute position sizing, ATR Stop Loss, and 100% Pure Trailing Stop Loss.
-4. Automated Execution & Notifications: Places market entry orders on Trading 212 and dispatches
-   real-time multi-channel alerts (Console, Desktop, Telegram, Discord, JSONL) for:
-   BUY, SELL, SL, and TSL.
-5. Continuous Position Monitor: Tracks live positions, ratchets pure Trailing Stop Loss, synchronizes broker GTC stops,
-   and closes stopped-out trades.
+Deterministic 5-Step Execution Pipeline:
+1. Market Check: Validates Trading 212 broker connectivity, account cash, and circuit breakers.
+2. Ingest Candles: Ingests live 15m/1d OHLCV bars, computing VWAP, ATR, and momentum indicators.
+3. Strategy Screen: Evaluates universe candidates against active quantitative strategy rules.
+4. Risk Sizing & Protection: Direct quantitative risk sizing, ATR stops, and leverage configuration.
+5. Order Route / Standby: Dispatches market entry orders to Trading 212 or enters standby mode.
 """
 
 from __future__ import annotations
@@ -1901,7 +1897,7 @@ class Orchestrator:
         account_equity: Optional[float] = None,
         config_snapshot: Optional[ConfigSnapshot] = None,
     ) -> Optional[DecisionCard]:
-        """Perform multi-agent debate and map candidate to exact leveraged execution ETP."""
+        """Perform quantitative sizing and map candidate to exact leveraged execution ETP."""
         snap = config_snapshot or self.config_bus.active_snapshot()
         underlying = candidate.ticker
         metrics = candidate.metrics
@@ -3043,7 +3039,7 @@ class Orchestrator:
             logger.warning("Broker order reconciliation warning: %s", exc)
 
     def run_cycle(self) -> List[DecisionCard]:
-        """Execute one complete Scan → Filter → Debate → Execute cycle."""
+        """Execute one complete 5-step deterministic scan and execution cycle."""
         cycle_id = f"cycle-{int(time.time())}"
         self._current_cycle_id = cycle_id
         self._broadcast_pipeline_progress(

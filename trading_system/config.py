@@ -698,11 +698,6 @@ class Settings:
         if invariant_errors:
             raise ValueError(invariant_errors[0]["message"])
 
-        if not self.OPENAI_API_KEY and not require_openai:
-            logger.warning(
-                "OPENAI_API_KEY is not set. System 2 LLM debate will fall back to rule-based analysis."
-            )
-
 
 def atomic_write_text(target_path: Union[str, Path], content: str) -> None:
     """Write text atomically using a thread-unique temp file, flush, fsync, and os.replace."""

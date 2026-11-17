@@ -1,7 +1,7 @@
 ---
 id: refactor-system-optimization-and-obsidian-dashboard
 title: "Refactor: Full-System Optimization, Pure 5-Step Quantitative Engine & Modern Obsidian Trading Terminal"
-status: proposed
+status: completed
 author: Antigravity
 date: 2026-11-13
 tier: deep
@@ -259,12 +259,12 @@ flowchart TD
 
 ## Definition of Done
 
-- [ ] `DebateEngine`, `TechnicalAgent`, `FundamentalAgent`, `evaluate_3rsi.py`, and dormant providers (`NixtlaProvider`, `OlostepProvider`, `FinnhubProvider`) are completely excised.
-- [ ] Pipeline is streamlined to 5 deterministic steps (`Market Check` ➔ `Ingest Candles` ➔ `Strategy Screen` ➔ `Risk Sizing` ➔ `Order Route`).
-- [ ] `RiskManager` sizes positions directly from strategy signals without debate wrappers.
-- [ ] Configuration schemas are pruned of obsolete and unused keys.
-- [ ] Dashboard is transformed into the Modern Obsidian Trading Terminal with a 3-section Command Deck and slide-over settings drawer.
-- [ ] Jargon (raw epoch commit hashes, quarantine warnings) is removed from the primary UI.
-- [ ] Zero Trading 212 API quota consumed on telemetry broadcasts.
-- [ ] Core execution mechanics (Trading 212 orders, TSL ratcheting, native GTC stops, 16:20 UTC cutoff) remain 100% intact.
-- [ ] All unit tests and E2E tests pass.
+- [x] `DebateEngine`, `TechnicalAgent`, `FundamentalAgent`, `evaluate_3rsi.py`, and dormant providers (`NixtlaProvider`, `OlostepProvider`, `FinnhubProvider`) are completely excised.
+- [x] Pipeline is streamlined to 5 deterministic steps (`Market Check` ➔ `Ingest Candles` ➔ `Strategy Screen` ➔ `Risk Sizing` ➔ `Order Route`).
+- [x] `RiskManager` sizes positions directly from strategy signals without debate wrappers.
+- [x] Configuration schemas are pruned of obsolete and unused keys.
+- [x] Dashboard is transformed into the Modern Obsidian Trading Terminal with a 3-section Command Deck and slide-over settings drawer.
+- [x] Jargon (raw epoch commit hashes, quarantine warnings) is removed from the primary UI.
+- [x] Zero Trading 212 API quota consumed on telemetry broadcasts.
+- [x] Core execution mechanics (Trading 212 orders, TSL ratcheting, native GTC stops, 16:20 UTC cutoff) remain 100% intact.
+- [x] All unit tests and E2E tests pass.
