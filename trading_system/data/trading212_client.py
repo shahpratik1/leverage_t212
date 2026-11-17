@@ -38,6 +38,8 @@ try:
     import pandas as pd
     import yfinance as yf
     HAS_DATA_LIBS = True
+    # Silence noisy yfinance HTTP scrapers/quoteSummary 404 logs on ETFs and non-equities
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 except ImportError:
     np = None
     pd = None
@@ -1580,6 +1582,15 @@ class MarketDataProvider:
     SYNTHETIC_TICKERS: set = set()
     _CANDLE_CACHE: Dict[str, Tuple[float, Any]] = {}
     _EARNINGS_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
+    # Non-equity symbols (ETFs, benchmarks, indices, commodities, bonds, crypto) that do not have corporate earnings
+    _NON_EQUITY_SYMBOLS: set = {
+        "QQQ", "SPY", "SOXX", "SMH", "MAGS", "FXI", "^GDAXI", "^FTSE",
+        "^STOXX50E", "^FCHI", "FTSEMIB.MI", "EWY", "EWJ", "INDA", "VT",
+        "EWT", "ARKK", "GDX", "BOTZ", "CIBR", "DFNS", "SPCX", "URA",
+        "URNM", "KWEB", "XLF", "XLE", "XLV", "XLI", "GLD", "SLV",
+        "USO", "BNO", "UNG", "COFF", "WEAT", "HG=F", "SILV", "TLT",
+        "BUND", "BTP", "3GIL", "BLC", "BTC-USD", "ETH-USD", "GBPUSD=X",
+    }
 
     @classmethod
     def get_company_fundamentals(cls, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
@@ -1618,11 +1629,9 @@ class MarketDataProvider:
         if not clean:
             return None
 
-        # Fast exit for indices, commodities, currencies, cryptos
-        if any(clean.startswith(p) for p in [
-            "^", "EUR", "GBP", "BTC", "ETH", "SOL", "XRP", "ADA",
-            "GLD", "SLV", "USO", "UNG", "BUND", "TLT", "COFF", "WEAT",
-            "XLF", "XLE", "XLV", "XLI", "SMH", "SOXX", "QQQ", "SPY"
+        # Fast exit for indices, commodities, currencies, cryptos, and ETFs (no corporate earnings)
+        if clean in cls._NON_EQUITY_SYMBOLS or any(clean.startswith(p) for p in [
+            "^", "EUR", "GBP", "BTC", "ETH", "SOL", "XRP", "ADA", "USD"
         ]):
             return None
 
@@ -1686,14 +1695,23 @@ class MarketDataProvider:
             ask = float(meta.get("ask", 0.0) or 0.0)
             bid = float(meta.get("bid", 0.0) or 0.0)
 
-            # Try yfinance info if bid/ask missing from chart meta
+            # Try yfinance fast_info or info if bid/ask missing from chart meta
             if (not ask or not bid or ask <= bid) and HAS_DATA_LIBS and yf is not None:
                 try:
-                    yf_info = yf.Ticker(clean).info or {}
-                    yf_ask = float(yf_info.get("ask", 0.0) or 0.0)
-                    yf_bid = float(yf_info.get("bid", 0.0) or 0.0)
-                    if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
-                        ask, bid = yf_ask, yf_bid
+                    t = yf.Ticker(clean)
+                    fast_info = getattr(t, "fast_info", None)
+                    if fast_info is not None:
+                        yf_ask = float(getattr(fast_info, "ask", 0.0) or 0.0)
+                        yf_bid = float(getattr(fast_info, "bid", 0.0) or 0.0)
+                        if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
+                            ask, bid = yf_ask, yf_bid
+                    # Only query heavy .info for non-ETF single stocks (ETFs lack quoteSummary fundamentals)
+                    if (not ask or not bid or ask <= bid) and clean not in cls._NON_EQUITY_SYMBOLS:
+                        yf_info = t.info or {}
+                        yf_ask = float(yf_info.get("ask", 0.0) or 0.0)
+                        yf_bid = float(yf_info.get("bid", 0.0) or 0.0)
+                        if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
+                            ask, bid = yf_ask, yf_bid
                 except Exception:
                     pass
 

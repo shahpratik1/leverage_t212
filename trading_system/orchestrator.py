@@ -237,6 +237,8 @@ class Orchestrator:
         data_dir: Optional[Path | str] = None,
     ) -> None:
         self.dry_run = dry_run
+        # Silence noisy yfinance HTTP scraper/404 logs on non-equity universe tickers
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
         is_testing = _is_unittest_process()
         if dry_run or is_testing:
             settings.validate(required_keys=[])
@@ -3357,6 +3359,8 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    # Silence noisy third-party loggers (e.g. yfinance HTTP 404s on ETFs without fundamentals)
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
     parser = argparse.ArgumentParser(description="3x Leveraged Long/Short Quantitative Trading Engine")
     parser.add_argument("--once", action="store_true", help="Run a single scan & execution cycle and exit")
