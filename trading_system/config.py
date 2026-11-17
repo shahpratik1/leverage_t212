@@ -363,7 +363,10 @@ class Settings:
     SPECULATIVE_CONFIDENCE_THRESHOLD: float = 0.70
 
     # Market Data API keys
+    FMP_API_KEY: str = ""
+    TIINGO_API_KEY: str = ""
     POLYGON_API_KEY: str = ""
+    ALPHA_VANTAGE_API_KEY: str = ""
     FINNHUB_API_KEY: str = ""
     OLOSTEP_API_KEY: str = ""
     NIXTLA_API_KEY: str = ""
@@ -479,7 +482,10 @@ class Settings:
             "TRADING212_API_KEY",
             "TRADING212_API_SECRET",
             "OPENAI_API_KEY",
+            "FMP_API_KEY",
+            "TIINGO_API_KEY",
             "POLYGON_API_KEY",
+            "ALPHA_VANTAGE_API_KEY",
             "FINNHUB_API_KEY",
             "OLOSTEP_API_KEY",
             "NIXTLA_API_KEY",

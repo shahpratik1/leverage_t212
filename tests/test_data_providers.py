@@ -33,6 +33,14 @@ class TestMarketDataProvider(unittest.TestCase):
         self.assertNotIn("TEST", MarketDataProvider._CANDLE_CACHE)
         self.assertNotIn("TEST", MarketDataProvider._EARNINGS_CACHE)
 
+    def test_non_equity_earnings_skip(self):
+        """Verify non-equity universe tickers (ETFs, indices, commodities) skip earnings calendar without network/404."""
+        for sym in ("ARKK", "GDX", "QQQ", "SPY", "BOTZ", "URA", "GLD", "SLV", "^GDAXI", "BTC-USD"):
+            with patch("trading_system.data.trading212_client.yf") as mock_yf:
+                res = MarketDataProvider.get_days_to_earnings(sym)
+                self.assertIsNone(res)
+                mock_yf.Ticker.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

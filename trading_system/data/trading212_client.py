@@ -1580,6 +1580,15 @@ class MarketDataProvider:
     SYNTHETIC_TICKERS: set = set()
     _CANDLE_CACHE: Dict[str, Tuple[float, Any]] = {}
     _EARNINGS_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
+    # Non-equity symbols (ETFs, benchmarks, indices, commodities, bonds, crypto) that do not have corporate earnings
+    _NON_EQUITY_SYMBOLS: set = {
+        "QQQ", "SPY", "SOXX", "SMH", "MAGS", "FXI", "^GDAXI", "^FTSE",
+        "^STOXX50E", "^FCHI", "FTSEMIB.MI", "EWY", "EWJ", "INDA", "VT",
+        "EWT", "ARKK", "GDX", "BOTZ", "CIBR", "DFNS", "SPCX", "URA",
+        "URNM", "KWEB", "XLF", "XLE", "XLV", "XLI", "GLD", "SLV",
+        "USO", "BNO", "UNG", "COFF", "WEAT", "HG=F", "SILV", "TLT",
+        "BUND", "BTP", "3GIL", "BLC", "BTC-USD", "ETH-USD", "GBPUSD=X",
+    }
 
     YAHOO_TRANSLATIONS: Dict[str, str] = {
         "COFF": "KC=F",
@@ -1636,11 +1645,9 @@ class MarketDataProvider:
         if not clean:
             return None
 
-        # Fast exit for indices, commodities, currencies, cryptos
-        if any(clean.startswith(p) for p in [
-            "^", "EUR", "GBP", "BTC", "ETH", "SOL", "XRP", "ADA",
-            "GLD", "SLV", "USO", "UNG", "BUND", "TLT", "COFF", "WEAT",
-            "XLF", "XLE", "XLV", "XLI", "SMH", "SOXX", "QQQ", "SPY"
+        # Fast exit for indices, commodities, currencies, cryptos, and ETFs (no corporate earnings)
+        if clean in cls._NON_EQUITY_SYMBOLS or any(clean.startswith(p) for p in [
+            "^", "EUR", "GBP", "BTC", "ETH", "SOL", "XRP", "ADA", "USD"
         ]):
             return None
 
@@ -1651,7 +1658,18 @@ class MarketDataProvider:
                 return val
 
         days: Optional[float] = None
-        if HAS_DATA_LIBS and yf is not None:
+
+        # 1. Try managed MultiProviderRouter earnings calendar (FMP -> Alpha Vantage)
+        try:
+            from trading_system.config import settings
+            from trading_system.data.multi_provider import MultiProviderRouter
+            router = MultiProviderRouter.get_instance()
+            days = router.get_earnings_days_cascade(clean, settings)
+        except Exception as mp_err:
+            logger.debug("MultiProviderRouter earnings check failed for %s: %s", clean, mp_err)
+
+        # 2. Try yfinance calendar fallback for single stocks
+        if days is None and HAS_DATA_LIBS and yf is not None:
             try:
                 t = yf.Ticker(clean)
                 cal = getattr(t, "calendar", None)
@@ -1693,7 +1711,18 @@ class MarketDataProvider:
         elif clean.endswith("A_EQ"):
             clean = clean[:-4] + ".AS"
 
-        # 1. Try Yahoo Finance chart meta quote
+        # 1. Try managed MultiProviderRouter quote (FMP -> Tiingo)
+        try:
+            from trading_system.config import settings
+            from trading_system.data.multi_provider import MultiProviderRouter
+            router = MultiProviderRouter.get_instance()
+            managed_quote = router.get_quote_cascade(clean, settings)
+            if managed_quote and managed_quote.get("bid", 0.0) > 0 and managed_quote.get("ask", 0.0) > 0:
+                return managed_quote
+        except Exception as mp_err:
+            logger.debug("MultiProviderRouter quote check failed for %s: %s", clean, mp_err)
+
+        # 2. Try Yahoo Finance chart meta quote
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{clean}?range=1d&interval=1m"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
@@ -1704,14 +1733,23 @@ class MarketDataProvider:
             ask = float(meta.get("ask", 0.0) or 0.0)
             bid = float(meta.get("bid", 0.0) or 0.0)
 
-            # Try yfinance info if bid/ask missing from chart meta
+            # Try yfinance fast_info or info if bid/ask missing from chart meta
             if (not ask or not bid or ask <= bid) and HAS_DATA_LIBS and yf is not None:
                 try:
-                    yf_info = yf.Ticker(clean).info or {}
-                    yf_ask = float(yf_info.get("ask", 0.0) or 0.0)
-                    yf_bid = float(yf_info.get("bid", 0.0) or 0.0)
-                    if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
-                        ask, bid = yf_ask, yf_bid
+                    t = yf.Ticker(clean)
+                    fast_info = getattr(t, "fast_info", None)
+                    if fast_info is not None:
+                        yf_ask = float(getattr(fast_info, "ask", 0.0) or 0.0)
+                        yf_bid = float(getattr(fast_info, "bid", 0.0) or 0.0)
+                        if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
+                            ask, bid = yf_ask, yf_bid
+                    # Only query heavy .info for non-ETF single stocks (ETFs lack quoteSummary fundamentals)
+                    if (not ask or not bid or ask <= bid) and clean not in cls._NON_EQUITY_SYMBOLS:
+                        yf_info = t.info or {}
+                        yf_ask = float(yf_info.get("ask", 0.0) or 0.0)
+                        yf_bid = float(yf_info.get("bid", 0.0) or 0.0)
+                        if yf_ask > 0 and yf_bid > 0 and yf_ask >= yf_bid:
+                            ask, bid = yf_ask, yf_bid
                 except Exception:
                     pass
 
@@ -2073,8 +2111,40 @@ class MarketDataProvider:
 
         result = None
 
-        # 1. Try yfinance if installed
-        if HAS_DATA_LIBS and yf is not None:
+        # 1. Try managed MultiProviderRouter (FMP -> Tiingo -> Polygon -> Alpha Vantage)
+        try:
+            from trading_system.config import settings
+            from trading_system.data.multi_provider import MultiProviderRouter
+            router = MultiProviderRouter.get_instance()
+            managed_candles = router.get_daily_candles_cascade(query_sym, settings, period=fetch_period)
+            if managed_candles:
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
+                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                result = managed_candles
+        except Exception as mp_err:
+            logger.debug("MultiProviderRouter daily fetch error for %s: %s", query_sym, mp_err)
+
+        # 2. Try raw Yahoo Finance Chart API (keyless)
+        if result is None:
+            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str=fetch_period, interval="1d")
+            if candles:
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
+                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                result = candles
+
+        # 3. Try free institutional Stooq CSV endpoint (keyless)
+        if result is None:
+            candles = MarketDataProvider._fetch_stooq_data(query_sym)
+            if candles:
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
+                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
+                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
+                result = candles
+
+        # 4. Try yfinance if installed (keyless fallback)
+        if result is None and HAS_DATA_LIBS and yf is not None:
             try:
                 ticker = yf.Ticker(query_sym)
                 df = ticker.history(period=fetch_period, interval="1d")
@@ -2090,52 +2160,6 @@ class MarketDataProvider:
                     result = df
             except Exception as yf_exc:
                 logger.debug("yfinance history failed for %s (%s)", query_sym, yf_exc)
-
-        # 2. Try raw Yahoo Finance Chart API
-        if result is None:
-            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str=fetch_period, interval="1d")
-            if candles:
-                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
-                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
-                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                result = candles
-
-        # 3. Try free institutional Stooq CSV endpoint
-        if result is None:
-            candles = MarketDataProvider._fetch_stooq_data(query_sym)
-            if candles:
-                MarketDataProvider.SYNTHETIC_TICKERS.discard(clean_upper)
-                MarketDataProvider.SYNTHETIC_TICKERS.discard(query_sym.upper())
-                MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                result = candles
-
-        # 4. Try Polygon.io if key configured
-        if result is None:
-            try:
-                from trading_system.config import settings
-                poly_key = getattr(settings, "POLYGON_API_KEY", "")
-                if poly_key:
-                    candles = MarketDataProvider._fetch_polygon_data(symbol, poly_key)
-                    if candles:
-                        MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
-                        MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                        result = candles
-            except Exception:
-                pass
-
-        # 5. Try Finnhub if key configured
-        if result is None:
-            try:
-                from trading_system.config import settings
-                finnhub_key = getattr(settings, "FINNHUB_API_KEY", "")
-                if finnhub_key:
-                    candles = MarketDataProvider._fetch_finnhub_data(symbol, finnhub_key)
-                    if candles:
-                        MarketDataProvider.SYNTHETIC_TICKERS.discard(symbol.upper())
-                        MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC = False
-                        result = candles
-            except Exception:
-                pass
 
         # Merge newly fetched candles into CandleDatabase
         if result is not None and not MarketDataProvider.LAST_FETCH_WAS_SYNTHETIC:
@@ -2215,7 +2239,25 @@ class MarketDataProvider:
 
         result = None
 
-        if HAS_DATA_LIBS and yf is not None:
+        # 1. Try managed MultiProviderRouter (FMP -> Polygon)
+        try:
+            from trading_system.config import settings
+            from trading_system.data.multi_provider import MultiProviderRouter
+            router = MultiProviderRouter.get_instance()
+            managed_candles = router.get_hourly_candles_cascade(query_sym, settings, period=fetch_period)
+            if managed_candles:
+                result = managed_candles
+        except Exception as mp_err:
+            logger.debug("MultiProviderRouter hourly fetch error for %s: %s", query_sym, mp_err)
+
+        # 2. Try raw Yahoo Finance Chart API (keyless)
+        if result is None:
+            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str=fetch_period, interval="1h")
+            if candles:
+                result = candles
+
+        # 3. Try yfinance library fallback
+        if result is None and HAS_DATA_LIBS and yf is not None:
             try:
                 ticker = yf.Ticker(query_sym)
                 df = ticker.history(period=fetch_period, interval="1h")
@@ -2228,11 +2270,6 @@ class MarketDataProvider:
                     result = df
             except Exception:
                 pass
-
-        if result is None:
-            candles = MarketDataProvider._fetch_yahoo_chart_data(query_sym, range_str=fetch_period, interval="1h")
-            if candles:
-                result = candles
 
         # Merge newly fetched hourly candles into CandleDatabase
         if result is not None:

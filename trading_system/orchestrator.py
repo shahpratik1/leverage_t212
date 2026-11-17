@@ -3381,22 +3381,18 @@ def main() -> None:
         candles = None
         if not args.dry_run:
             try:
-                import yfinance as yf
-                ticker = yf.Ticker(args.backtest_symbol)
-                hist = ticker.history(period=args.backtest_period)
-                if not hist.empty:
-                    candles = []
-                    for dt, row in hist.iterrows():
-                        candles.append({
-                            "date": dt.strftime("%Y-%m-%d"),
-                            "open": float(row["Open"]),
-                            "high": float(row["High"]),
-                            "low": float(row["Low"]),
-                            "close": float(row["Close"]),
-                            "volume": float(row["Volume"]),
-                        })
+                from trading_system.data.trading212_client import MarketDataProvider
+                raw = MarketDataProvider.get_daily_candles(args.backtest_symbol, period=args.backtest_period)
+                if raw is not None:
+                    if hasattr(raw, "to_dict"):
+                        candles = raw.to_dict(orient="records")
+                        if "date" not in raw.columns and hasattr(raw, "index"):
+                            for idx, rec in enumerate(candles):
+                                rec["date"] = str(raw.index[idx])[:10]
+                    elif isinstance(raw, list):
+                        candles = raw
             except Exception as e:
-                logger.warning("Could not fetch yfinance data for %s: %s", args.backtest_symbol, e)
+                logger.warning("Could not fetch market data for %s: %s", args.backtest_symbol, e)
         if not candles:
             candles = generate_synthetic_candles(args.backtest_symbol, count=160)
 

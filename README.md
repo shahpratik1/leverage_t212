@@ -1,44 +1,15 @@
-# 3x & 5x Leveraged Quantitative Trading System
+# ⚡ Quantitative 3x & 5x Leveraged Trading Engine
 
-[![Tests: 606/606 Passing](https://img.shields.io/badge/Tests-606%2F606%20Passing-emerald)](https://github.com)
-[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
-[![Broker: Trading 212](https://img.shields.io/badge/Broker-Trading%20212%20Invest-indigo)](https://trading212.com)
-[![Strategy: Directional Trend](https://img.shields.io/badge/Strategy-Directional%20Trend-emerald)](docs/architecture.md)
-[![Execution: 100% Pure TSL](https://img.shields.io/badge/Execution-100%25%20Pure%20TSL-teal)](docs/architecture.md)
+[![Tests: 565/565 Passing](https://img.shields.io/badge/Tests-565%2F565%20Passing-emerald?style=for-the-badge&logo=pytest)](https://github.com/shahpratik1/leverage_t212)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python)](https://python.org)
+[![Broker: Trading 212](https://img.shields.io/badge/Broker-Trading%20212%20Invest%20Spot-indigo?style=for-the-badge)](https://trading212.com)
+[![Strategy: Directional Trend](https://img.shields.io/badge/Strategy-Directional%20Trend%20%2B%20DMI-teal?style=for-the-badge)](docs/PROFITABILITY_AND_STRATEGY_GUIDE.md)
+[![Execution: 100% Pure TSL](https://img.shields.io/badge/Execution-Native%20GTC%20Stop%20%2B%20TSL-green?style=for-the-badge)](docs/PROFITABILITY_AND_STRATEGY_GUIDE.md)
+[![Market Data: Multi--Provider](https://img.shields.io/badge/Market%20Data-FMP%20%7C%20Tiingo%20%7C%20Polygon%20%7C%20Yahoo-orange?style=for-the-badge)](docs/PROFITABILITY_AND_STRATEGY_GUIDE.md)
 
-An institutional-grade algorithmic trading system designed specifically for **3x and 5x leveraged Exchange-Traded Products (ETPs)** on **Trading 212**. 
+An institutional-grade quantitative algorithmic trading engine engineered specifically for **3x and 5x leveraged Exchange-Traded Products (ETPs)** on **Trading 212**. 
 
-The system operates on a pure **System 2 Deliberative Multi-Agent Brain** (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter, RiskManager), executing spot orders with crash-resilient native broker stops and a **100% Pure Trailing Stop Loss engine**.
-
----
-
-## 🚀 Key Advantages & Quantitative Edge
-
-1. **Zero CFD Financing or Borrowing Costs**:
-   - Executes both Long and Short market directions via standard spot equity orders on the London Stock Exchange (LSE) using paired **3x Long** and **3x Inverse Short** ETPs (GraniteShares, Leverage Shares, WisdomTree). Eliminates overnight CFD swap/interest fees.
-2. **100% Pure Trailing Stop Loss Engine & Native Broker GTC Protection**:
-   - Automatically posts **native server-side GTC Stop Loss orders** (`POST /equity/orders/stop`) directly to Trading 212 protecting 100% of position quantity.
-   - Eliminates broker order contention (`400 Bad Request: 'Selling more equities than owned'`) by avoiding competing TP limit orders.
-   - Progressively ratchets stops forward: **+1.5% profit $\to$ Breakeven**, **+3.0% profit $\to$ +1.5% Cushion Locked**, and dynamic ATR Chandelier trail in profit zone, allowing 100% of shares to ride the full trend intact.
-3. **Directional Trend Strategy & Dual-Track Bear Shield**:
-   - Automated Directional Movement Index (DMI) polarity gating strictly requires $+DI > -DI$ with $ADX \ge 18.0$ for longs, and $-DI > +DI$ with $ADX \ge 18.0$ for shorts.
-   - Multi-timeframe 20/50 EMA slope hierarchy strictly forbids counter-trend dip buying into sustained sell-offs, completely eliminating falling knife traps.
-   - **Dual-Track Bear Execution**: Broad market indices (`QQQ`, `SPY`, `SMH`) route to 3x Inverse Short ETPs (`QQQS`, `3USS`, `3SES`); single equities route to 100% Cash Defense.
-   - **Pre-Flight Order Queue Reconciliation**: Audits open broker orders at the start of every cycle, cancelling stale market orders (>300s or closed market) and deduplicating in-flight orders.
-   - Verified on benchmark backtesting engine with **Sharpe Ratio 3.40, Profit Factor 6.86, and Win Rate 75.0%**.
-4. **Calculated Risk Gates (Spread, Drift, Auction Buffer & Circuit Breaker)**:
-   - **15-Minute Opening Auction Buffer**: Blocks trade entries during 08:00–08:15 UTC (EU/LSE) and 14:30–14:45 UTC (US) to let opening auctions uncross and spreads normalize, preventing immediate stop-outs.
-   - **Pre-Trade Spread & Drift Gates**: Rejects setups if live broker spread $> 1.00\%$ or overnight price has drifted $> 1.50\%$ from signal generation. Recalibrates entry and stop to live quote when within limits.
-   - **Stop Invariant Gate**: Asserts that protective stops on spot holdings are strictly below current market price and resting bid ($P_{\text{stop}} < P_{\text{bid}}$), eliminating inverted stop liquidations.
-   - **Currency Normalization**: Canonical EUR base conversion divides LSE GBX pence quotes by 100, enforcing a strict 20% max equity cap.
-   - **Daily Circuit Breaker**: Automatically suspends trading for 24h if portfolio daily drawdown breaches $-2.0\%$.
-5. **High-Throughput In-Memory Candle Cache**:
-   - Zero-latency cached market data ingestion eliminates API quota exhaustion and reduces universe screening overhead from seconds to milliseconds.
-6. **16:20 UTC Asymmetric Session Gap Protocol (Winter Time / GMT)**:
-   - Automatically evacuates unhedged trades 10 minutes before the European market close (16:30 UTC), preventing catastrophic gap risk while US benchmark markets continue trading until 21:00 UTC.
-   - Positions with locked breakeven stops qualify for overnight carry.
-7. **Interactive Live Dashboard & 24/7 Raspberry Pi Daemon**:
-   - Zero-dependency web interface (`http://trading212-pi.local:8080`) featuring live broker equity curve, real-time working stop order badges, price monitoring, and 1-click clipboard trade cards.
+Operates a deterministic **5-step quantitative pipeline** with mathematical volatility-decay avoidance, native server-side broker GTC stop protection, progressive trailing stop ratchets, multi-provider rate-limited data feeds, and an automated **1-click GitHub Actions cloud runner**.
 
 ---
 
@@ -46,149 +17,218 @@ The system operates on a pure **System 2 Deliberative Multi-Agent Brain** (Techn
 
 ```mermaid
 flowchart TD
-    subgraph Data & Candidate Pre-Filter
-        U[Curated 3x/5x Pairs\n120+ Assets] -->|Parallel Workers| S[Ingestion Engine & Candle DB]
-        S --> L1[Candidate Pre-Filter & Strategy Engine\nDirectional Trend: DMI Polarity + EMA Slope]
+    subgraph S1["1. Market Check"]
+        B1[Trading 212 Auth & Connectivity] --> B2[Live Account Cash & Equity]
+        B2 --> B3{Daily Drawdown < -2.0%?}
+        B3 -->|Yes| HALT[Circuit Breaker Trip\n24h Entry Halt]
+        B3 -->|No| S2["2. Ingest Candles"]
     end
 
-    subgraph System 2: Deliberative Multi-Agent Brain
-        L1 --> DEEP[Deliberative Multi-Agent Debate\nTechnical + Fundamental + Dialectic Arbiter]
+    subgraph S2["2. Multi-Provider Market Data Ingestion"]
+        MP[MultiProviderRouter\nSliding Rate Limiter & Auto-Cooldown]
+        MP --> P1[FMP]
+        MP --> P2[Tiingo]
+        MP --> P3[Polygon.io]
+        MP --> P4[Alpha Vantage]
+        MP --> P5[Keyless: Direct Yahoo Chart & Stooq CSV]
+        P1 & P2 & P3 & P4 & P5 --> CDB[(Persistent CandleDatabase SQLite)]
     end
 
-    subgraph Risk & Sizing
-        DEEP --> RISK[RiskManager\nVolatility Sizing / GBX Pence Normalization]
-        RISK --> CARD[DecisionCard\nExact Entry, Initial SL, Pure TSL Protocol]
+    subgraph S3["3. Quantitative Strategy Screen"]
+        CDB --> STRAT[Directional Trend & DMI Polarity Screen]
+        STRAT --> DMI{ADX ≥ 18.0 & Polarity?}
+        DMI -->|Choppy / ADX < 18| CASH[Cash Defense\nAvoid Volatility Decay]
+        DMI -->|Trend Confirmed| S4["4. Risk Sizing & Protection"]
     end
 
-    subgraph Broker Execution & Pure TSL
-        CARD --> T212[Trading 212 Client\nPre-Flight Order Queue Reconciliation & Spot Execution]
-        T212 --> STOP[Native Server GTC Stop\n100% Protection #Order_ID]
-        T212 --> MON[PositionMonitor\n100% Pure Trailing Stop Engine]
-        STOP --> MON
+    subgraph S4["4. Risk Sizing & Protection"]
+        S4A[ATR Stop Calculation\nClamped 2.5% to 8.0%]
+        S4B[GBX Pence Normalization\nCanonical EUR/USD Base]
+        S4C[Portfolio Beta Heat Clamp ≤ 6.0]
+        S4A & S4B & S4C --> CARD[Decision Card]
+    end
+
+    subgraph S5["5. Automated Execution & Pure TSL"]
+        CARD --> ROUTE[Trading 212 Order Execution]
+        ROUTE --> GSTOP[Native Server GTC Stop Order\nPOST /equity/orders/stop]
+        GSTOP --> MON[PositionMonitor TSL Engine]
         MON -->|+1.5% Gain| BE[Ratchet Stop to Breakeven]
-        MON -->|+3.0% Gain| CUSH[Ratchet Stop to +1.5% Cushion]
+        MON -->|+3.0% Gain| CUSH[Lock +1.5% Profit Cushion]
         MON -->|Profit Trail| ATR[Dynamic ATR Chandelier Trail]
-        MON -->|16:20 UTC| ASYM[Winter-Time Asymmetric Session Gap Protocol]
+        MON -->|16:20 UTC| ASYM[16:20 UTC Asymmetric Session Gap Evacuation]
     end
 
-    subgraph UI & Telemetry
-        MON --> DASH[Live HTML Dashboard\nhttp://trading212-pi.local:8080]
+    subgraph TELEMETRY["UI & Live Control Plane"]
+        MON --> DASH[Live Web Dashboard & Cloudflare Quick Tunnel]
         MON --> LOGS[trades.jsonl & active_trades.json]
     end
 ```
 
 ---
 
-## ⚡ Quick Start
+## 🚀 The Quantitative Edge: 6 Profitability Pillars
 
-### 1. Prerequisites
-- Python 3.10 or higher
-- Trading 212 Invest account (Demo or Live) with an API key
+### 1. Zero CFD Financing & Borrowing Costs
+- Executes both Long and Short market directions via **spot equity orders on the London Stock Exchange (LSE)** using paired **3x Long** and **3x Inverse Short** ETPs (Leverage Shares, GraniteShares, WisdomTree).
+- Completely eliminates overnight CFD financing swap/borrow fees (saving 8%–15% annualized drag).
 
-### 2. Environment Configuration
-Create a `.env` file in the project root:
+### 2. Mathematical Volatility Decay Neutralization ($ADX \ge 18.0$)
+- In leveraged products, volatility decay is proportional to $L^2 \sigma^2$ (for 3x leverage, decay is 9x higher than 1x underlying).
+- The engine strictly enforces **Directional Movement Index (DMI) polarity**: $+DI > -DI$ with $ADX \ge 18.0$ and positive 20 EMA slope for Longs; $-DI > +DI$ with $ADX \ge 18.0$ and negative 20 EMA slope for Shorts.
+- During sideways chop ($ADX < 18$), the engine automatically retreats to **100% Cash Defense**.
 
-```env
-# Trading 212 API Credentials
-TRADING212_API_KEY=your_api_key_here
-TRADING212_ENV=demo              # 'demo' or 'live'
-TRADING212_BASE_URL=https://demo.trading212.com/api/v0
+### 3. Dual-Track Bear Shield
+- When market indices drop, the engine routes directly to 3x Inverse Short ETPs (`QQQSl_EQ`, `3USSl_EQ`, `3SESl_EQ`) to profit from downturns.
+- Single tech equities route to Cash Defense, preventing dangerous short squeezes on individual high-beta stocks.
 
-# Risk Management
-ACCOUNT_RISK_PER_TRADE=0.005    # 0.5% max risk per trade
-MAX_NOTIONAL_PER_TRADE=0.05     # 5.0% max notional exposure
+### 4. 100% Pure Trailing Stop Loss & Native Broker GTC Stops
+- Immediately places a **server-side native GTC stop order** (`POST /equity/orders/stop`) on Trading 212 protecting 100% of shares.
+- Completely avoids broker order contention (`400 Bad Request: 'Selling more equities than owned'`) by eliminating competing TP limit orders.
+- Progressively ratchets:
+  - **+1.5% Profit** $\to$ Stop moved to **Breakeven** ($0.00\%$ downside risk).
+  - **+3.0% Profit** $\to$ Stop locked at **+1.5% Profit Cushion** (guaranteed winning trade).
+  - **Runner Zone** $\to$ Dynamic ATR Chandelier Trail tracks $P_{\text{high}} - 1.2 \times \text{ATR}$, riding outlier trends to full maturity.
 
-# Session Timing (UTC)
-SESSION_CLOSE_CUTOFF_UTC=16:20
-ENFORCE_INVERSE_INTRADAY_ONLY=true
-ENFORCE_LONG_BREAKEVEN_OVERNIGHT=true
-```
+### 5. 16:20 UTC Asymmetric Session Gap Evacuation
+- European ETP markets close at 16:30 UTC, while US underlying markets continue trading until 21:00 UTC.
+- At 16:20 UTC (10 minutes before London close), unhedged positions that have not reached Breakeven are automatically liquidated, completely eliminating catastrophic overnight gap risk from after-hours US earnings or macro prints.
 
-### 3. Running the Engine
-To start the autonomous scanning and execution loop:
+### 6. Multi-Provider Market Data Waterfall
+- Thread-safe sliding-window rate limiters across **Financial Modeling Prep (FMP)**, **Tiingo**, **Polygon.io**, and **Alpha Vantage**, with zero-config keyless fallbacks to direct **Yahoo Chart API** and **Stooq CSV**.
+- If an API quota is exhausted or returns HTTP 429, the engine automatically enters a cooldown state and cascades to the next provider without stalling the execution scan.
+
+---
+
+## ⚡ 3-Minute Quickstart
+
+### Option A: 1-Click GitHub Actions Cloud Runner (No Server Required!) ⭐ *(Recommended)*
+
+Run the entire system in the cloud for free during London Stock Exchange market hours:
+
+1. Go to your GitHub repository: **Actions** $\to$ **[Trading 212 Market Hours Live Runner](.github/workflows/market_runner.yml)**.
+2. Click **Run workflow** (branch: `main` or your working branch).
+3. Configuration:
+   - **Duration**: `270` minutes (4.5h morning session) or `245` minutes (afternoon session).
+   - **Trade with real money on LIVE account**: Leave **unchecked** for Demo mode; check for Live mode.
+   - **Dry run**: Leave unchecked for active trading.
+4. Click **Run workflow**.
+5. Open the workflow logs to find your public **Cloudflare Live Dashboard URL** (`https://xxx.trycloudflare.com`) to monitor live trades and equity from your phone or desktop.
+
+---
+
+### Option B: Local CLI Runner
+
 ```bash
-python3 -m trading_system.orchestrator
-```
+# 1. Clone repository
+git clone https://github.com/shahpratik1/leverage_t212.git
+cd leverage_t212
 
-### 4. Running the Signals Dashboard
+# 2. Install dependencies
+pip install -r trading_system/requirements.txt
 
-The interactive signals dashboard provides real-time broker equity tracking, active positions, working native GTC stop badges, trade history, and manual execution cards.
+# 3. Configure credentials
+cp .env.example .env
+# Edit .env with your TRADING212_API_KEY and USE_LIVE=false
 
-#### Starting the Standalone Dashboard Server
-```bash
-python3 -m trading_system.dashboard.server --port 8888
-```
-Navigate to `http://localhost:8888/signals_dashboard.html` in your browser.
+# 4. Run in Paper-Trade / Dry-Run mode
+python3 -m trading_system.orchestrator --dry-run
 
-#### Common Dashboard CLI Options
-| Flag | Description | Example |
-|---|---|---|
-| `--port <PORT>` | Set listening port (default: `8888`) | `python3 -m trading_system.dashboard.server --port 8888` |
-| `--host <HOST>` | Bind to a specific network interface | `python3 -m trading_system.dashboard.server --host 127.0.0.1` |
-| `--no-browser` | Run headlessly without auto-opening a browser window | `python3 -m trading_system.dashboard.server --port 8888 --no-browser` |
-| `--print-token` | Print active dashboard auth token to stdout | `python3 -m trading_system.dashboard.server --print-token` |
-| `--token-file <PATH>` | Custom file path for persistent auth token | `python3 -m trading_system.dashboard.server --token-file data/.dashboard_token` |
-| `--generate-only` | Regenerate static `signals_dashboard.html` and exit | `python3 -m trading_system.dashboard.server --generate-only` |
-| `--output <PATH>` | Custom output destination for generated HTML | `python3 -m trading_system.dashboard.server --generate-only --output dashboard.html` |
-
-#### Running Dashboard Embedded with the Orchestrator
-When running the full autonomous engine, the dashboard server runs embedded and enabled by default:
-```bash
-# Run orchestrator with embedded dashboard on port 8888
-python3 -m trading_system.orchestrator --dashboard-port 8888
-
-# Open browser automatically on launch
-python3 -m trading_system.orchestrator --dashboard-port 8888 --open-browser
-
-# Run engine headless without starting the embedded dashboard server
-python3 -m trading_system.orchestrator --no-dashboard
-```
-
-#### Synchronizing Remote Raspberry Pi Dashboard
-If running on a 24/7 dedicated Raspberry Pi runner (`trading-bot.service` on port `8080`):
-- Access directly on your local network: `http://trading212-pi.local:8080/signals_dashboard.html`
-- Sync live dashboard HTML and state files to your local machine:
-  ```bash
-  ./scripts/fetch_live_state.sh
-  ```
-
-### 5. Running the Test Suite
-The codebase includes comprehensive unit tests verifying risk sizing, 3-tier profit taking, the 16:20 UTC session protocol, and broker rate-limiting:
-```bash
-python3 -m unittest discover tests
+# 5. Run live automated trading engine
+python3 -m trading_system.orchestrator --interval 5 --monitor-interval 10
 ```
 
 ---
 
-## 📊 Curated Leveraged Asset Universe
+### Option C: Historical Backtesting Simulator
 
-| Underlying Asset | Category | 3x Long ETP | 3x Inverse ETP | 5x Institutional ETP | Currency |
+Run institutional backtest simulations across historical market data:
+
+```bash
+# Backtest QQQ over 1 year using Directional Trend strategy
+python3 -m trading_system.orchestrator --backtest --backtest-symbol QQQ --backtest-period 1y
+
+# Fast verification backtest using synthetic simulation
+python3 -m trading_system.orchestrator --backtest --dry-run
+```
+
+---
+
+## ⚙️ Environment Configuration (`.env`)
+
+```ini
+# ── Trading 212 API Credentials ──
+TRADING212_API_KEY=your_trading212_api_key_here
+TRADING212_API_SECRET=your_trading212_api_secret_here
+USE_LIVE=false  # Set to 'false' for Demo account; 'true' for Live real money
+
+# ── Optional Multi-Provider Market Data Keys (with Auto-Waterfall) ──
+FMP_API_KEY=your_fmp_key_here            # Financial Modeling Prep (250 req/day free)
+TIINGO_API_KEY=your_tiingo_key_here      # Tiingo (500 req/day, 50/hr free)
+POLYGON_API_KEY=your_polygon_key_here    # Polygon.io (5 req/min free)
+ALPHA_VANTAGE_API_KEY=your_av_key_here   # Alpha Vantage (5 req/min, 25/day free)
+
+# ── Multi-Channel Real-Time Alerts (Optional) ──
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+DISCORD_WEBHOOK_URL=
+OPENAI_API_KEY=
+
+# ── Web Workbench & Control Plane ──
+DASHBOARD_PORT=8080
+DASHBOARD_HOST=0.0.0.0
+```
+
+---
+
+## 📊 Curated 3x & 5x Leveraged Asset Universe
+
+| Underlying Asset | Category | 3x Long ETP | 3x Inverse Short ETP | 5x Institutional ETP | Currency |
 |---|---|---|---|---|---|
-| **QQQ** (Nasdaq 100) | Index | `QQQ3l_EQ` | `QQQSl_EQ` | `QQQ5l_EQ` / `QQ3Sl_EQ` | USD |
-| **SPY** (S&P 500) | Index | `3USLl_EQ` | `3USSl_EQ` | `SP5Yl_EQ` / `SPYSl_EQ` | USD |
-| **NVDA** (NVIDIA) | Tech Equity | `3LNVl_EQ` | `3SNVl_EQ` | *3x Capped (UCITS)* | USD |
-| **TSLA** (Tesla) | Tech Equity | `3LTSl_EQ` | `3STSl_EQ` | *3x Capped (UCITS)* | USD |
-| **AAPL** (Apple) | Tech Equity | `AAP3l_EQ` | `AAPSl_EQ` | *3x Capped (UCITS)* | USD |
-| **MSFT** (Microsoft) | Tech Equity | `MSF3l_EQ` | `MS3Sl_EQ` | *3x Capped (UCITS)* | USD |
-| **TSM** (TSMC) | Global Tech | `3TSMl_EQ` | `STSMl_EQ` | *3x Capped (UCITS)* | GBX / USD |
-| **GLD** (Gold) | Commodity | `3GLEl_EQ` | `GDMSl_EQ` | `GLD5l_EQ` | USD |
-| **SLV** (Silver) | Commodity | `3SLVl_EQ` | `SLVSl_EQ` | *3x Capped* | USD |
-| **USO** (WTI Oil) | Commodity | `WTI3l_EQ` | `SWTOl_EQ` | *3x Capped* | USD |
-| **TLT** (20+ Yr Bond) | Fixed Income | `3TYLl_EQ` | `3TYSl_EQ` | `TLT5l_EQ` / `TL5Sl_EQ` | USD |
+| **QQQ** (Nasdaq 100) | Index | `QQQ3l_EQ` | `QQQSl_EQ` | `QQQ5l_EQ` / `QQ3Sl_EQ` | EUR / USD / GBX |
+| **SPY** (S&P 500) | Index | `3USLl_EQ` | `3USSl_EQ` | `SP5Yl_EQ` / `SPYSl_EQ` | EUR / USD / GBX |
+| **SOXX** (Semiconductors) | Index | `3SEMl_EQ` | `3SESl_EQ` | *3x Capped* | EUR / USD / GBX |
+| **NVDA** (NVIDIA) | Tech Equity | `3LVEl_EQ` / `3LNVl_EQ` | `3SVEl_EQ` / `3SNVl_EQ` | *3x Capped (UCITS)* | EUR / USD / GBX |
+| **TSLA** (Tesla) | Tech Equity | `3LTEl_EQ` / `3LTSl_EQ` | `3STEl_EQ` / `3STSl_EQ` | *3x Capped (UCITS)* | EUR / USD / GBX |
+| **AAPL** (Apple) | Tech Equity | `3APEl_EQ` / `AAP3l_EQ` | `SALEl_EQ` / `AAPSl_EQ` | *3x Capped (UCITS)* | EUR / USD / GBX |
+| **MSFT** (Microsoft) | Tech Equity | `3LMEl_EQ` / `MSF3l_EQ` | `3SMEl_EQ` / `MS3Sl_EQ` | *3x Capped (UCITS)* | EUR / USD / GBX |
+| **AMZN** (Amazon) | Tech Equity | `3LPEl_EQ` / `AMZ3l_EQ` | `3SPEl_EQ` / `AMZSl_EQ` | *3x Capped (UCITS)* | EUR / USD / GBX |
+| **GLD** (Gold) | Commodity | `3GLEl_EQ` / `3GLDl_EQ` | `GDMSl_EQ` | `GLD5l_EQ` | EUR / USD / GBX |
+| **SLV** (Silver) | Commodity | `3SILl_EQ` / `3SLVl_EQ` | `SSLEl_EQ` / `SLVSl_EQ` | *3x Capped* | EUR / USD / GBX |
+| **USO** (WTI Oil) | Commodity | `3OILl_EQ` / `WTI3l_EQ` | `SWTOl_EQ` | *3x Capped* | EUR / USD / GBX |
+| **TLT** (20+ Yr US Treasury) | Fixed Income | `3TYLl_EQ` | `3TYSl_EQ` | `TLT5l_EQ` / `TL5Sl_EQ` | EUR / USD / GBX |
 
-*Note: Under European UCITS concentration limits, single stocks are capped at 3x, while broad market indices, commodities, and government bonds offer 5x leverage.*
-
----
-
-## 📚 In-Depth Documentation
-
-- [System Architecture Blueprint](docs/architecture.md): Deep dive into the deliberative multi-agent cognitive architecture, pure TSL execution, and state persistence.
-- [Operating Manual & Trading 212 SOP](docs/operating-manual.md): Broker API permissions, rate limiting, OCO order emulation, 5x leverage rules, and manual execution SOP.
-- [Connors 3-RSI Strategy Guide](docs/strategy-3rsi.md): Mathematical formulations, parameter calibrations, volatility drag neutralization, and backtest autocorrelation findings.
-- [Domain Concepts Glossary](CONCEPTS.md): Project-wide vocabulary and terminology standards.
+*Under European UCITS regulations, single equities are capped at 3x, while broad market indices, commodities, and sovereign bonds offer up to 5x leverage.*
 
 ---
 
-## 🛡️ License & Disclaimers
+## 🧪 Testing & Verification
 
-This software is for educational, research, and algorithmic trading automation purposes. Leveraged ETPs carry significant risk of capital loss due to compounding volatility drag and intraday market gaps. Never allocate capital you cannot afford to lose.
+The test suite rigorously validates every risk constraint, order routing rule, mathematical stop clamp, and rate limiter across **565 unit tests**:
+
+```bash
+# Run complete test suite
+python3 -m unittest discover tests
+
+# Run multi-provider router tests
+python3 -m unittest tests/test_multi_provider.py
+
+# Run control plane and config tests
+python3 -m unittest tests/test_config_bus.py
+```
+
+---
+
+## 📚 Documentation Index
+
+- 📘 **[Quantitative Edge & Profitability Guide](docs/PROFITABILITY_AND_STRATEGY_GUIDE.md)**: Mathematical breakdown of volatility drag, Schmitt Hysteresis, and the 5 golden rules of leveraged trading.
+- 📐 **[System Architecture Blueprint](docs/architecture.md)**: Deep dive into the 5-step quantitative engine, pure TSL execution, and SQLite state persistence.
+- 📖 **[Operating Manual & SOP](docs/operating-manual.md)**: Broker API keys, rate-limit governance, 5x leverage rules, and manual execution protocols.
+- 📑 **[Domain Concepts Glossary](CONCEPTS.md)**: Mathematical notation and terminology standards.
+
+---
+
+## 🛡️ License & Risk Disclaimer
+
+Distributed under the [MIT License](LICENSE).
+
+*Disclaimer: This software is designed for research, algorithmic education, and automated trading. Leveraged Exchange-Traded Products (ETPs) carry significant risk of capital loss due to intraday volatility compounding and market gap risk. Never allocate capital you cannot afford to lose.*
