@@ -41,11 +41,6 @@ class TestMarketDataProvider(unittest.TestCase):
                 self.assertIsNone(res)
                 mock_yf.Ticker.assert_not_called()
 
-    def test_yfinance_logger_silenced(self):
-        """Verify yfinance logger is suppressed to CRITICAL to avoid noisy 404 logs."""
-        import logging
-        self.assertGreaterEqual(logging.getLogger("yfinance").level, logging.CRITICAL)
-
 
 if __name__ == "__main__":
     unittest.main()

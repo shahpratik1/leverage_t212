@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 
 
 logger = logging.getLogger(__name__)
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 _TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _VALID_SETUP_SCORES = ("unfavorable", "mediocre", "favorable", "exceptional")

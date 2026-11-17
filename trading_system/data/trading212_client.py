@@ -38,8 +38,6 @@ try:
     import pandas as pd
     import yfinance as yf
     HAS_DATA_LIBS = True
-    # Silence noisy yfinance HTTP scrapers/quoteSummary 404 logs on ETFs and non-equities
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 except ImportError:
     np = None
     pd = None
