@@ -20,6 +20,11 @@ on:
         required: false
         default: false
         type: boolean
+      use_live:
+        description: 'Trade with real money on LIVE account (leave unchecked for Demo)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -83,7 +88,7 @@ jobs:
         env:
           TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
           TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
-          USE_LIVE: ${{ secrets.USE_LIVE || 'true' }}
+          USE_LIVE: ${{ inputs.use_live || secrets.USE_LIVE || 'false' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -98,7 +103,26 @@ jobs:
             DRY_RUN_FLAG="--dry-run"
           fi
           
-          echo "Starting engine with duration: ${DURATION}m (DryRun: ${DRY_RUN_FLAG:-false})"
+          # Determine USE_LIVE mode (default: false for Demo account safety)
+          USE_LIVE_MODE="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.use_live }}" = "true" ]; then
+              USE_LIVE_MODE="true"
+            else
+              USE_LIVE_MODE="false"
+            fi
+          elif [ "${{ secrets.USE_LIVE }}" = "true" ]; then
+            USE_LIVE_MODE="true"
+          fi
+          export USE_LIVE="$USE_LIVE_MODE"
+          
+          echo "=========================================================="
+          echo "🚀 Starting Quantitative Leveraged Trading Engine"
+          echo "⏱️ Duration: ${DURATION}m"
+          echo "⚙️ Mode: USE_LIVE=$USE_LIVE ($([ "$USE_LIVE" = "true" ] && echo 'LIVE REAL MONEY (live.trading212.com)' || echo 'DEMO ACCOUNT (demo.trading212.com)'))"
+          echo "🧪 DryRun: ${DRY_RUN_FLAG:-false}"
+          echo "=========================================================="
+          
           python3 -m trading_system.orchestrator \
             --interval 5 \
             --monitor-interval 10 \
