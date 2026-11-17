@@ -453,6 +453,36 @@ class MultiProviderRouter:
                 return records
         return None
 
+    def fetch_polygon_quote(self, symbol: str, api_key: str) -> Optional[Dict[str, float]]:
+        """Fetch real-time top-of-book or previous close quote from Polygon.io."""
+        if not api_key:
+            return None
+        clean = symbol.upper().replace("^", "")
+        # 1. Try real-time NBBO endpoint
+        url = f"https://api.polygon.io/v2/last/nbbo/{clean}?apiKey={api_key}"
+        status, data = self._http_get_json(url)
+        is_429 = status == 429 or (isinstance(data, dict) and "exceeded" in str(data.get("message", "")).lower())
+        self.record_response("polygon", status, is_rate_limited=is_429)
+        if status == 200 and isinstance(data, dict):
+            res = data.get("results", {})
+            bid = float(res.get("p", 0.0) or 0.0)
+            ask = float(res.get("P", 0.0) or 0.0)
+            if ask > 0 and bid > 0 and ask >= bid:
+                mid = (ask + bid) / 2.0
+                return {"bid": bid, "ask": ask, "mid": mid, "spread_pct": (ask - bid) / mid}
+
+        # 2. Fallback to previous day bar snapshot if real-time NBBO is not supported on tier
+        prev_url = f"https://api.polygon.io/v2/aggs/ticker/{clean}/prev?apiKey={api_key}"
+        prev_status, prev_data = self._http_get_json(prev_url)
+        if prev_status == 200 and isinstance(prev_data, dict):
+            results = prev_data.get("results", [])
+            if results:
+                bar = results[0]
+                close_px = float(bar.get("c", 0.0) or bar.get("vw", 0.0) or 0.0)
+                if close_px > 0:
+                    return {"bid": round(close_px * 0.99875, 4), "ask": round(close_px * 1.00125, 4), "mid": close_px, "spread_pct": 0.0025}
+        return None
+
     # ── Alpha Vantage ──
 
     def fetch_alphavantage_daily(self, symbol: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
@@ -588,10 +618,12 @@ class MultiProviderRouter:
         settings_obj: Any,
     ) -> Optional[Dict[str, float]]:
         """Execute waterfall cascade for bid/ask spread quotes."""
+        poly_key = getattr(settings_obj, "POLYGON_API_KEY", "")
         fmp_key = getattr(settings_obj, "FMP_API_KEY", "")
         tiingo_key = getattr(settings_obj, "TIINGO_API_KEY", "")
 
         chain: List[Tuple[str, Optional[str], Callable[[], Optional[Dict[str, float]]]]] = [
+            ("polygon", poly_key, lambda: self.fetch_polygon_quote(symbol, poly_key)),
             ("fmp", fmp_key, lambda: self.fetch_fmp_quote(symbol, fmp_key)),
             ("tiingo", tiingo_key, lambda: self.fetch_tiingo_quote(symbol, tiingo_key)),
         ]

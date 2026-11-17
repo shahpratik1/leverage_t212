@@ -93,6 +93,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           DASHBOARD_HOST: '0.0.0.0'
           DASHBOARD_PORT: '8080'
           LIVE_DASHBOARD_PUBLIC_URL: ${{ env.TUNNEL_URL }}
@@ -121,6 +126,13 @@ jobs:
           echo "⏱️ Duration: ${DURATION}m"
           echo "⚙️ Mode: USE_LIVE=$USE_LIVE ($([ "$USE_LIVE" = "true" ] && echo 'LIVE REAL MONEY (live.trading212.com)' || echo 'DEMO ACCOUNT (demo.trading212.com)'))"
           echo "🧪 DryRun: ${DRY_RUN_FLAG:-false}"
+          echo "🌐 Market Data Providers:"
+          [ -n "${POLYGON_API_KEY}" ] && echo "  - Polygon.io: CONFIGURED (Key Detected)" || echo "  - Polygon.io: Not configured"
+          [ -n "${FMP_API_KEY}" ] && echo "  - Financial Modeling Prep (FMP): CONFIGURED (Key Detected)" || echo "  - FMP: Not configured"
+          [ -n "${TIINGO_API_KEY}" ] && echo "  - Tiingo: CONFIGURED (Key Detected)" || echo "  - Tiingo: Not configured"
+          [ -n "${ALPHA_VANTAGE_API_KEY}" ] && echo "  - Alpha Vantage: CONFIGURED (Key Detected)" || echo "  - Alpha Vantage: Not configured"
+          echo "  - Direct Yahoo Chart API: ACTIVE (Keyless fallback)"
+          echo "  - Stooq CSV: ACTIVE (Keyless fallback)"
           echo "=========================================================="
           
           python3 -m trading_system.orchestrator \

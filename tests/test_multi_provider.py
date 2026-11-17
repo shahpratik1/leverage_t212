@@ -114,6 +114,16 @@ class TestMultiProviderRouter(unittest.TestCase):
                     mock_fmp.assert_not_called()
                     mock_av.assert_not_called()
 
+    def test_polygon_quote_fetch(self):
+        """Polygon NBBO quote fetch parses bid and ask successfully."""
+        nbbo_data = {"results": {"p": 125.50, "P": 125.55, "t": 1794843978000}}
+        with patch.object(self.router, "_http_get_json", return_value=(200, nbbo_data)):
+            quote = self.router.fetch_polygon_quote("NVDA", "poly_key")
+            self.assertIsNotNone(quote)
+            self.assertEqual(quote["bid"], 125.50)
+            self.assertEqual(quote["ask"], 125.55)
+            self.assertAlmostEqual(quote["mid"], 125.525)
+
     def test_telemetry_reporting(self):
         """Telemetry reports diagnostic metrics for all providers."""
         self.router.record_response("fmp", 200)
