@@ -15,16 +15,6 @@ on:
         required: true
         default: '270'
         type: string
-      dry_run:
-        description: 'Simulate trades locally only (DO NOT send orders to Trading 212)'
-        required: false
-        default: false
-        type: boolean
-      use_live:
-        description: 'Trade with REAL MONEY (Checked = Live account; Unchecked = Demo practice account)'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -131,7 +121,7 @@ jobs:
         env:
           TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
           TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
-          USE_LIVE: ${{ inputs.use_live || secrets.USE_LIVE || 'false' }}
+          USE_LIVE: 'true'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -168,29 +158,12 @@ jobs:
             echo "⏱️ Manual session duration: ${DURATION}m"
           fi
 
-          DRY_RUN_FLAG=""
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            DRY_RUN_FLAG="--dry-run"
-          fi
-          
-          # Determine USE_LIVE mode (default: false for Demo account safety)
-          USE_LIVE_MODE="false"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ inputs.use_live }}" = "true" ]; then
-              USE_LIVE_MODE="true"
-            else
-              USE_LIVE_MODE="false"
-            fi
-          elif [ "${{ secrets.USE_LIVE }}" = "true" ]; then
-            USE_LIVE_MODE="true"
-          fi
-          export USE_LIVE="$USE_LIVE_MODE"
+          export USE_LIVE="true"
           
           echo "=========================================================="
           echo "🚀 Starting Quantitative Leveraged Trading Engine"
           echo "⏱️ Duration: ${DURATION}m"
-          echo "⚙️ Mode: USE_LIVE=$USE_LIVE ($([ "$USE_LIVE" = "true" ] && echo 'LIVE REAL MONEY (live.trading212.com)' || echo 'DEMO ACCOUNT (demo.trading212.com)'))"
-          echo "🧪 DryRun: ${DRY_RUN_FLAG:-false}"
+          echo "⚙️ Mode: USE_LIVE=true (LIVE REAL MONEY on live.trading212.com)"
           echo "🌐 Market Data Providers:"
           [ -n "${POLYGON_API_KEY}" ] && echo "  - Polygon.io: CONFIGURED (Key Detected)" || echo "  - Polygon.io: Not configured"
           [ -n "${FMP_API_KEY}" ] && echo "  - Financial Modeling Prep (FMP): CONFIGURED (Key Detected)" || echo "  - FMP: Not configured"
@@ -205,8 +178,7 @@ jobs:
             --monitor-interval 10 \
             --dashboard-port 8080 \
             --dashboard-host 0.0.0.0 \
-            --duration-minutes "$DURATION" \
-            $DRY_RUN_FLAG
+            --duration-minutes "$DURATION"
 
       - name: 💾 Synchronize Active Trades State to Repository
         if: always() && steps.market_check.outputs.should_run != 'false'
