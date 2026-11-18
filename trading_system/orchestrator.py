@@ -401,16 +401,17 @@ class Orchestrator:
         self._scan_future: Optional[concurrent.futures.Future] = None
 
         # Synchronize broker-native GTC Stop Loss / Limit orders for active positions
-        if not self.dry_run:
+        if settings.TRADING212_API_KEY:
             try:
                 self.position_monitor.reconcile_with_broker(adopt_untracked=True)
-                self.position_monitor.sync_broker_orders()
-                self.position_monitor.apply_daily_rollover_stops()
+                if not self.dry_run:
+                    self.position_monitor.sync_broker_orders()
+                    self.position_monitor.apply_daily_rollover_stops()
             except Exception as exc:
                 logger.warning("Initial broker stop sync deferred: %s", exc)
 
         # Non-unit-test warm-up using non-forced broker getters before initial snapshot publish
-        if not is_testing and not self.dry_run and settings.TRADING212_API_KEY:
+        if not is_testing and settings.TRADING212_API_KEY:
             try:
                 boot_cash = self.t212.get_account_cash(
                     fallback_equity=self._get_fallback_equity(snap),
@@ -1201,7 +1202,7 @@ class Orchestrator:
                 "broker_name": "Trading 212 Live" if settings.USE_LIVE else "Trading 212 Demo",
                 "broker_mode": "LIVE" if settings.USE_LIVE else "DEMO",
                 "dry_run": bool(self.dry_run),
-                "is_connected": bool(settings.TRADING212_API_KEY) and not self.dry_run,
+                "is_connected": bool(settings.TRADING212_API_KEY),
                 "is_halted": is_halted,
                 "active_server_stops": active_stops,
                 "active_positions_count": len(active_signals),

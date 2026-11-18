@@ -2168,8 +2168,10 @@ class PositionMonitor:
                         continue
 
                 if ticker not in broker_map:
-                    # In live mode, if position is missing from broker, mark closed externally
-                    if not self.dry_run:
+                    # Mark closed externally if missing from broker portfolio:
+                    # In live/demo mode (not dry_run), OR if the position was placed on broker/has a broker stop order
+                    is_broker_linked = getattr(pos, "strategy_type", "") == "broker_placed" or bool(getattr(pos, "broker_stop_order_id", None))
+                    if not self.dry_run or is_broker_linked:
                         pos_snap = self._resolve_position_snapshot(pos)
                         logger.warning(
                             "Reconciliation: %s not found in broker portfolio! Marked closed externally.",

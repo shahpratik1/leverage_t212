@@ -16,12 +16,12 @@ on:
         default: '270'
         type: string
       dry_run:
-        description: 'Run in paper-trade / dry-run mode'
+        description: 'Simulate trades locally only (DO NOT send orders to Trading 212)'
         required: false
         default: false
         type: boolean
       use_live:
-        description: 'Trade with real money on LIVE account (leave unchecked for Demo)'
+        description: 'Trade with REAL MONEY (Checked = Live account; Unchecked = Demo practice account)'
         required: false
         default: false
         type: boolean
