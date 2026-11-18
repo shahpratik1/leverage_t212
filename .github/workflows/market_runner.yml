@@ -3,10 +3,10 @@ name: Trading 212 Market Hours Live Runner
 on:
   schedule:
     # ── London Stock Exchange (08:00 - 16:30 UTC / 09:00 - 17:30 CET, Mon-Fri) ──
-    # Morning Session: 08:00 UTC (runs 270 mins = 4.5 hours until 12:30 UTC)
-    - cron: '0 8 * * 1-5'
-    # Afternoon Session: 12:30 UTC (runs 245 mins = ~4 hours until 16:35 UTC market close)
-    - cron: '30 12 * * 1-5'
+    # Morning Session: 07:55 UTC (08:55 CET) - boots 5m before open, avoids :00 queue traffic
+    - cron: '55 7 * * 1-5'
+    # Afternoon Session: 12:25 UTC (13:25 CET) - avoids :30 queue traffic
+    - cron: '25 12 * * 1-5'
 
   workflow_dispatch:
     inputs:
@@ -40,24 +40,66 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 🛡️ Pre-Flight Market Hours Guard
+        id: market_check
+        run: |
+          # If triggered manually via workflow_dispatch, always allow running (e.g. for testing)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Bypassing market hours guard."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Evaluated in UTC
+          DOW=$(date -u +%u) # 1=Monday ... 7=Sunday
+          HOUR=$(date -u +%H)
+          MINUTE=$(date -u +%M)
+          CURRENT_MINS=$(( 10#$HOUR * 60 + 10#$MINUTE ))
+
+          # Weekend check
+          if [ "$DOW" -gt 5 ]; then
+            echo "⏸️ Today is weekend (DOW: $DOW). European markets (LSE) are CLOSED."
+            echo "Exiting scheduled run immediately to conserve runner minutes."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # London Stock Exchange (LSE) is open 08:00 - 16:30 UTC (09:00 - 17:30 CET)
+          # Allowed execution window: 07:50 UTC (470 mins) to 16:35 UTC (995 mins)
+          if [ "$CURRENT_MINS" -lt 470 ] || [ "$CURRENT_MINS" -gt 995 ]; then
+            echo "⏸️ Current time is $(date -u +'%H:%M UTC') ($(date +'%H:%M %Z')). European markets (LSE) are CLOSED."
+            echo "LSE Trading Hours: 08:00 - 16:30 UTC / 09:00 - 17:30 CET."
+            echo "This scheduled run was delayed by GitHub Actions queue or fired off-hours."
+            echo "Exiting immediately to prevent running at night and conserve GitHub runner minutes."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "✅ Market hours check passed: $(date -u +'%H:%M UTC') is within LSE trading window (07:50 - 16:35 UTC)."
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
       - name: 🐍 Set up Python 3.11
+        if: steps.market_check.outputs.should_run != 'false'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: 📦 Install Python Dependencies
+        if: steps.market_check.outputs.should_run != 'false'
         run: |
           python -m pip install --upgrade pip
           pip install -r trading_system/requirements.txt
 
       - name: 🌐 Install Cloudflare Quick Tunnel
+        if: steps.market_check.outputs.should_run != 'false'
         run: |
           curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
       - name: 🚀 Start Cloudflare Tunnel & Extract Live Dashboard URL
         id: tunnel
+        if: steps.market_check.outputs.should_run != 'false'
         run: |
           nohup cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cloudflared.log 2>&1 &
           sleep 5
@@ -85,6 +127,7 @@ jobs:
           fi
 
       - name: 📈 Execute Quantitative Leveraged Trading Engine
+        if: steps.market_check.outputs.should_run != 'false'
         env:
           TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
           TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
@@ -102,8 +145,29 @@ jobs:
           DASHBOARD_PORT: '8080'
           LIVE_DASHBOARD_PUBLIC_URL: ${{ env.TUNNEL_URL }}
         run: |
-          # Morning session: 270m (08:00 - 12:30 UTC), Afternoon session: 245m (12:30 - 16:35 UTC)
-          DURATION="${{ inputs.duration_minutes || (github.event.schedule == '30 12 * * 1-5' && '245') || '270' }}"
+          # Calculate session duration
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR=$(date -u +%H)
+            MINUTE=$(date -u +%M)
+            CURRENT_MINS=$(( 10#$HOUR * 60 + 10#$MINUTE ))
+            MARKET_CLOSE_MINS=995 # 16:35 UTC
+            REMAINING_MINS=$(( MARKET_CLOSE_MINS - CURRENT_MINS ))
+            
+            # Morning session cap: 270m, Afternoon cap: remaining mins until 16:35 UTC
+            if [ "$REMAINING_MINS" -le 0 ]; then
+              echo "Market already closed (past 16:35 UTC). Exiting."
+              exit 0
+            elif [ "$REMAINING_MINS" -lt 270 ]; then
+              DURATION="$REMAINING_MINS"
+            else
+              DURATION="270"
+            fi
+            echo "⏱️ Dynamically calculated session duration: ${DURATION}m (Market closes at 16:35 UTC / 17:35 CET)"
+          else
+            DURATION="${{ inputs.duration_minutes || '270' }}"
+            echo "⏱️ Manual session duration: ${DURATION}m"
+          fi
+
           DRY_RUN_FLAG=""
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             DRY_RUN_FLAG="--dry-run"
@@ -145,7 +209,7 @@ jobs:
             $DRY_RUN_FLAG
 
       - name: 💾 Synchronize Active Trades State to Repository
-        if: always()
+        if: always() && steps.market_check.outputs.should_run != 'false'
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Market Runner"
