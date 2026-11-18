@@ -121,7 +121,7 @@ jobs:
         env:
           TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
           TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
-          USE_LIVE: 'true'
+          USE_LIVE: 'false'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -158,12 +158,12 @@ jobs:
             echo "⏱️ Manual session duration: ${DURATION}m"
           fi
 
-          export USE_LIVE="true"
+          export USE_LIVE="false"
           
           echo "=========================================================="
           echo "🚀 Starting Quantitative Leveraged Trading Engine"
           echo "⏱️ Duration: ${DURATION}m"
-          echo "⚙️ Mode: USE_LIVE=true (LIVE REAL MONEY on live.trading212.com)"
+          echo "⚙️ Mode: USE_LIVE=false (DEMO / PRACTICE ACCOUNT on demo.trading212.com)"
           echo "🌐 Market Data Providers:"
           [ -n "${POLYGON_API_KEY}" ] && echo "  - Polygon.io: CONFIGURED (Key Detected)" || echo "  - Polygon.io: Not configured"
           [ -n "${FMP_API_KEY}" ] && echo "  - Financial Modeling Prep (FMP): CONFIGURED (Key Detected)" || echo "  - FMP: Not configured"
