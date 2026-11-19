@@ -12,7 +12,7 @@
 export default {
   // Triggered automatically by Cloudflare Edge Cron
   async scheduled(event, env, ctx) {
-    const url = "https://api.github.com/repos/shahpratik1/leverage_t212/actions/workflows/market_runner.yml/dispatches";
+    const url = "https://api.github.com/repos/shahpratik1/leveraged-etp-engine/actions/workflows/market_runner.yml/dispatches";
 
     if (!env.GITHUB_PAT) {
       console.error("❌ GITHUB_PAT secret is missing in Cloudflare Worker environment variables.");
@@ -50,7 +50,7 @@ export default {
 
     // If visiting /trigger?secret=..., allow manual 1-click trigger from browser
     if (url.pathname === "/trigger") {
-      const ghUrl = "https://api.github.com/repos/shahpratik1/leverage_t212/actions/workflows/market_runner.yml/dispatches";
+      const ghUrl = "https://api.github.com/repos/shahpratik1/leveraged-etp-engine/actions/workflows/market_runner.yml/dispatches";
       const resp = await fetch(ghUrl, {
         method: "POST",
         headers: {
