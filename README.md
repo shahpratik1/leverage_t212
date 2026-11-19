@@ -1,6 +1,6 @@
 # ⚡ Quantitative 3x & 5x Leveraged Trading Engine
 
-[![Tests: 565/565 Passing](https://img.shields.io/badge/Tests-565%2F565%20Passing-emerald?style=for-the-badge&logo=pytest)](https://github.com/shahpratik1/leverage_t212)
+[![Tests: 566/566 Passing](https://img.shields.io/badge/Tests-566%2F566%20Passing-emerald?style=for-the-badge&logo=pytest)](https://github.com/shahpratik1/leveraged-etp-engine)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python)](https://python.org)
 [![Broker: Trading 212](https://img.shields.io/badge/Broker-Trading%20212%20Invest%20Spot-indigo?style=for-the-badge)](https://trading212.com)
 [![Strategy: Directional Trend](https://img.shields.io/badge/Strategy-Directional%20Trend%20%2B%20DMI-teal?style=for-the-badge)](docs/PROFITABILITY_AND_STRATEGY_GUIDE.md)
@@ -9,7 +9,7 @@
 
 An institutional-grade quantitative algorithmic trading engine engineered specifically for **3x and 5x leveraged Exchange-Traded Products (ETPs)** on **Trading 212**. 
 
-Operates a deterministic **5-step quantitative pipeline** with mathematical volatility-decay avoidance, native server-side broker GTC stop protection, progressive trailing stop ratchets, multi-provider rate-limited data feeds, and an automated **1-click GitHub Actions cloud runner**.
+Operates a deterministic **5-step quantitative pipeline** with mathematical volatility-decay avoidance, native server-side broker GTC stop protection, progressive trailing stop ratchets, multi-provider rate-limited data feeds, real-time Web Workbench telemetry, and an automated **1-click GitHub Actions cloud runner**.
 
 ---
 
@@ -17,11 +17,12 @@ Operates a deterministic **5-step quantitative pipeline** with mathematical vola
 
 ```mermaid
 flowchart TD
-    subgraph S1["1. Market Check"]
+    subgraph S1["1. Market Check & Pre-Flight Reconciliation"]
         B1[Trading 212 Auth & Connectivity] --> B2[Live Account Cash & Equity]
         B2 --> B3{Daily Drawdown < -2.0%?}
         B3 -->|Yes| HALT[Circuit Breaker Trip\n24h Entry Halt]
-        B3 -->|No| S2["2. Ingest Candles"]
+        B3 -->|No| RECON[Pre-Flight Order Queue Reconciliation\nPurge Stale Orders > 300s & Deduplicate In-Flight]
+        RECON --> S2["2. Ingest Candles"]
     end
 
     subgraph S2["2. Multi-Provider Market Data Ingestion"]
@@ -34,22 +35,23 @@ flowchart TD
         P1 & P2 & P3 & P4 & P5 --> CDB[(Persistent CandleDatabase SQLite)]
     end
 
-    subgraph S3["3. Quantitative Strategy Screen"]
-        CDB --> STRAT[Directional Trend & DMI Polarity Screen]
+    subgraph S3["3. Pluggable Quantitative Strategy Screen"]
+        CDB --> STRAT[Pluggable Strategy Engine\nACTIVE_STRATEGY = 'directional_trend']
         STRAT --> DMI{ADX ≥ 18.0 & Polarity?}
         DMI -->|Choppy / ADX < 18| CASH[Cash Defense\nAvoid Volatility Decay]
         DMI -->|Trend Confirmed| S4["4. Risk Sizing & Protection"]
     end
 
-    subgraph S4["4. Risk Sizing & Protection"]
+    subgraph S4["4. Risk Sizing & Safety Gates"]
         S4A[ATR Stop Calculation\nClamped 2.5% to 8.0%]
         S4B[GBX Pence Normalization\nCanonical EUR/USD Base]
         S4C[Portfolio Beta Heat Clamp ≤ 6.0]
-        S4A & S4B & S4C --> CARD[Decision Card]
+        S4D[9 Safety Gates: Spread, Drift, Earnings, Stop Invariant]
+        S4A & S4B & S4C & S4D --> CARD[Decision Card]
     end
 
     subgraph S5["5. Automated Execution & Pure TSL"]
-        CARD --> ROUTE[Trading 212 Order Execution]
+        CARD --> ROUTE[Trading 212 Spot Market Order Q > 0]
         ROUTE --> GSTOP[Native Server GTC Stop Order\nPOST /equity/orders/stop]
         GSTOP --> MON[PositionMonitor TSL Engine]
         MON -->|+1.5% Gain| BE[Ratchet Stop to Breakeven]
@@ -59,7 +61,9 @@ flowchart TD
     end
 
     subgraph TELEMETRY["UI & Live Control Plane"]
-        MON --> DASH[Live Web Dashboard & Cloudflare Quick Tunnel]
+        MON --> DASH[Live Web Workbench & Radar Dashboard]
+        MON --> SSE[SSE /api/live Real-Time Telemetry]
+        MON --> TUNNEL[Automated Cloudflare Quick Tunnel]
         MON --> LOGS[trades.jsonl & active_trades.json]
     end
 ```
@@ -120,8 +124,8 @@ Run the entire system in the cloud for free during London Stock Exchange market 
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/shahpratik1/leverage_t212.git
-cd leverage_t212
+git clone https://github.com/shahpratik1/leveraged-etp-engine.git
+cd leveraged-etp-engine
 
 # 2. Install dependencies
 pip install -r trading_system/requirements.txt
@@ -134,7 +138,7 @@ cp .env.example .env
 python3 -m trading_system.orchestrator --dry-run
 
 # 5. Run live automated trading engine
-python3 -m trading_system.orchestrator --interval 5 --monitor-interval 10
+python3 -m trading_system.orchestrator --interval 5 --monitor-interval 10 --dashboard-port 8080
 ```
 
 ---
@@ -176,6 +180,7 @@ OPENAI_API_KEY=
 # ── Web Workbench & Control Plane ──
 DASHBOARD_PORT=8080
 DASHBOARD_HOST=0.0.0.0
+DASHBOARD_AUTH_ENABLED=false
 ```
 
 ---
@@ -203,17 +208,20 @@ DASHBOARD_HOST=0.0.0.0
 
 ## 🧪 Testing & Verification
 
-The test suite rigorously validates every risk constraint, order routing rule, mathematical stop clamp, and rate limiter across **565 unit tests**:
+The test suite rigorously validates every risk constraint, order routing rule, mathematical stop clamp, and rate limiter across **566 unit and integration tests**:
 
 ```bash
-# Run complete test suite
+# Run complete test suite (566 tests, 100% passing)
 python3 -m unittest discover tests
 
 # Run multi-provider router tests
 python3 -m unittest tests/test_multi_provider.py
 
-# Run control plane and config tests
+# Run control plane and config bus tests
 python3 -m unittest tests/test_config_bus.py
+
+# Run opaque-box E2E test suite
+./run_e2e_tests.sh
 ```
 
 ---
@@ -221,8 +229,9 @@ python3 -m unittest tests/test_config_bus.py
 ## 📚 Documentation Index
 
 - 📘 **[Quantitative Edge & Profitability Guide](docs/PROFITABILITY_AND_STRATEGY_GUIDE.md)**: Mathematical breakdown of volatility drag, Schmitt Hysteresis, and the 5 golden rules of leveraged trading.
-- 📐 **[System Architecture Blueprint](docs/architecture.md)**: Deep dive into the 5-step quantitative engine, pure TSL execution, and SQLite state persistence.
-- 📖 **[Operating Manual & SOP](docs/operating-manual.md)**: Broker API keys, rate-limit governance, 5x leverage rules, and manual execution protocols.
+- 📐 **[System Architecture Blueprint](docs/architecture.md)**: Deep dive into the 5-step quantitative engine, pure TSL execution, multi-provider data waterfall, and SQLite state persistence.
+- 📖 **[Operating Manual & SOP](docs/operating-manual.md)**: Broker API keys, rate-limit governance, 5x leverage rules, Web Workbench controls, and manual execution protocols.
+- 📈 **[Directional Trend Strategy Guide](docs/strategy-directional-trend.md)**: Mathematical formulation, DMI polarity gating, EMA slope hierarchy, and dual-track short execution.
 - 📑 **[Domain Concepts Glossary](CONCEPTS.md)**: Mathematical notation and terminology standards.
 
 ---

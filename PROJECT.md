@@ -2,13 +2,13 @@
 
 ## Architecture
 The Trading 212 algorithmic system is an autonomous multi-agent quantitative trading engine for leveraged equities and ETPs.
-- **Data & Indicators Layer**: `trading_system/data/` (`trading212_client.py`, `leveraged_universe.py`, `candle_db.py`). Provides market data caching, indicator computation (RSI, EMA, ADX, ATR, Donchian, Bollinger, Volatility, DMI +/-DI, 20 EMA slope), and live broker connectivity.
-- **Quantitative Strategy Engine**: `trading_system/strategies/` (`base.py`, `registry.py`, `directional_trend.py`). Decoupled strategy architecture with `BaseStrategy` Protocol, `StrategySignal`, and `StrategyRegistry`. Standardized exclusively on `DirectionalTrendStrategy` (DMI polarity gating + 20/50 EMA slope hierarchy + MACD divergence filtering + Dual-Track Bear Regime execution). Legacy 3-RSI and Donchian momentum heuristics fully pruned.
-- **Screener & Regime Layer**: `trading_system/screener/` (`laya_screener.py`). Filters universe candidates and classifies market regime (`CHOP_RANGE`, `TRENDING_BREAKOUT`, `HIGH_VOL_ERRATIC`), delegating directly to active strategy.
-- **Agent Deliberation Layer**: `trading_system/agents/` (`technical_agent.py`, `risk_manager.py`, `debate_engine.py`). Pure System 2 deliberative multi-agent debate (technical + fundamental + dialectic arbiter) with fast reflex bypass completely removed.
+- **Data & Indicators Layer**: `trading_system/data/` (`trading212_client.py`, `leveraged_universe.py`, `candle_db.py`, `multi_provider.py`). Provides multi-provider waterfall routing (FMP, Tiingo, Polygon.io, Alpha Vantage, Yahoo Chart, Stooq CSV), SQLite WAL delta caching, indicator computation (RSI, EMA, ADX, ATR, Donchian, Bollinger, Volatility, DMI +/-DI, 20 EMA slope), and live broker connectivity.
+- **Quantitative Strategy Engine**: `trading_system/strategies/` (`base.py`, `registry.py`, `directional_trend.py`, `vwap.py`). Decoupled strategy architecture with `BaseStrategy` Protocol, `StrategySignal`, and `StrategyRegistry`. Supports `DirectionalTrendStrategy` (DMI polarity gating + 20/50 EMA slope hierarchy + MACD divergence filtering + Dual-Track Bear Regime execution) and `VWAPStrategy`.
+- **Screener & Regime Layer**: `trading_system/screener/` (`laya_screener.py`). Filters universe candidates, runs parallel multi-threaded screening across 120+ pairs, and generates structured decision funnel attribution reports.
+- **Agent Deliberation Layer**: `trading_system/agents/` (`technical_agent.py`, `risk_manager.py`, `debate_engine.py`, `strategy_improvement_agent.py`). Pure System 2 deliberative multi-agent debate (technical + fundamental + dialectic arbiter) with fast reflex bypass completely removed.
 - **Execution & Position Monitoring Layer**: `trading_system/orchestrator.py`, `trading_system/execution/position_monitor.py`. Pre-flight broker order queue reconciliation (stale order purge & in-flight deduplication), 15-minute market opening auction buffer, pre-trade drift & spread gates, 100% Pure Trailing Stop Loss engine (0% TP limits), and native Trading 212 GTC stop synchronization.
 - **Backtesting & Simulation Layer**: `trading_system/backtest/` (`engine.py`). Simulates strategy execution across historical OHLCV data and verifies statistical edge (Sharpe, Profit Factor, Win Rate).
-- **Dashboard & Operations Layer**: `trading_system/dashboard/server.py`, `scripts/deploy_to_pi.sh`. Web UI anchored to live broker equity and Raspberry Pi systemd deployment.
+- **Control Plane, Dashboard & Cloud/Edge Layer**: `trading_system/dashboard/server.py`, `trading_system/config_bus.py`, `scripts/deploy_to_pi.sh`, `.github/workflows/market_runner.yml`. Live Web Workbench with dynamic ConfigBus profiles and epochs, token auth, SSE telemetry, Cloudflare Quick Tunnel, and Raspberry Pi systemd daemon.
 
 ## Feature Inventory
 | # | Feature | Description | Milestone | Source |
@@ -37,7 +37,12 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
 | 22 | Directional Trend Strategy | DMI (+DI/-DI) polarity gating, 20/50 EMA slope hierarchy, and MACD divergence gating | M5 | User Directive |
 | 23 | Dual-Track Bear Execution | Short inverse 3x ETPs on indices (`QQQS`, `3USS`, `3SES`), 100% Cash Defense for single equities | M5 | User Directive |
 | 24 | Pre-Flight Order Queue Reconciliation | Audit resting broker orders, purge stale market orders (>300s or closed market), deduplicate in-flight orders | M5 | User Directive |
-| 25 | Sole Strategy Standardization | Excise 3-RSI mean reversion and legacy momentum heuristics; standardize entire system on Directional Trend | M5 | User Directive |
+| 25 | Sole Strategy Standardization | Excise 3-RSI mean reversion and legacy momentum heuristics; standardize active strategy on Directional Trend | M5 | User Directive |
+| 26 | Multi-Provider Waterfall Router | Thread-safe sliding rate-limiting and auto-cooldown across FMP, Tiingo, Polygon.io, Alpha Vantage, Yahoo, Stooq | M6 | System Scaling |
+| 27 | Dynamic ConfigBus & Epoch Tracking | Pinned epoch snapshots (`config_epoch_id`), built-in profiles, and live parameter calibration | M6 | Control Plane |
+| 28 | Web Workbench & API Auth | Browser workbench UI (`/workbench`), bearer token authentication, SSE 1-second telemetry push | M6 | UI/UX |
+| 29 | 1-Click Cloud Runner & Cloudflare | GitHub Actions automated market hours live runner with Cloudflare Quick Tunnel and atomic state persistence | M6 | Cloud Infra |
+| 30 | 566 Automated Test Verification | 100% passing across 566 unit and integration test assertions with zero regressions | M6 | Quality Assurance |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -47,6 +52,7 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
 | M3 | Quantitative Backtest Engine & Walk-Forward Validation | Features 12-15, 20: BacktestEngine pure TSL & multi-regime simulation, 120-asset 3x universe evaluation, statistical edge verification (Sharpe >= 1.5, PF >= 1.75, Win Rate >= 60%), 405 unit test zero regression | M2 | COMPLETED |
 | M4 | Final Milestone: 100% E2E Test Pass, Pure TSL & Pi Deployment | Features 16-19: Pass all 201 E2E tests (Tiers 1-4), 100% Pure TSL engine activation, broker order contention elimination, and 24/7 Raspberry Pi deployment | M3, TEST_READY.md | COMPLETED |
 | M5 | Isolated Strategy Engine & Directional Trend Overhaul | Features 21-25: Pluggable strategy architecture, DirectionalTrendStrategy with DMI polarity, dual-track bear shorting, pre-flight order queue reconciliation, full test pass | M4 | COMPLETED |
+| M6 | Multi-Provider Market Data, ConfigBus & Cloud Control Plane | Features 26-30: Multi-provider waterfall, dynamic ConfigBus & profiles, Web Workbench, GitHub Actions 1-click cloud runner, 566 tests 100% pass | M5 | COMPLETED |
 
 ## Interface Contracts
 
@@ -61,13 +67,10 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
 - **Cap**: Position notional `shares * price_eur` $\le 0.20 \times \text{account\_equity\_eur}$.
 - **Verification**: `3GISl_EQ` with quote 7805p on €4,923.05 equity sizes to exactly 10 shares (~€940).
 
-### 3. Market Regime Classification ↔ Strategy Recommendation
-- **Enum/Type**: `MarketRegime`: `CHOP_RANGE`, `TRENDING_BREAKOUT`, `HIGH_VOL_ERRATIC`.
-- **Logic**:
-  - `HIGH_VOL_ERRATIC`: Realized Vol > 65.0% or `atr / atr_20d_sma >= 1.5` -> Action: `REDUCE_SIZE` or `DO_NOT_TRADE`.
-  - `CHOP_RANGE`: ADX < 22.0 -> Strategy: `3RSI_MEAN_REVERSION` (entry: RSI3 <= 28, RSI7 <= 45, Bollinger/Keltner band confirmation).
-  - `TRENDING_BREAKOUT`: ADX >= 25.0 and EMA20 > EMA50 -> Strategy: `DONCHIAN_EMA_BREAKOUT` (entry: close > Donchian 20d High).
-- **Output**: Recorded in `ScreenerResult.market_regime`, `TechnicalAnalysis.market_regime`, and `DecisionCard.market_regime`.
+### 3. Multi-Provider Router Waterfall Contract
+- **Class**: `MultiProviderRouter` (`trading_system/data/multi_provider.py`)
+- **Waterfall**: `FMP` $\to$ `Tiingo` $\to$ `Polygon.io` $\to$ `Alpha Vantage` $\to$ `Yahoo Direct Chart` $\to$ `Stooq CSV` $\to$ `yfinance`.
+- **Rate-Limiter**: Sliding window tracking timestamps; automatic 60s–120s cooldown upon HTTP 429 without failing caller queries.
 
 ### 4. 100% Pure Trailing Stop Loss Engine & Broker Synchronization
 - **Complete Elimination of Take Profit Targets (TP1 / TP2 / TP3)**: Static profit targets and partial quantity trims (50%/25%/25%) are fully excised. 100% of shares ride the trend intact without artificial profit caps.
@@ -88,13 +91,16 @@ The Trading 212 algorithmic system is an autonomous multi-agent quantitative tra
   - Win Rate: **75.0%** (Target: $\ge 60.0\%$)
 
 ## Code Layout
+- `trading_system/data/multi_provider.py`: Thread-safe multi-provider waterfall with sliding-window rate limiters.
 - `trading_system/data/trading212_client.py`: `MarketDataProvider` indicators and quote methods.
-- `trading_system/data/leveraged_universe.py`: Curated 3x universe (120 pairs), currency metadata, and normalization helpers.
-- `trading_system/screener/laya_screener.py`: Screener regime classification and candidate routing.
+- `trading_system/data/leveraged_universe.py`: Curated 3x/5x universe (120+ pairs), currency metadata, and normalization helpers.
+- `trading_system/screener/laya_screener.py`: Screener regime classification, candidate routing, and funnel attribution.
+- `trading_system/strategies/`: Pluggable strategy engine (`base.py`, `registry.py`, `directional_trend.py`, `vwap.py`).
 - `trading_system/agents/technical_agent.py`: Technical analysis regime detection and strategy recommendations.
 - `trading_system/agents/risk_manager.py`: Position sizing with live ETP quote, GBX normalization, 20% cap, directional safety gate.
-- `trading_system/orchestrator.py`: Multi-regime coordination, live quote passing, order execution.
+- `trading_system/orchestrator.py`: Deterministic 5-step pipeline coordination, pre-flight order queue reconciliation, live quote passing, order execution.
 - `trading_system/execution/position_monitor.py`: Pure 100% Trailing Stop Loss engine, progressive ratchets (+1.5% BE, +3.0% Cushion, ATR trail), native T212 GTC stop synchronization.
 - `trading_system/backtest/engine.py`: Multi-regime backtester, universe batch simulation, benchmark edge verification with Pure TSL.
-- `trading_system/dashboard/server.py`: Live broker equity anchoring (€4,923.05), EUR dashboard display, and real-time SSE telemetry.
-- `tests/`: 25 test files containing 405 unit tests + 201 opaque-box E2E tests (606 tests total, 100% passing).
+- `trading_system/config_bus.py`: Dynamic configuration snapshots, epoch tracking, built-in profiles.
+- `trading_system/dashboard/server.py`: Embedded web workbench, live broker equity anchoring (€4,923.05), EUR dashboard display, and real-time SSE telemetry.
+- `tests/`: Complete unit and opaque-box E2E suites containing **566 automated tests (100% passing)**.

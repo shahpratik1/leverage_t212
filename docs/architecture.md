@@ -1,8 +1,8 @@
-# System Architecture: 3x & 5x Leveraged Quantitative Trading Engine
+# System Architecture: Quantitative 3x & 5x Leveraged Trading Engine
 
 > **Autonomous Multi-Agent Quantitative Trading System**  
 > Engineered for European & London-listed leveraged Exchange Traded Products (ETPs) on Trading 212.  
-> Powered by a pure **System 2 Deliberative Multi-Agent Brain & Meta-Learning** architecture (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter, RiskManager), backed by crash-resilient native broker execution, SQLite WAL candle caching, and 24/7 Raspberry Pi runner telemetry.
+> Powered by a pure **System 2 Deliberative Multi-Agent Brain & Meta-Learning** architecture (TechnicalAnalyst, FundamentalAnalyst, Dialectic Arbiter, RiskManager), backed by crash-resilient native broker execution, multi-provider waterfall market data routing, SQLite WAL candle caching, live Web Workbench with dynamic ConfigBus, and dual cloud (GitHub Actions) & edge (Raspberry Pi 5) runners.
 
 ---
 
@@ -16,17 +16,19 @@ The platform monitors global equities, broad market indices, sovereign bonds, co
 | :--- | :--- | :--- |
 | **Monitored Universe** | **120+ Curated Pairs** | 3x & 5x leverage covering Tech, Indices, FX, Bonds, Commodities, Frontier Tech |
 | **Currency Preference** | **82%+ EUR Natively** | EUR-first policy eliminating FX currency conversion fees for EU accounts |
+| **Market Data Feeds** | **Multi-Provider Waterfall** | Thread-safe sliding rate-limiting across FMP, Tiingo, Polygon.io, Alpha Vantage, with keyless Yahoo Chart & Stooq CSV fallbacks |
 | **Ingestion Latency** | **<10ms Triage** | Parallel multi-worker async pipeline + local SQLite WAL candle database |
 | **Cognitive Framework** | **Deliberative Multi-Agent Brain** | Pure System 2 Multi-Agent Dialectic (Technical + Fundamental + Sentiment + Forecast) without speculative bypass |
-| **Quantitative Strategy** | **Directional Trend (Sole Strategy)** | Isolated pluggable Strategy Engine (`trading_system/strategies/`); DMI (+DI/-DI) polarity gating + 20/50 EMA slope hierarchy + Dual-Track Bear execution |
+| **Strategy Architecture** | **Pluggable Strategy Engine** | Decoupled `BaseStrategy` Protocol & `StrategyRegistry`; active `directional_trend` (DMI polarity + EMA slope hierarchy + Dual-Track Bear) and `vwap` |
 | **Risk Containment** | **9 Multi-Layer Gates** | Circuit breaker (-2% equity), 15m opening auction buffer, spread gate (<1.0%), drift gate (<1.5%), 48h earnings blackout |
-| **Execution Safety** | **Crash-Proof Native GTC** | Native broker-side GTC Stops placed immediately at fill + single order 100% quantity protection |
+| **Execution Safety** | **Crash-Proof Native GTC** | Native broker-side GTC Stops placed immediately at fill (`POST /equity/orders/stop`) + single order 100% quantity protection |
 | **Target Lifecycle** | **100% Pure Trailing Stop Loss** | Progressive ratchets (+1.5% Breakeven, +3.0% Cushion, ATR Chandelier Trail) with 100% quantity ride (0% TP limits / trims) |
 | **Overnight Policy** | **16:20 UTC Protocol** | Asymmetric gap isolation: intraday shorts flatten; winners with breakeven/cushion stops carry |
 | **Statistical Edge** | **Sharpe 3.40 / PF 6.86 / WR 75%** | Verified walk-forward benchmark simulator across curated 3x leveraged universe |
 | **Order Reconciliation**| **Pre-Flight Queue Purge** | Automatically cancels stale market orders (>300s or closed market) and deduplicates in-flight entries |
-| **Test Verification** | **437 Automated Tests (100% Pass)** | Comprehensive unit and opaque-box E2E suites passing with zero regressions |
-| **Deployment** | **24/7 Hardened Linux Daemon** | Raspberry Pi 5 runner via `systemd`, SSE live dashboard, atomic state persistence |
+| **Control Plane** | **Dynamic ConfigBus & Workbench** | Embedded HTTP server with SSE `/api/live`, epoch-versioned configuration snapshots, and built-in tuning profiles |
+| **Test Verification** | **566 Automated Tests (100% Pass)** | Comprehensive unit and opaque-box E2E suites passing with zero regressions |
+| **Deployment Topologies** | **Cloud & Edge Production** | 1-click GitHub Actions cloud runner with Cloudflare Quick Tunnel + 24/7 Raspberry Pi 5 Linux daemon via `systemd` |
 
 ---
 
@@ -36,76 +38,63 @@ The following diagram illustrates the complete end-to-end data flow, cognitive r
 
 ```mermaid
 flowchart TD
-    subgraph Market Data Mesh
-        T212_API["Trading 212 REST API\n(Live Quotes & Orders)"]
-        YFIN["Yahoo Finance\n(Historical Daily OHLCV)"]
-        FINN["Finnhub Provider\n(Fundamentals & News)"]
-        OLO["Olostep Provider\n(Real-time Web Sentiment)"]
-        NIX["Nixtla TimeGPT\n(5-Day Forecast)"]
-        CANDLE_DB[("SQLite WAL Cache\ndata/candles.db\n(Incremental Delta Sync)")]
+    subgraph S1["1. Market Check & Pre-Flight Reconciliation"]
+        T212_AUTH[Trading 212 REST API Auth] --> CASH_CHK[Live Cash & Portfolio Equity]
+        CASH_CHK --> CB_GATE{Daily Drawdown < -2.0%?}
+        CB_GATE -->|Yes| HALT[Circuit Breaker Trip\n24h Entry Trading Halt]
+        CB_GATE -->|No| RECON[Pre-Flight Order Queue Reconciliation\nPurge Stale Orders > 300s & Deduplicate In-Flight]
+        RECON --> S2["2. Multi-Provider Market Data Ingestion"]
     end
 
-    subgraph Universe Ingestion & Pre-Filtering
-        UNIV["LeveragedUniverse\n(120+ 3x/5x Curated Pairs)"] --> PARALLEL["Parallel Ingestion Engine\n(24 Thread Workers)"]
-        CANDLE_DB --> PARALLEL
-        T212_API --> PARALLEL
-        PARALLEL --> SCREENER["Candidate Pre-Filter & Strategy Engine\n(Directional Trend: DMI Polarity + 20/50 EMA Slope)"]
-        SCREENER --> CANDIDATES["Qualified Universe Candidates\n(Top N Ranked Directional Setups)"]
+    subgraph S2["2. Multi-Provider Market Data Waterfall"]
+        ROUTER[MultiProviderRouter\nSliding-Window Rate Limiter & Auto-Cooldown]
+        ROUTER --> P_FMP[Financial Modeling Prep]
+        ROUTER --> P_TIINGO[Tiingo]
+        ROUTER --> P_POLYGON[Polygon.io]
+        ROUTER --> P_AV[Alpha Vantage]
+        ROUTER --> P_YAHOO[Keyless Direct Yahoo Chart API]
+        ROUTER --> P_STOOQ[Keyless Stooq CSV Feed]
+        P_FMP & P_TIINGO & P_POLYGON & P_AV & P_YAHOO & P_STOOQ --> CDB[(SQLite WAL Cache\ndata/candles.db\nIncremental Delta Sync)]
+        CDB --> S3["3. Quantitative Strategy Screen"]
     end
 
-    subgraph System 2: Deliberative Multi-Agent Brain
-        CANDIDATES --> DEEP_DEBATE["Deliberative Multi-Agent Debate\n(DebateEngine / TradingAgents Graph)"]
-        
-        DEEP_DEBATE --> TECH_AGENT["TechnicalAnalyst\n(Multi-Timeframe RSI/SMA)"]
-        DEEP_DEBATE --> FUND_AGENT["FundamentalAnalyst\n(Finnhub / Olostep / Nixtla)"]
-        DEEP_DEBATE --> AGY_AGENT["Antigravity Agentic SDK\n(Autonomous Reasoning)"]
-        
-        FINN --> FUND_AGENT
-        OLO --> FUND_AGENT
-        NIX --> FUND_AGENT
-        
-        TECH_AGENT --> DEBATE_SYNTH["Dialectic Consensus Synthesis\n(Consensus Decision & Conviction Score)"]
-        FUND_AGENT --> DEBATE_SYNTH
-        AGY_AGENT --> DEBATE_SYNTH
+    subgraph S3["3. Pluggable Quantitative Strategy Engine"]
+        REG[StrategyRegistry Factory\nACTIVE_STRATEGY = 'directional_trend']
+        REG --> STRAT_DT[DirectionalTrendStrategy\nDMI Polarity + 20/50 EMA Slope Hierarchy]
+        REG --> STRAT_VWAP[VWAPStrategy\nSession VWAP Trend-Following]
+        STRAT_DT --> DMI_CHK{ADX ≥ 18.0 & Polarity?}
+        DMI_CHK -->|Choppy / ADX < 18| CASH_DEF[100% Cash Defense\nAvoid Compounding Volatility Decay]
+        DMI_CHK -->|Trend Confirmed| S2_BRAIN[System 2 Deliberation\nTechnical + Fundamental Debate]
+        S2_BRAIN --> S4["4. Risk Sizing & Safety Gates"]
     end
 
-    subgraph Quantitative Risk Management
-        DEBATE_SYNTH --> RISK_MGR["RiskManager\n(0.5% Equity Risk / Kelly ATR Sizing)"]
-        
-        RISK_MGR --> GATES{"Pre-Trade Safety Gates\n- Daily Drawdown (-2.0%)\n- 15m Opening Auction Settlement Buffer\n- Pre-Trade Live Spread Gate (<1.00%)\n- Stale Overnight Drift Gate (<1.50%)\n- Stop Invariant Gate (Stop < Price)\n- 48h Earnings Blackout\n- Direction Gate (No Long on Short)\n- Synthetic Data Gate"}
-        GATES -->|Pass| CARD["DecisionCard\n(Validated Order Intent)"]
-        GATES -->|Fail| REJECT["Order Rejected / Logged\n(Safety Violation Prevented)"]
+    subgraph S4["4. Institutional Risk Sizing & Safety Gates"]
+        S2_BRAIN --> RM[RiskManager\nVolatility Sizing: 0.5% Capital Risk / ATR Dist]
+        RM --> G_SPREAD[Spread Gate < 1.0%]
+        RM --> G_DRIFT[Overnight Drift Gate < 1.5%]
+        RM --> G_EARN[48h Earnings Blackout Gate]
+        RM --> G_GBX[GBX Pence Normalization to EUR Base]
+        RM --> G_HEAT[Portfolio Beta Heat Clamp ≤ 6.0]
+        G_SPREAD & G_DRIFT & G_EARN & G_GBX & G_HEAT --> CARD[DecisionCard Intent]
     end
 
-    subgraph Hybrid Broker Execution
-        CARD --> ORCH["Orchestrator Engine\n(Pre-Flight Order Queue Reconciliation & Deduplication)"]
-        ORCH --> T212_EXEC["Trading 212 Client\n(Spot Market Order Q > 0)"]
-        T212_EXEC --> BROKER_STOP["Broker Server Stop Order\n(POST /equity/orders/stop GTC)"]
-        T212_EXEC --> POS_MON["PositionMonitor\n(Lifecycle Manager)"]
-        BROKER_STOP --> POS_MON
+    subgraph S5["5. Automated Execution & Pure TSL Engine"]
+        CARD --> T212_EXEC[Trading 212 Spot Market Order Q > 0]
+        T212_EXEC --> GSTOP[Native Server GTC Stop Order\nPOST /equity/orders/stop]
+        GSTOP --> MON[PositionMonitor TSL Engine]
+        MON -->|+1.5% Gain| BE[Ratchet Stop to Breakeven\nRisk = 0.00%]
+        MON -->|+3.0% Gain| CUSH[Lock +1.5% Profit Cushion\nGuaranteed Winning Trade]
+        MON -->|Profit Trail| ATR_CHAND[Dynamic ATR Chandelier Trail\nStop = P_peak - 1.2 * ATR]
+        MON -->|16:20 UTC| ASYM_EXIT[16:20 UTC Asymmetric Session Gap Protocol\nFlatten Shorts & Stagnant Longs]
     end
 
-    subgraph Position Lifecycle & Dynamic Ratchets
-        POS_MON --> TICK_EVAL["Live Tick Monitor\n(Every 10 Seconds)"]
-        TICK_EVAL -->|Gain >= +1.5%| BE_ACT["Move SL to Breakeven\n(100% Shares Intact)"]
-        TICK_EVAL -->|Gain >= +3.0%| CUSH_ACT["Lock +1.5% Profit Cushion\n(100% Shares Intact)"]
-        TICK_EVAL -->|Trailing Zone| DYN_ACT["Dynamic ATR Chandelier Trail\n(Behind Trend Peak / Trough)"]
-        BE_ACT --> SYNC_STOP["Sync Native GTC Stop on T212\n(Cancel Old & Post Tightened Stop)"]
-        CUSH_ACT --> SYNC_STOP
-        DYN_ACT --> SYNC_STOP
-        TICK_EVAL -->|Price <= TSL| EXIT_ACT["100% Liquidation via TSL\n(Full Capital Preserved)"]
-        TICK_EVAL -->|16:20 UTC| ASYM_GAP["Asymmetric Session Gap Protocol\n(Flatten Shorts & Unprotected Longs)"]
-    end
-
-    subgraph Telemetry, Presentation & State
-        POS_MON --> ATOMIC_STATE[("active_trades.json\n(Atomic Tempfile Sync)")]
-        POS_MON --> TRADE_LOGS[("trades.jsonl & notifications.jsonl")]
-        POS_MON --> DASH_SERVER["Embedded Dashboard Server\n(Port 8080 Multi-Threaded HTTP)"]
-        DASH_SERVER --> SSE_STREAM["SSE Stream /api/live\n(1-Second Real-Time Telemetry)"]
-        DASH_SERVER --> UI["signals_dashboard.html\n(Live P&L, 2-Line Alerts, Stops)"]
-        POS_MON --> NOTIFIER["Notifier System\n(Desktop, Telegram, Webhooks)"]
-        META_AGENT["StrategyImprovementAgent\n(Autonomous Meta-Learner)"] --> TRADE_LOGS
-        META_AGENT -->|Dynamic Calibration| SCREENER
+    subgraph TELEMETRY["Live Control Plane & Telemetry"]
+        MON --> ATOMIC_STATE[(active_trades.json & trades.jsonl)]
+        MON --> DASH_SERVER[Embedded Multi-Threaded HTTP Server :8080]
+        DASH_SERVER --> SSE_LIVE[SSE Stream /api/live\n1-Second Telemetry Push]
+        DASH_SERVER --> WB_UI[Live Web Workbench & Radar Dashboard]
+        DASH_SERVER --> TUNNEL[Automated Cloudflare Quick Tunnel]
+        CONFIG_BUS[ConfigBus & Profiles] <--> DASH_SERVER
     end
 ```
 
@@ -113,22 +102,28 @@ flowchart TD
 
 ## 3. Subsystem Deep Dive
 
-### 3.1 Market Data Mesh & SQLite WAL Persistence
+### 3.1 Multi-Provider Market Data Waterfall & SQLite WAL Persistence
 
 The market data layer is decoupled into specialized providers with a persistent SQLite write-ahead log (WAL) database, drastically reducing external API usage and latency.
 
+* **`trading_system/data/multi_provider.py` (`MultiProviderRouter`)**:
+  * Implements a resilient waterfall architecture across 6 providers:
+    1. **Financial Modeling Prep (FMP)**: Daily and hourly candles with high-rate caching.
+    2. **Tiingo**: Institutional daily price histories with split/dividend adjustment.
+    3. **Polygon.io**: High-frequency bars and real-time aggregate quotes.
+    4. **Alpha Vantage**: Global benchmark intraday feeds.
+    5. **Direct Yahoo Chart API**: Zero-config keyless JSON candle retrieval.
+    6. **Stooq CSV Feed**: Direct daily historical price data without API credentials.
+  * **Thread-Safe Sliding-Window Rate Limiting**: Each provider tracks request timestamps within a rolling window (e.g. 5 req/min for Polygon free tier, 50 req/hr for Tiingo).
+  * **Auto-Cooldown on HTTP 429**: When a provider encounters rate exhaustion, it enters an automated cooldown state (60–120 seconds), and queries cascade seamlessly to the next provider in the chain without interrupting orchestrator cycle execution.
 * **`trading_system/data/candle_db.py`**:
   * Manages `data/candles.db` using SQLite with `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL`.
-  * **Incremental Delta Fetch**: Checks `MAX(timestamp)` for each asset and interval (1m, 5m, 15m, 1h, 1d). Only queries external APIs for candles created *after* the latest stored candle, saving 90%+ of network bandwidth and preventing rate-limiting.
-  * Handles duplicate avoidance via `INSERT OR REPLACE INTO candles`.
+  * **Incremental Delta Fetch**: Checks `MAX(timestamp)` for each asset and interval (1m, 5m, 15m, 1h, 1d). Only queries external APIs for candles created *after* the latest stored candle, saving 90%+ of network bandwidth.
+  * Enforces duplicate avoidance via `INSERT OR REPLACE INTO candles`.
 * **`trading_system/data/trading212_client.py`**:
   * High-resilience REST client with sliding-window rate limit management (`.t212_rate_limit.json`), preventing broker API lockouts.
   * Disk caching of instrument metadata (`.t212_instruments_cache.json`).
   * Live bid-ask spread inspection, portfolio retrieval, and market session verification.
-* **Provider Enrichment Suite**:
-  * **`finnhub_provider.py`**: Pulls quarterly financial metrics, earnings surprise percentages, and 7-day company headlines.
-  * **`olostep_provider.py`**: Searches recent real-time web discussions, returning aggregated sentiment scores.
-  * **`nixtla_provider.py`**: Zero-shot deep neural forecasting (`TimeGPT`), returning a 5-day projected price path and expected percentage return.
 
 ---
 
@@ -147,18 +142,19 @@ The market data layer is decoupled into specialized providers with a persistent 
   * **EUR-First Preference Policy**: Prioritizes European exchange listings to eliminate currency exchange fees for Euro accounts.
   * **Authoritative Direction Resolution (`get_etp_direction`)**: Automatically identifies whether an execution ticker is an inverse `SHORT` (e.g. `QQQSm_EQ`, `3SVEl_EQ`) or a spot `LONG` (e.g. `IONQl1_EQ`, `3LVEl_EQ`).
   * **Spot ETP Trading Dynamics**: Enforces spot mechanics on Trading 212 Invest—all assets are purchased long ($Q > 0$). Inverse ETPs rise when the underlying falls; software never inverts P&L calculations.
+  * **LSE GBX Pence Normalization**: Tickers denominated in British Pence (`GBX` / `p`) are divided by 100 to GBP and converted to the EUR base currency before calculating position sizing.
 
 ---
 
-### 3.3 Pluggable Strategy Engine & Directional Trend Layer
+### 3.3 Pluggable Quantitative Strategy Engine
 
 * **`trading_system/strategies/`**:
   * **Abstract Strategy Protocol (`base.py`)**:
     * Introduces `@runtime_checkable` `BaseStrategy` Protocol with `evaluate_candidate(ticker: str, metrics: Dict[str, Any]) -> StrategySignal`.
     * Encapsulates candidate evaluation into `StrategySignal` (`direction`, `conviction`, `setup_quality`, `bull_evidence`, `bear_evidence`, `catalyst_risk`). Decouples strategy mathematics from the screener and multi-agent debate.
   * **Central Strategy Registry (`registry.py`)**:
-    * Provides `@StrategyRegistry.register("name")` factory, allowing zero-touch strategy swapping via `ACTIVE_STRATEGY = "directional_trend"` in `config.py`.
-* **Directional Trend Strategy (`directional_trend.py`)**:
+    * Provides `@StrategyRegistry.register("name")` factory, allowing zero-touch strategy swapping via `ACTIVE_STRATEGY` in `config.py`.
+* **Directional Trend Strategy (`directional_trend.py`)** *(Default)*:
   * **Directional Movement Index (DMI) Polarity Gating**:
     * Evaluates dominant directional pressure: $+DI > -DI$ with $ADX \ge 18.0$ for Longs; $-DI > +DI$ with $ADX \ge 18.0$ for Shorts.
     * Eliminates non-directional momentum errors where crashing assets previously awarded ADX strength to the bullish case.
@@ -171,11 +167,11 @@ The market data layer is decoupled into specialized providers with a persistent 
   * **Dual-Track Bear Regime Execution**:
     * **Broad Benchmark Indices** (`QQQ`, `SPY`, `SMH`, `3USL`, `QQQ3`, `STOXX`): Routed to 3x Inverse Short ETPs (`QQQS`, `3USS`, `3SES`).
     * **Single Equities** (`TSLA`, `NVDA`, `AAPL`, `COIN`): Routed to 100% Cash Defense (`direction = "NEUTRAL"`), completely eliminating short borrow fees and single-stock squeeze risk.
-  * **Complete Removal of Alternative Strategies**:
-    * Connors 3-RSI mean reversion and legacy Donchian momentum heuristics have been completely removed from the production codebase. The screener and debate brain focus 100% of allocation on confirmed directional trends.
+* **VWAP Strategy (`vwap.py`)** *(Registered Alternative)*:
+  * Institutional session trend-following requiring price breakout and hold above VWAP for Longs, and breakdown below VWAP for Short index ETPs.
 * **`trading_system/screener/laya_screener.py`**:
   * Runs concurrent multi-threaded scans across all universe assets every 60 seconds (24 parallel thread workers).
-  * `LayaScreener` and `TechnicalFallbackScreener` delegate candidate evaluation directly to `DirectionalTrendStrategy`, populating `strategy_signal` on every `ScreenerResult`.
+  * `LayaScreener` and `TechnicalFallbackScreener` delegate candidate evaluation directly to the active strategy, populating `strategy_signal` on every `ScreenerResult`.
   * **Zero Bypass Policy**: All qualified setups are forwarded to System 2 deliberation; fast-reflex bypass shortcuts remain strictly eliminated.
 
 ---
@@ -189,11 +185,11 @@ The market data layer is decoupled into specialized providers with a persistent 
     * **`debate_engine.py`**: Synthesizes technical and fundamental signals through deterministic dialectic synthesis to establish consensus conviction without speculative bypass.
 * **`trading_system/agents/strategy_improvement_agent.py`**:
   * Autonomous meta-learning agent inspecting `trades.jsonl` performance and cycle yields.
-  * Detects pipeline starvation (e.g. 3 consecutive zero-signal cycles during low-volatility regimes) and suggests adaptive parameter tuning (e.g., broadening RSI3 threshold from 22 to 25 or lowering ADX gate to 18).
+  * Detects pipeline starvation (e.g. 3 consecutive zero-signal cycles during low-volatility regimes) and suggests adaptive parameter tuning (e.g., broadening ADX floor or adjusting catalyst risk).
 
 ---
 
-### 3.5 Institutional Risk Management & Safety Gates
+### 3.5 Institutional Risk Management & The 9 Safety Gates
 
 * **`trading_system/agents/risk_manager.py`**:
   * **Strict Volatility-Scaled Sizing**:
@@ -212,107 +208,67 @@ The market data layer is decoupled into specialized providers with a persistent 
 
 ---
 
-### 3.6 Hybrid Broker Execution & Position Lifecycle
+### 3.6 Hybrid Broker Execution & 100% Pure Trailing Stop Loss Engine
 
 * **`trading_system/execution/position_monitor.py`**:
   * **Native Broker Stop-Loss Orders**: At the exact second an entry order fills, a server-side Stop Order (`POST /equity/orders/stop`) is registered directly with Trading 212 with Good-Till-Cancel (GTC) expiry protecting **100% of shares**.
-  * **100% Pure Trailing Stop Loss Engine**:
-
-```mermaid
-stateDiagram-v2
-    [*] --> ActiveEntry: Order Filled
-    ActiveEntry --> NativeStopRegistered: Place Server GTC Stop (100% Qty)
-    
-    state ActiveEntry {
-        direction LR
-        MonitoringPrice --> RiskStopHit: Price <= Initial Stop Loss
-    }
-    
-    NativeStopRegistered --> BreakevenLocked: Profit >= +1.5%
-    
-    state BreakevenLocked {
-        StopToEntry: Ratchet Native Stop to Entry Price
-        ZeroLossAssurance: 100% Shares Ride Risk-Free
-        StopToEntry --> ZeroLossAssurance
-    }
-    
-    BreakevenLocked --> CushionLocked: Profit >= +3.0%
-    
-    state CushionLocked {
-        StopToCushion: Ratchet Native Stop to Entry + 1.5%
-        GuaranteedProfit: Lock in +1.5% Net Profit Minimum
-        StopToCushion --> GuaranteedProfit
-    }
-    
-    CushionLocked --> DynamicTrail: Above +3.0% Profit Zone
-    
-    state DynamicTrail {
-        ChandelierTrail: Stop = Peak Price - (1.2 * ATR)
-        TightenOnExhaustion: Aggressive Ratchet on 3-RSI / SMA5 Reversal
-        ChandelierTrail --> TightenOnExhaustion
-    }
-    
-    DynamicTrail --> TSLHit: Price Reverses into TSL
-    CushionLocked --> TSLHit: Price Reverses into Cushion
-    BreakevenLocked --> TSLHit: Price Reverses into Breakeven
-    
-    TSLHit --> Closed: 100% Position Liquidated at Peak Gains
-    RiskStopHit --> Closed: Initial Capital Preserved
-```
-
-* **Complete Elimination of Take Profit Targets (TP1 / TP2 / TP3)**:
-  * Static profit milestones (TP1 +1.0R, TP2 +2.0R, TP3 +3.0R) and partial profit trims (50% / 25% / 25%) have been completely excised from the production engine.
-  * In leveraged momentum trading, capping winners early at arbitrary multiples truncates the right-tail return distribution, while placing broker-side TP limit orders creates severe order contention (`Trading 212 Error 400: Selling more equities than owned`).
-  * The architecture now relies exclusively on **100% Pure Trailing Stop Loss (TSL)**:
-    1. **Phase 1: Capital Defense**: Server-side GTC stop loss placed immediately upon fill at entry $- 2.2 \times \text{ATR}$ (capped at 3.0% max stop distance).
-    2. **Phase 2: Breakeven Lock (+1.5% Gain)**: Once unrealized profit reaches $+1.5\%$, the stop loss ratchets to `entry_price`, guaranteeing a risk-free trade while keeping 100% of shares intact.
-    3. **Phase 3: Profit Cushion Lock (+3.0% Gain)**: Once unrealized profit reaches $+3.0\%$, the stop loss ratchets to `entry_price * 1.015`, locking in $+1.5\%$ minimum net profit on 100% of the position.
-    4. **Phase 4: Dynamic ATR Chandelier Trail (> +3.0% Gain)**: Above $+3.0\%$, the stop trails behind peak market prices ($P_{\text{peak}} - 1.2 \times \text{ATR}$), continuously ratcheting upward on new highs and never loosening.
-    5. **100% Position Liquidation**: The position runs until the market reverses into the tightened broker GTC stop, banking maximal trend gains.
-* **Broker Order Contention Elimination**:
-  * Resolves Trading 212 Invest API restriction where simultaneous stop and limit orders on identical shares produce `400 Bad Request: 'Selling more equities than owned'`.
-  * All shares are protected under a single server-side GTC Stop Order that updates monotonically.
-* **16:20 UTC Asymmetric Session Gap Protocol (Winter Time / GMT)**:
-  * Evaluates all open positions daily at 16:20 UTC using `Europe/London` ZoneInfo.
-  * **Intraday Shorts**: Automatically flattened at 16:20 UTC to prevent overnight gap risk and leveraged compounding decay.
-  * **Winners with Locked Stops**: Long positions that reached Breakeven (`TSL >= Entry`) are approved for overnight carry.
-  * **Pre-Earnings Run-Up Radar**: Carries positions 1 to 21 days before earnings if the trade is profitable with a locked stop.
-* **Auto-Healing Broker Reconciliation**:
-  * Runs every tick to reconcile local state with actual broker portfolio.
-  * Detects external app closes, auto-restores expired stop orders, adopts untracked positions, and repairs scale mismatches (e.g. GBX pence vs EUR).
-* **Pre-Flight Broker Order Queue Reconciliation & Deduplication**:
-  * `Orchestrator.reconcile_pending_orders()` runs at the start of every quantitative cycle.
-  * Queries `Trading212Client.get_orders(force_refresh=True)` to inspect resting broker orders.
-  * Automatically cancels stale `MARKET` orders in `NEW`/`LOCAL` status if order age $> 300\text{s}$ or if the underlying exchange is closed.
-  * Tracks pending tickers in `Orchestrator.in_flight_tickers` and asserts deduplication checks in `execute_trade()` to prevent submitting duplicate entries while an order is in-flight.
+  * **Order Contention Elimination (0% TP Limits)**:
+    * Avoids broker order collision (`400 Bad Request: 'Selling more equities than owned'`).
+    * Protects 100% of shares under a single server-side GTC Stop Order that updates monotonically.
+  * **Progressive TSL Ratchet Lifecycle**:
+    1. **Phase 1: Capital Defense**: Stop placed at entry $- 2.2 \times \text{ATR}$ (clamped between 2.5% and 8.0%).
+    2. **Phase 2: Breakeven Lock (+1.5% Gain)**: Once unrealized profit reaches $+1.5\%$, stop loss ratchets to `entry_price`, guaranteeing a risk-free trade with 100% of shares riding.
+    3. **Phase 3: Profit Cushion Lock (+3.0% Gain)**: Once unrealized profit reaches $+3.0\%$, stop loss ratchets to `entry_price * 1.015`, locking in $+1.5\%$ minimum net profit on 100% of the position.
+    4. **Phase 4: Dynamic ATR Chandelier Trail (> +3.0% Gain)**: Above $+3.0\%$, stop trails behind peak market prices ($P_{\text{peak}} - 1.2 \times \text{ATR}$), continuously ratcheting upward on new highs and never loosening.
+    5. **100% Position Liquidation**: The position runs until the market reverses into the tightened broker GTC stop, capturing peak trend expansion.
+  * **Session-Day Decay Trailing Stop Envelope & Zero-Alpha Evacuation**:
+    * For stagnant positions, allowable ATR trailing distance tightens by 0.35x ATR per completed session.
+    * Stagnant positions with no expansion after 4 sessions are liquidated at 16:20 UTC to prevent compounding volatility decay.
+    * **Tenured Runner Immunity**: Positions with $\ge +3.0\%$ profit are immune from decay tightening.
+  * **16:20 UTC Asymmetric Session Gap Protocol**:
+    * Evaluates all open positions daily at 16:20 UTC (`Europe/London` ZoneInfo).
+    * **Intraday Shorts**: Automatically flattened at 16:20 UTC to prevent overnight gap risk and leveraged compounding decay.
+    * **Winners with Locked Stops**: Long positions that reached Breakeven (`TSL >= Entry`) are approved for overnight carry.
+  * **Pre-Flight Order Queue Reconciliation & Deduplication**:
+    * `Orchestrator.reconcile_pending_orders()` runs at the start of every quantitative cycle.
+    * Automatically cancels stale `MARKET` orders in `NEW`/`LOCAL` status if order age $> 300\text{s}$ or if exchange is closed.
+    * Tracks pending tickers in `Orchestrator.in_flight_tickers` to eliminate duplicate submissions.
 
 ---
 
-### 3.7 Embedded Real-Time Telemetry & SSE Dashboard
+### 3.7 Embedded Real-Time Telemetry & Web Workbench
 
 * **`trading_system/dashboard/server.py`**:
   * Embedded multi-threaded HTTP server running directly inside the orchestrator process on port 8080 (or 8888).
   * **Server-Sent Events (SSE) `/api/live`**: Pushes 1-second live telemetry updates to connected browsers with zero page reloading.
   * **Fast TTL Cached `/api/data` Endpoint**: Serves active signals, broker status, monitored watchlist, and live broker execution history with a 2.5-second lock cache to prevent broker API rate-limiting.
-  * **Accurate 2-Line Alert History**:
-    * Line 1: Real broker quantity (e.g., `1.00 shs`).
-    * Line 2: Realized financial profit/loss and true percentage return (e.g., `-€2.00 (-7.25%)` or `Open Entry`), calculated from broker wallet impact net values.
-  * **Authoritative Multi-Currency Display**: Seamlessly formats British Pence (`GBX` / `p`), Euros (`EUR` / `€`), and US Dollars (`USD` / `$`).
+  * **Authoritative Multi-Currency Display**: Formats British Pence (`GBX` / `p`), Euros (`EUR` / `€`), and US Dollars (`USD` / `$`).
+* **`trading_system/config_bus.py` & Workbench UI (`/workbench`)**:
+  * Dynamic parameter calibration without restarting the engine.
+  * **Config Epochs (`config_epoch_id`)**: Every configuration update produces an immutable, timestamped snapshot. Open trades retain their entry policy epoch unless migrated.
+  * **Tuning Profiles**: One-click switching between `default`, `conservative`, `aggressive`, and `benchmark` profiles.
+  * **Decision Funnel Attribution**: Visualizes candidates passing/failing each stage of the quantitative pipeline, with deep links to the governing configuration parameters.
+* **`trading_system/dashboard/auth.py`**:
+  * Token-based bearer authentication for all API endpoints when enabled, with IP-based rate limiting to prevent unauthorized access.
 
 ---
 
-### 3.8 Production 24/7 Raspberry Pi Runner
+### 3.8 Production Deployment Topologies
 
-The trading engine runs 24/7 autonomously on a dedicated local hardware runner:
+The system supports three production deployment topologies:
 
-* **Hardware Host**: Raspberry Pi 5 (`192.168.68.50`, hostname `trading212-pi`).
-* **Operating System**: Debian GNU/Linux 13 (Trixie/Linux 6.18 arm64).
-* **System Daemon**: Managed via Linux `systemd` service (`trading-bot.service`):
-  * Command: `/home/shahpratik11/modest-bose/venv/bin/python3 -m trading_system.orchestrator --interval 5 --monitor-interval 10 --dashboard-port 8080`
-  * Auto-restarts on unexpected termination (`Restart=always`, `RestartSec=5`).
-* **Automated Deployment Pipeline**:
-  * `scripts/deploy_to_pi.sh`: Single-command deployment syncing codebase via `rsync`, updating dependencies, and performing zero-downtime service restart.
-  * `scripts/fetch_live_state.sh`: Synchronizes remote runner state back to local dev machine for offline audit.
+1. **1-Click GitHub Actions Cloud Runner (`.github/workflows/market_runner.yml`)**:
+   * Runs the engine serverlessly in GitHub's cloud during London Stock Exchange trading hours.
+   * Automated **Cloudflare Quick Tunnel** provides an instant, encrypted public dashboard URL (`https://xxx.trycloudflare.com`) accessible from mobile or desktop without opening firewall ports.
+   * State persistence: synchronizes `active_trades.json` back to the repository upon session completion.
+2. **24/7 Raspberry Pi 5 Linux Daemon (`trading-bot.service`)**:
+   * Dedicated hardware runner on Debian 13 arm64 (`trading212-pi`).
+   * Managed via `systemd` with automatic restart on failure (`Restart=always`, `RestartSec=5`).
+   * Single-command deployment via `scripts/deploy_to_pi.sh` (rsync codebase, install dependencies, restart daemon).
+   * Remote state pull via `scripts/fetch_live_state.sh`.
+3. **Local CLI Runner & Backtesting Engine**:
+   * Run live or paper trading locally via `python3 -m trading_system.orchestrator`.
+   * Run historical backtest simulations via `python3 -m trading_system.orchestrator --backtest`.
 
 ---
 
@@ -325,3 +281,4 @@ The trading engine runs 24/7 autonomously on a dedicated local hardware runner:
 5. **Session Isolation**: Intraday shorts and non-breakeven positions flatten at 16:20 UTC, preventing overnight gap risk and leveraged ETP volatility drag.
 6. **Continuous Auto-Healing**: Local state continuously reconciles against broker reality, automatically correcting stale orders, scale discrepancies, and direction mismatches.
 7. **Pre-Flight Order Queue Reconciliation**: Open broker market orders are audited at the start of every cycle. Resting orders >300s old or submitted when markets are closed are actively cancelled, preventing duplicate order placement and stranded capital.
+8. **Thread-Safe Multi-Provider Waterfall**: External market data feeds are isolated behind sliding-window rate limiters with auto-cooldown, ensuring uninterrupted scanning even during upstream vendor outages.

@@ -10,37 +10,30 @@ An exchange-traded product providing daily multiplied (e.g. 3x or 5x) or inverse
 
 Leveraged ETPs trade as spot equities on European exchanges (e.g., LSE) in GBP, EUR, or USD. Long and inverse directions are both executed via spot buy orders, eliminating overnight CFD borrowing and financing fees.
 
-### Mean Reversion
-A quantitative trading strategy that identifies extreme short-term statistical overextension (e.g. Connors 3-RSI oversold pullbacks) within structural trends and trades expected snapbacks toward short-term moving averages.
-
-Positions are held for short durations (typically 1 to 4 trading days) to capture prompt relief bounces while minimizing exposure to leveraged volatility drag.
-
 ### Volatility Drag
 The mathematical compounding decay inherent to daily rebalanced leveraged instruments, where high volatility causes cumulative performance to lag arithmetic multiples of the underlying benchmark.
 *Avoid: Beta slippage, decay fee*
 
-Volatility drag is non-linear and escalates rapidly over multi-week holding periods in choppy sideways markets, necessitating strict maximum holding duration limits.
+Volatility drag is non-linear and escalates rapidly over multi-week holding periods in choppy sideways markets, necessitating strict maximum holding duration limits ($-\frac{1}{2} L^2 \sigma^2$).
 
 ### Catastrophic Stop
-An emergency stop-loss placed significantly outside normal market volatility noise (e.g. 3.5x to 5.0x ATR) designed solely to protect capital against regime shifts or gap openings, rather than exiting on ordinary pullbacks.
+An emergency stop-loss placed significantly outside normal market volatility noise (e.g. 2.5% to 8.0% ATR clamp) designed to protect capital against regime shifts or gap openings on broker servers.
 *Avoid: Operational stop, trailing stop*
 
-Mean reversion strategies rely on indicator reversion (e.g. price crossing the 5-period SMA) for ordinary exits; tight operational stops inadvertently choke valid dip-buying entries before the snapback materializes.
+### 100% Pure Trailing Stop Loss (TSL)
+An execution architecture that completely eliminates Take Profit (TP) limit orders and partial share trims, protecting 100% of open shares under a single server-side GTC Stop Order that ratchets monotonically upward (+1.5% Breakeven, +3.0% Cushion Lock, Dynamic ATR Chandelier Trail).
+*Avoid: Partial target trimming, TP1/TP2 limits, order-locking limits*
 
-### Noise Buffer
-An ATR multiplier (e.g. 2.0x–2.5x) applied to stop-loss placement on high-beta leveraged products to absorb intraday microstructure wicks and bid-ask spread noise without prematurely choking a mean-reversion trade.
-*Avoid: Tight stop, scalping stop*
-
-Calibrating the noise buffer to at least 2.2x ATR prevents false-positive exits during peak adverse excursion on 3x leveraged ETPs, allowing short-term relief rallies to develop.
+Eliminates broker order collision (`400 Bad Request: 'Selling more equities than owned'`) while allowing winning momentum trends to compound across the full right-tail return distribution.
 
 ### Schmitt Hysteresis Ratchet
-A two-stage protective stop-loss protocol that moves the stop to break-even upon reaching the first take-profit milestone and elevates it to lock in gains only after market price escapes past a volatility dead-band.
+A two-stage protective stop-loss protocol that moves the stop to break-even upon reaching +1.5% unrealized gain and elevates it to lock in +1.5% profit cushion only after market price escapes past a volatility dead-band.
 *Avoid: Single-tick ratchet, instant break-even lock*
 
 Because wide bid-ask spreads on leveraged vehicles cause immediate resting bid executions, holding the stop at entry until price clears the escape boundary prevents bid-ask bounce from terminating profitable trades prematurely.
 
 ### Asymmetric Session Protocol
-An execution rule governing overnight risk where leveraged inverse short positions are systematically flattened prior to exchange close, while long positions require positive unrealized cushion to hold overnight.
+An execution rule governing overnight risk where leveraged inverse short positions are systematically flattened prior to exchange close (16:20 UTC), while long positions require positive unrealized cushion to hold overnight.
 *Avoid: Universal overnight hold, static session policy*
 
 Inverse leveraged products experience heightened path-dependency and compounding decay during off-market gap openings; liquidating inverse exposure intraday isolates risk to active trading hours.
@@ -51,21 +44,9 @@ A volatility normalization mechanism that scales underlying benchmark ATR percen
 
 Because leveraged products experience amplified daily range, stop loss distance is calculated using the scaled volatility and clamped between safety thresholds (2.5% to 8.0%) to prevent false-positive noise stop-outs.
 
-### Dual-Trigger Exit Protocol
-An execution architecture that couples native broker server-side GTC protective stop and limit orders with algorithmic leading-indicator exits (e.g. Connors 3-RSI exhaustion, Nixtla 5-day forecast reversals).
-*Avoid: Client-only stop, price-only limit*
-
-Broker-side orders ensure capital protection persists across network drops and off-hours, while algorithmic signals capture peak momentum trims before price reversal degrades unrealized gains.
-
-### Multi-Factor Forecast Trimming
-An algorithmic exit mechanism that evaluates rolling zero-lookahead forward price projections (e.g. Nixtla 5-day Holt-Winters exponential smoothing forecasts) on profitable positions, executing a partial trim (e.g. 50%) when expected returns deteriorate sharply ahead of a market turning point.
-*Avoid: Fixed target exit, static price limit*
-
-By locking in accrued gains prior to projected negative momentum shifts, forecast trimming prevents sudden adverse swings from eroding leveraged gains.
-
-### Micro-Runner Dynamic Host Discovery
-An automated probing mechanism for deploying to physical micro-runners (e.g. Raspberry Pi) across local area networks subject to DHCP lease drift, sequentially testing candidate hostnames and active subnet IPs before initiating synchronization.
-*Avoid: Hardcoded static IP, manual target entry*
+### Multi-Provider Waterfall Router
+A thread-safe market data ingestion architecture with sliding-window rate limiters that sequences requests across multiple vendors (FMP, Tiingo, Polygon.io, Alpha Vantage) with auto-cooldown on HTTP 429 and automatic fallback to zero-config keyless feeds (Direct Yahoo Chart API, Stooq CSV).
+*Avoid: Single-vendor dependency, hard-failing rate limits*
 
 ### Session-Day Decay Trailing Stop Envelope
 A multi-dimensional trailing stop loss protocol that tightens allowable ATR distance by a fixed daily decrement (e.g. 0.35x ATR per session) across completed exchange trading days on leveraged ETPs, forcing stagnant positions to Break-Even or liquidating them before daily rebalancing volatility drag (beta slippage) erodes capital.
@@ -112,4 +93,3 @@ A structured per-cycle diagnostic record capturing stage pass/reject counts, cro
 *Avoid: Unstructured log scraping, opaque zero-trade cycles*
 
 Linking each gate rejection directly to empirical cross-sectional metrics and its governing schema parameter allows operators to diagnose starved scans and stage evidence-based parameter adjustments in the web console.
-

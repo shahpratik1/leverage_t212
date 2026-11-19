@@ -401,7 +401,7 @@ class Orchestrator:
         self._scan_future: Optional[concurrent.futures.Future] = None
 
         # Synchronize broker-native GTC Stop Loss / Limit orders for active positions
-        if settings.TRADING212_API_KEY:
+        if not is_testing and settings.TRADING212_API_KEY:
             try:
                 self.position_monitor.reconcile_with_broker(adopt_untracked=True)
                 if not self.dry_run:
